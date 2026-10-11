@@ -25,6 +25,10 @@
 //! We publish a fallback `motion=off` after `motion_wake_hold_secs` so
 //! HA never gets stuck on "motion=on" if reconnect failed.
 //!
+//! Each push also drives `status/push`, which in-session motion never
+//! touches: it's the camera's own alarm decision (its detection and
+//! schedule settings), not every motion report a live session sees.
+//!
 //! The push itself is class-blind: person / vehicle / animal / other
 //! lives in the TLS body we can't read. The per-class
 //! `status/motion/{class}` topics are only published once the
@@ -118,6 +122,12 @@ pub async fn run_with_listener(
 		motion_wake_hold_secs = cfg.motion_wake_hold.as_secs_f64(),
 		"Push listener started"
 	);
+
+	// Before the first accept, so it can't race a push. Connections
+	// meanwhile wait in the listen backlog.
+	if let Some(ref mqtt) = mqtt {
+		reset_push_state(mqtt, &topic_prefix, &cameras).await;
+	}
 
 	loop {
 		tokio::select! {
@@ -245,13 +255,40 @@ pub(crate) fn match_camera_by_address(
 	matches.next().is_none().then_some(first)
 }
 
-/// Fire the motion event: publish `status/motion=on`, hold a wake-lock
-/// for `hold`, then publish a fallback `status/motion=off` (and every
-/// per-class topic off) so HA never gets stuck on `on` if the
-/// in-session `motion_listener` never picks up the live `Stop`.
-/// Idempotent w.r.t. the in-session publisher — duplicate `off` is
-/// harmless (HA dedups). `seq` is this push's
-/// [`CameraHandle::push_seq`]; a later push takes over the clear.
+/// Publish `status/push=off` for every camera, so a retained `on` from
+/// a run that died mid-hold doesn't linger. Bounded so a wedged broker
+/// can't keep the listener from accepting.
+async fn reset_push_state(
+	mqtt: &SharedMqttClient,
+	topic_prefix: &str,
+	cameras: &HashMap<String, Arc<CameraHandle>>,
+) {
+	let reset = async {
+		for handle in cameras.values() {
+			let publisher = StatusPublisher::new(mqtt, topic_prefix, handle.name());
+			match publisher.publish_push(false).await {
+				Ok(()) => handle.status_cache().set_push(false),
+				Err(e) => {
+					tracing::warn!(camera = %handle.name(), error = %e, "push listener: initial push=off publish failed");
+				}
+			}
+		}
+	};
+	if tokio::time::timeout(Duration::from_secs(2), reset)
+		.await
+		.is_err()
+	{
+		tracing::warn!("push listener: initial push=off publishes timed out");
+	}
+}
+
+/// Fire the motion event: publish `status/motion=on` and
+/// `status/push=on`, hold a wake-lock for `hold`, then publish a
+/// fallback `motion=off` (every per-class topic too) and `push=off` so
+/// HA never gets stuck on `on` if the in-session `motion_listener`
+/// never picks up the live `Stop`. Idempotent w.r.t. the in-session
+/// publisher — duplicate `off` is harmless (HA dedups). `seq` is this
+/// push's [`CameraHandle::push_seq`]; a later push takes over the clear.
 async fn fire_motion(
 	handle: Arc<CameraHandle>,
 	mqtt: SharedMqttClient,
@@ -262,10 +299,15 @@ async fn fire_motion(
 ) {
 	let _guard = handle.wake_lock().acquire();
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, handle.name());
-	if let Err(e) = publisher.publish_motion(true).await {
-		tracing::warn!(camera = %handle.name(), error = %e, "push motion: publish_motion(true) failed");
+	let raise = async {
+		publisher.publish_motion(true).await?;
+		publisher.publish_push(true).await
+	};
+	if let Err(e) = raise.await {
+		tracing::warn!(camera = %handle.name(), error = %e, "push motion: motion/push=on publish failed");
 	}
 	handle.status_cache().set_motion(true);
+	handle.status_cache().set_push(true);
 
 	// Hold for `hold`, bailing on cancel — same primitive used by the
 	// camera reconnect path so the contract lives in one place.
@@ -284,12 +326,14 @@ async fn fire_motion(
 	let none = AiDetections::default();
 	let clear = async {
 		publisher.publish_motion(false).await?;
-		crate::camera_tasks::publish_motion_classes(&publisher, none).await
+		crate::camera_tasks::publish_motion_classes(&publisher, none).await?;
+		publisher.publish_push(false).await
 	};
 	match tokio::time::timeout(FALLBACK_PUBLISH_TIMEOUT, clear).await {
 		Ok(Ok(())) => {
 			handle.status_cache().set_motion(false);
 			handle.status_cache().set_motion_classes(none);
+			handle.status_cache().set_push(false);
 		}
 		Ok(Err(e)) => {
 			tracing::warn!(camera = %handle.name(), error = %e, "push motion: fallback motion=off publish failed");
@@ -297,7 +341,7 @@ async fn fire_motion(
 		Err(_) => {
 			tracing::debug!(
 				camera = %handle.name(),
-				"push motion: fallback publish_motion(false) timed out (likely shutdown)"
+				"push motion: fallback clear timed out (likely shutdown)"
 			);
 		}
 	}
@@ -818,6 +862,17 @@ mod tests {
 			Some(AiDetections::default())
 		);
 
+		// `push` mirrors the edge: reset off at startup, on with the
+		// push, off with the fallback.
+		let push: Vec<Vec<u8>> = mock
+			.published()
+			.into_iter()
+			.filter(|(t, _, r)| t == "bairelay/front/status/push" && *r)
+			.map(|(_, p, _)| p)
+			.collect();
+		assert_eq!(push, [b"off".to_vec(), b"on".to_vec(), b"off".to_vec()]);
+		assert_eq!(handle.status_cache().push(), Some(false));
+
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 	}
@@ -828,14 +883,8 @@ mod tests {
 		// first but B's is still running, so only B may clear — at
 		// t≈1000 ms, not 600 ms.
 		let registry = bairelay_wake_server::make_registry();
-		registry.upsert(
-			"YARDUID01234",
-			"127.0.0.1:55004".parse().unwrap(),
-			0xFEED_FACE,
-			Instant::now(),
-		);
 		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
-		let handle = handle_with_uid("yard", Some("YARDUID0"));
+		let handle = handle_with_address("yard", Some("127.0.0.1"));
 		cameras.insert("yard".into(), Arc::clone(&handle));
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 		let port = listener.local_addr().unwrap().port();
@@ -857,10 +906,10 @@ mod tests {
 			cancel.clone(),
 		));
 
-		let motion_payloads = |mock: &bairelay_mqtt::test_support::MockHandle| -> Vec<Vec<u8>> {
+		let push_payloads = |mock: &bairelay_mqtt::test_support::MockHandle| -> Vec<Vec<u8>> {
 			mock.published()
 				.into_iter()
-				.filter(|(t, _, _)| t == "bairelay/yard/status/motion")
+				.filter(|(t, _, _)| t == "bairelay/yard/status/push")
 				.map(|(_, p, _)| p)
 				.collect()
 		};
@@ -876,24 +925,33 @@ mod tests {
 		// t≈800 ms: past A's window, inside B's, ~200 ms of slack each way.
 		tokio::time::sleep(Duration::from_millis(400)).await;
 		assert_eq!(
-			motion_payloads(&mock),
-			[b"on".to_vec(), b"on".to_vec()],
+			push_payloads(&mock),
+			[b"off".to_vec(), b"on".to_vec(), b"on".to_vec()],
 			"A's expiry must not clear while B is live"
 		);
-		assert_eq!(handle.status_cache().motion(), Some(true));
+		assert_eq!(handle.status_cache().push(), Some(true));
 
+		// Push is the last topic the clear publishes.
 		let cleared = tokio::time::timeout(Duration::from_secs(2), async {
-			while motion_payloads(&mock).len() < 3 {
+			while push_payloads(&mock).len() < 4 {
 				tokio::time::sleep(Duration::from_millis(10)).await;
 			}
 		})
 		.await;
-		assert!(cleared.is_ok(), "B's expiry clears motion");
+		assert!(cleared.is_ok(), "B's expiry clears push");
+		assert!(mock
+			.published()
+			.iter()
+			.any(|(t, p, _)| t == "bairelay/yard/status/motion" && p == b"off"));
 		assert_eq!(
-			motion_payloads(&mock),
-			[b"on".to_vec(), b"on".to_vec(), b"off".to_vec()]
+			push_payloads(&mock),
+			[
+				b"off".to_vec(),
+				b"on".to_vec(),
+				b"on".to_vec(),
+				b"off".to_vec()
+			]
 		);
-		assert_eq!(handle.status_cache().motion(), Some(false));
 
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

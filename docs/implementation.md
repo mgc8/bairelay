@@ -215,6 +215,7 @@ These are distinct topics. Don't conflate them.
 Motion likewise has an aggregate topic and four refinements:
 
 - `status/motion` — any alarm active, from `MotionStatus::Start` / `Stop` (or the push listener).
+- `status/push` — the push listener's own on/off, never driven by the session. On at each push, off once the newest push's `motion_wake_hold_secs` window ends (`CameraHandle::push_seq` keeps an older push's timer from clearing a newer one). Reset to `off` when the listener starts.
 - `status/motion/{person,vehicle,animal,other}` — the `AiDetections` carried on each `Start`, parsed from the alarm's comma-separated `AItype` (`people`, `vehicle`, `dog_cat`, `other`). `other` also covers an alarm with no recognised class, so an active alarm always lights at least one class. Every `Start` republishes all four (the camera re-sends the alarm as its classification changes); `Stop` turns all four off.
 
 Update intervals (`battery_update`, `preview_update`, `floodlight_update`) must be ≥ 500 ms. Validation rejects shorter.

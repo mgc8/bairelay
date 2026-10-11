@@ -1,7 +1,7 @@
 //! Per-camera cache of the most-recent MQTT status values.
 //!
 //! Each camera task that publishes a status topic (battery, motion,
-//! per-class motion, floodlight, floodlight_tasks, pir, ir, led) writes the just-published value
+//! per-class motion, push, floodlight, floodlight_tasks, pir, ir, led) writes the just-published value
 //! into this cache. On a broker reconnect, `handle_connack` walks
 //! every camera's cache and re-emits any set value via the standard
 //! `publish_*` retained publishers.
@@ -34,6 +34,7 @@ pub struct StatusCache {
 	battery_level: RwLock<Option<u8>>,
 	motion: RwLock<Option<bool>>,
 	motion_classes: RwLock<Option<AiDetections>>,
+	push: RwLock<Option<bool>>,
 	floodlight: RwLock<Option<bool>>,
 	floodlight_tasks: RwLock<Option<bool>>,
 	pir: RwLock<Option<bool>>,
@@ -61,6 +62,13 @@ impl StatusCache {
 	}
 	pub fn motion_classes(&self) -> Option<AiDetections> {
 		*self.motion_classes.read_recover()
+	}
+
+	pub fn set_push(&self, active: bool) {
+		*self.push.write_recover() = Some(active);
+	}
+	pub fn push(&self) -> Option<bool> {
+		*self.push.read_recover()
 	}
 
 	pub fn set_floodlight(&self, on: bool) {
@@ -115,6 +123,7 @@ mod tests {
 		assert_eq!(c.battery_level(), None);
 		assert_eq!(c.motion(), None);
 		assert_eq!(c.motion_classes(), None);
+		assert_eq!(c.push(), None);
 		assert_eq!(c.floodlight(), None);
 		assert_eq!(c.floodlight_tasks(), None);
 		assert_eq!(c.pir(), None);
@@ -132,6 +141,7 @@ mod tests {
 			..Default::default()
 		};
 		c.set_motion_classes(person);
+		c.set_push(true);
 		c.set_floodlight(false);
 		c.set_floodlight_tasks(true);
 		c.set_pir(false);
@@ -140,6 +150,7 @@ mod tests {
 		assert_eq!(c.battery_level(), Some(72));
 		assert_eq!(c.motion(), Some(true));
 		assert_eq!(c.motion_classes(), Some(person));
+		assert_eq!(c.push(), Some(true));
 		assert_eq!(c.floodlight(), Some(false));
 		assert_eq!(c.floodlight_tasks(), Some(true));
 		assert_eq!(c.pir(), Some(false));

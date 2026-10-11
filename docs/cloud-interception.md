@@ -431,7 +431,7 @@ The implementation drops the socket the instant `accept()` returns. There's no T
    server off) -> the camera whose configured `address` is peer_ip.
 
 6. push_listener:
-   - publishes status/motion=on to MQTT
+   - publishes status/motion=on and status/push=on to MQTT
    - acquires a wake-lock for `motion_wake_hold_secs` (default 30 s)
    - drops the TCP socket (camera RSTs us back, moves on)
 
@@ -449,11 +449,11 @@ The implementation drops the socket the instant `accept()` returns. There's no T
    and every class off.
 
 9. After motion_wake_hold_secs, the push_listener's wake-lock guard
-   drops + a fallback status/motion=off (and every class off) is
-   published — unless a later push from the same camera arrived
-   meanwhile, in which case that push's timer clears. This catches the
-   case where step 7 fails (e.g. the camera went back to sleep before
-   bairelay reconnected) so HA never gets stuck on motion=on.
+   drops + a fallback status/motion=off (and every class off) plus
+   status/push=off is published — unless a later push from the same
+   camera arrived meanwhile, in which case that push's timer clears. This catches the case where step 7 fails (e.g. the
+   camera went back to sleep before bairelay reconnected) so HA never
+   gets stuck on motion=on.
 
 10. With no other wake-lock holders, the camera goes idle, the
     watchdog disconnects it, the camera resumes its sleep-mode
@@ -495,4 +495,5 @@ Same shape as Part I's recipe (`docs/testing.md` § "Local wake server live-veri
 - **Whether the camera retries elsewhere after the RST.** Within the 100 s baseline window, no fallback traffic was observed — the camera either retries the same hostname (which our hijack catches again) or gives up. Longer captures would clarify.
 - **Other cloud endpoints we haven't characterised.** `apis.reolink.com` (device profile), Reolink's own `mqtt-cn-reolink.cn` (China-region MQTT), and any future endpoints could carry alarm-relevant traffic. None observed during motion in the captures so far, but a fuller idle-state capture would map the full set.
 - **Whether the camera ever pushes non-motion alarms via this same channel.** Reolink's alarm taxonomy includes `MD`, `PIR`, and `AI` (person/vehicle/animal). Whether all three traverse `pushx.reolink.com` or only `MD` is untested. Today we treat any connect from a registered camera as a motion event regardless; if a non-motion alarm fires the same TCP path, we'd attribute it to motion incorrectly. No symptom observed yet. Either way the push can't carry the class — person / vehicle / animal / other is read from the Baichuan `AlarmEvent` once the push-driven wake reconnects (§II.4 step 8).
+- **Whether the camera pushes while a client is connected.** The captures cover a disconnected camera. If firmware suppresses pushes during a Baichuan session, `status/push` stays off through live view — no false alerts, but no alerts either.
 - **Cert pinning loosening.** If a future firmware drops to looser TLS validation, `tests/scripts/pushx-sink/` becomes the entry point for body decoding. Re-run that rig on each major firmware bump.

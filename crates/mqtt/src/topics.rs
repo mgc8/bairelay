@@ -25,6 +25,11 @@ pub fn status_motion_class(prefix: &str, cam: &str, class: MotionClass) -> Strin
 	format!("{prefix}/{cam}/status/motion/{}", class.as_str())
 }
 
+/// Push-listener alarm edges: `{prefix}/{cam}/status/push`
+pub fn status_push(prefix: &str, cam: &str) -> String {
+	format!("{prefix}/{cam}/status/push")
+}
+
 /// Battery level percentage: `{prefix}/{cam}/status/battery_level`
 pub fn status_battery_level(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/status/battery_level")

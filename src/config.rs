@@ -324,6 +324,21 @@ fn default_features() -> HashSet<Feature> {
 	Feature::ALL.iter().copied().collect()
 }
 
+/// The HA discovery features to emit: the configured set, minus `push`
+/// when no push listener runs to drive it.
+pub fn effective_discovery_features(
+	config: &Config,
+	discovery: &MqttDiscoveryConfig,
+) -> HashSet<Feature> {
+	let push_listener = config.push_listener.as_ref().is_some_and(|p| p.enable);
+	discovery
+		.features
+		.iter()
+		.copied()
+		.filter(|&f| f != Feature::Push || push_listener)
+		.collect()
+}
+
 // ── CameraConfig ───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
@@ -1601,6 +1616,35 @@ mod tests {
 		assert_eq!(pl.push_listener_port, 443);
 		assert!(pl.push_listener_addr.is_none());
 		assert!((pl.motion_wake_hold_secs - 30.0).abs() < f64::EPSILON);
+	}
+
+	#[test]
+	fn discovery_features_drop_push_without_an_enabled_push_listener() {
+		let discovery = MqttDiscoveryConfig {
+			topic: "homeassistant".to_string(),
+			features: default_features(),
+		};
+		let mut cfg = Config::default();
+		for push_listener in [
+			None,
+			Some(PushListenerConfig {
+				enable: false,
+				..Default::default()
+			}),
+		] {
+			cfg.push_listener = push_listener;
+			let features = effective_discovery_features(&cfg, &discovery);
+			assert!(!features.contains(&Feature::Push));
+			assert_eq!(features.len(), Feature::ALL.len() - 1);
+		}
+		cfg.push_listener = Some(PushListenerConfig {
+			enable: true,
+			..Default::default()
+		});
+		assert_eq!(
+			effective_discovery_features(&cfg, &discovery),
+			discovery.features
+		);
 	}
 
 	#[test]

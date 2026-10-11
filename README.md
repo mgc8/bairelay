@@ -196,7 +196,7 @@ topic_prefix = "bairelay"
 
 [mqtt.discovery]
 topic = "homeassistant"
-features = ["floodlight", "camera", "motion", "motion_class", "led", "ir", "reboot", "pt", "battery", "siren"]
+features = ["floodlight", "camera", "motion", "motion_class", "push", "led", "ir", "reboot", "pt", "battery", "siren"]
 
 [[cameras]]
 name = "driveway"
@@ -424,6 +424,8 @@ motion_wake_hold_secs = 30
 **Without the wake server.** The push listener doesn't need `[wake_server]` if each camera has a literal IP `address` (with a DHCP reservation, since that's what pushes are matched on). Leaving `p2p*.reolink.com` with Reolink keeps the Reolink app's remote live view working; bairelay then reaches the camera — awake from the motion that triggered the push — through its configured discovery.
 
 The "real" `motion=off` arrives once bairelay reconnects in-session and the camera reports `MotionStatus::Stop` natively. The hold-window timeout is a fallback so HA never sticks on `on`.
+
+**Push vs. motion.** Each push also turns `status/push` on for the same hold window (a later push extends it), surfaced in HA as a `push` binary sensor. In-session motion never touches it. `status/motion` reports every motion event a live session sees — including during live view or a kept-awake session — whereas a push is the camera's own alarm decision, made under its detection and schedule settings. Automations that should fire like a Reolink notification belong on `push`. The entity is only published while `[push_listener]` is enabled.
 
 **Person / vehicle / animal / other.** The push can't say *what* moved — that's in the TLS body. The class comes from the reconnected Baichuan session: the camera's alarm event carries an `AItype` (`people`, `vehicle`, `dog_cat`, `other`), and bairelay publishes it as retained `on`/`off` on `status/motion/person`, `status/motion/vehicle`, `status/motion/animal` and `status/motion/other` alongside the aggregate `status/motion`. `other` is any motion not attributed to the first three, including all motion from cameras without on-board AI. Expect the class a few seconds after the push-driven `motion=on`, once the wake completes; the hold-window fallback clears the class topics along with `motion`. In HA these are four `binary_sensor`s under the `motion_class` discovery feature.
 

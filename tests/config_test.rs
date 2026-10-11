@@ -1133,8 +1133,8 @@ fn discovery_present_defaults_to_all_features() {
 	validate_config(&config).expect("valid");
 	let d = config.mqtt.unwrap().discovery.unwrap();
 	assert_eq!(d.topic, "homeassistant");
-	// Feature::ALL has 12 entries — full default set.
-	assert_eq!(d.features.len(), 12);
+	// Feature::ALL has 13 entries — full default set.
+	assert_eq!(d.features.len(), 13);
 }
 
 #[test]

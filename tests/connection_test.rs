@@ -52,6 +52,7 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 			vehicle: true,
 			..Default::default()
 		});
+	cam.status_cache().set_push(true);
 	cam.status_cache().set_floodlight(false);
 	cam.status_cache().set_floodlight_tasks(true);
 	cam.status_cache().set_pir(false);
@@ -91,6 +92,10 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 			mock.published_topics()
 		);
 	}
+	assert!(
+		saw("bairelay/cam1/status/push", b"on"),
+		"push=on retained must land"
+	);
 	assert!(
 		saw("bairelay/cam1/status/floodlight", br#"{"state":"off"}"#),
 		"floodlight off retained must land"

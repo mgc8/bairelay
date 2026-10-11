@@ -47,8 +47,8 @@ bind = "0.0.0.0"
 # [mqtt.discovery]
 # topic = "homeassistant"
 # features = [
-#     "floodlight", "camera", "motion", "motion_class", "led", "ir",
-#     "reboot", "pt", "battery", "siren",
+#     "floodlight", "camera", "motion", "motion_class", "push", "led",
+#     "ir", "reboot", "pt", "battery", "siren",
 # ]
 
 

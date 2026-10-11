@@ -217,16 +217,17 @@ async fn async_main() -> Result<()> {
 	// client is available (no broker → nothing to publish onto).
 	let discovery_publisher = match (&mqtt_shared, config.mqtt.as_ref()) {
 		(Some(client), Some(mqtt_cfg)) => mqtt_cfg.discovery.as_ref().map(|d| {
+			let features = bairelay::config::effective_discovery_features(&config, d);
 			info!(
 				ha_topic = %d.topic,
-				features = d.features.len(),
+				features = features.len(),
 				"HA MQTT discovery enabled"
 			);
 			bairelay_mqtt::DiscoveryPublisher::new(
 				client.clone(),
 				topic_prefix.clone(),
 				d.topic.clone(),
-				d.features.clone(),
+				features,
 				env!("CARGO_PKG_VERSION").to_string(),
 			)
 		}),

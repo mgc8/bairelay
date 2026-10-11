@@ -48,6 +48,14 @@ fn motion_class_topic_format() {
 }
 
 #[test]
+fn push_topic_format() {
+	assert_eq!(
+		bairelay_mqtt::topics::status_push(PREFIX, "garden"),
+		"bairelay/garden/status/push"
+	);
+}
+
+#[test]
 fn control_topic_pattern() {
 	assert_eq!(
 		bairelay_mqtt::topics::control_floodlight(PREFIX, "cam1"),
