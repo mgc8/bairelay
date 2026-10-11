@@ -76,6 +76,11 @@ bind = "0.0.0.0"
 # push_listener_addr = "0.0.0.0"       # default: wake_server bind / top-level bind
 # push_listener_port = 443             # override when 443 is taken
 # motion_wake_hold_secs = 30           # wake-lock window per push event
+# forward_upstream = false             # also relay each push, bytes only, to
+#                                      # the real pushx.reolink.com so the
+#                                      # Reolink app still gets notified
+# upstream_resolver = "1.1.1.1"        # DNS server forwarding asks for the
+#                                      # real pushx; not your LAN resolver
 
 
 # ── Cameras ──

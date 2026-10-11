@@ -97,6 +97,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 bytes = "1"
 quick-xml = { version = "0.36", features = ["serialize"] }
+rand = "0.8"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 ab_glyph = "0.2"
 time = { version = "0.3", features = ["macros", "formatting", "local-offset"] }

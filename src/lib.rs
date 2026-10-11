@@ -8,6 +8,7 @@ pub mod capabilities;
 pub mod cli;
 pub mod cli_convert;
 pub mod config;
+pub mod dns;
 pub mod grace_period;
 pub mod hassio;
 pub mod local_time;

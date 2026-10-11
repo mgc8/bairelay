@@ -1,6 +1,7 @@
 use bairelay_mqtt::discovery::Feature;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 
 // ── Enums ──────────────────────────────────────────────────────────────
 
@@ -181,7 +182,8 @@ impl Default for Config {
 /// event. Operator-side DNS hijack for `pushx.reolink.com` →
 /// `push_listener_addr` is the prerequisite. Listener doesn't
 /// terminate TLS — the connection's existence is the signal; we
-/// close immediately. The source IP is matched against the wake
+/// close immediately, or with `forward_upstream` relay it unread to
+/// the real endpoint. The source IP is matched against the wake
 /// server's heartbeat registry, then each camera's IP `address`.
 ///
 /// Field names are deliberately prefixed (`push_listener_addr` /
@@ -212,6 +214,19 @@ pub struct PushListenerConfig {
 	/// slow reconnects, higher values hold the camera awake longer.
 	#[serde(default = "default_motion_wake_hold_secs")]
 	pub motion_wake_hold_secs: f64,
+
+	/// Relay each accepted connection to the real `pushx.reolink.com:443`
+	/// instead of dropping it, so Reolink's own app notifications keep
+	/// working. Bytes pass through untouched: TLS stays end-to-end
+	/// between the camera and Reolink, cert pinning included.
+	#[serde(default)]
+	pub forward_upstream: bool,
+
+	/// Plain-DNS resolver (`ip` or `ip:port`) that forwarding asks for
+	/// the real `pushx.reolink.com` — one without the LAN override.
+	/// Default `1.1.1.1:53`.
+	#[serde(default)]
+	pub upstream_resolver: Option<String>,
 }
 
 impl Default for PushListenerConfig {
@@ -221,7 +236,25 @@ impl Default for PushListenerConfig {
 			push_listener_addr: None,
 			push_listener_port: default_push_listener_port(),
 			motion_wake_hold_secs: default_motion_wake_hold_secs(),
+			forward_upstream: false,
+			upstream_resolver: None,
 		}
+	}
+}
+
+impl PushListenerConfig {
+	/// [`Self::upstream_resolver`] as a socket address; port 53 unless
+	/// given.
+	pub fn upstream_resolver_addr(&self) -> Result<SocketAddr, String> {
+		let Some(ref resolver) = self.upstream_resolver else {
+			return Ok(SocketAddr::from(([1, 1, 1, 1], 53)));
+		};
+		resolver
+			.parse::<SocketAddr>()
+			.or_else(|_| resolver.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))
+			.map_err(|_| {
+				format!("[push_listener]: upstream_resolver must be an IP or IP:port (got {resolver:?})")
+			})
 	}
 }
 
@@ -1339,6 +1372,9 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 					"[push_listener]: push_listener_port must be greater than 0".to_string()
 				);
 			}
+			if pl.forward_upstream {
+				pl.upstream_resolver_addr()?;
+			}
 			// A push is attributed to a camera by its source IP, via the
 			// wake server's heartbeat registry or a camera's literal IP
 			// `address`. With neither, every push misses silently.
@@ -1645,6 +1681,28 @@ mod tests {
 			effective_discovery_features(&cfg, &discovery),
 			discovery.features
 		);
+	}
+
+	#[test]
+	fn upstream_resolver_defaults_to_cloudflare_and_takes_ip_or_ip_port() {
+		let mut pl = PushListenerConfig::default();
+		assert_eq!(
+			pl.upstream_resolver_addr(),
+			Ok("1.1.1.1:53".parse().unwrap())
+		);
+		for (given, want) in [
+			("9.9.9.9", "9.9.9.9:53"),
+			("192.168.1.1:5353", "192.168.1.1:5353"),
+			("2606:4700:4700::1111", "[2606:4700:4700::1111]:53"),
+		] {
+			pl.upstream_resolver = Some(given.to_string());
+			assert_eq!(pl.upstream_resolver_addr(), Ok(want.parse().unwrap()));
+		}
+		pl.upstream_resolver = Some("dns.example".to_string());
+		assert!(pl
+			.upstream_resolver_addr()
+			.unwrap_err()
+			.contains("upstream_resolver"));
 	}
 
 	#[test]

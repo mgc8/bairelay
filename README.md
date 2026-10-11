@@ -421,6 +421,15 @@ motion_wake_hold_secs = 30
 
 **What you have to do**: redirect DNS for `pushx.reolink.com` to bairelay. The camera connects, bairelay maps the peer IP to a camera — through the wake server's heartbeat registry, or failing that a camera whose `address` is that IP — fires a `status/motion=on` MQTT publish, holds a wake-lock for `motion_wake_hold_secs`, and tears the socket. The TLS handshake never completes; the camera's retry state machine moves on within a few hundred milliseconds with no observable downstream effect.
 
+**Keeping Reolink's own notifications.** With `forward_upstream = true`, bairelay relays each connection to the real `pushx.reolink.com:443` instead of closing it. Only bytes pass through: TLS stays end-to-end between the camera and Reolink, the pinned certificate checks out, and the Reolink app is notified as if nothing were in the way — while bairelay still gets its motion edge from the connect. Every connection is relayed, including from Reolink devices bairelay doesn't manage, since the DNS override catches them all. The real address is looked up at `upstream_resolver` (default `1.1.1.1`); it must not be the LAN resolver carrying the override, and an answer pointing back at bairelay is refused rather than looped.
+
+```toml
+[push_listener]
+enable = true
+forward_upstream = true
+# upstream_resolver = "1.1.1.1"
+```
+
 **Without the wake server.** The push listener doesn't need `[wake_server]` if each camera has a literal IP `address` (with a DHCP reservation, since that's what pushes are matched on). Leaving `p2p*.reolink.com` with Reolink keeps the Reolink app's remote live view working; bairelay then reaches the camera — awake from the motion that triggered the push — through its configured discovery.
 
 The "real" `motion=off` arrives once bairelay reconnects in-session and the camera reports `MotionStatus::Stop` natively. The hold-window timeout is a fallback so HA never sticks on `on`.

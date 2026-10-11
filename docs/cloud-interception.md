@@ -398,6 +398,8 @@ We tried. `tests/scripts/pushx-sink/run.sh` stands up `openssl s_server` on `:44
 
 **A bare TCP RST without a TLS Alert.** That's the fingerprint of an embedded TLS stack (mbedTLS / wolfSSL family) that does cert-chain validation strictly and tears the socket down on failure rather than emitting a polite TLS Alert. We will not be presenting a cert this firmware accepts — the leaf would need to be signed by whatever root Reolink ships in the camera's CA bundle, and that key is on Reolink's side.
 
+What we *can* do without terminating TLS is pass it along: with `forward_upstream` the listener splices the accepted socket to the real `pushx.reolink.com:443` (§II.5.2). The camera's handshake then completes against Reolink's genuine certificate, and the body stays as opaque to us as before.
+
 If a future firmware ever loosens cert validation, `tests/scripts/pushx-sink/run.sh` is the entry point for re-attempting body decoding.
 
 ## II.3 Connect attempt as the signal
@@ -408,7 +410,7 @@ What we need is the source IP → camera mapping, and with the wake server runni
 
 When the registry has no entry (wake server disabled, or no fresh heartbeat), the listener falls back to the camera whose configured `address` is the peer IP. That only needs a literal IP and a stable lease, and it lets an operator hijack `pushx` alone — leaving `p2p*.reolink.com` with Reolink so the official app's remote access keeps working. Two cameras configured on one IP are ambiguous and match neither.
 
-The implementation drops the socket the instant `accept()` returns. There's no TLS termination, no read of bytes, no reply. The camera RSTs us back, then retries — possibly to the real `pushx.reolink.com` if the operator's resolver only redirects on a TTL window, or right back to us if the redirect is sticky. Either way the local motion event has already fired by the time the camera's retry kicks off.
+By default the implementation drops the socket the instant `accept()` returns (with `forward_upstream`, it relays it instead — §II.5.2). There's no TLS termination, no read of bytes, no reply. The camera RSTs us back, then retries — possibly to the real `pushx.reolink.com` if the operator's resolver only redirects on a TTL window, or right back to us if the redirect is sticky. Either way the local motion event has already fired by the time the camera's retry kicks off.
 
 ## II.4 End-to-end flow
 
@@ -474,7 +476,19 @@ Bind-permission caveat: port 443 needs root on Linux/macOS (or `CAP_NET_BIND_SER
 
 ### II.5.1 Live-verify recipe
 
-Same shape as Part I's recipe (`docs/testing.md` § "Local wake server live-verify"). Short version: enable both `[wake_server]` and `[push_listener]`, redirect both DNS names at the LAN resolver, run bairelay (with permission to bind 443), wait for the cameras to drop into idle-sleep, then trigger motion in front of one camera. Watch for `Motion push from camera (treating TCP-accept as motion edge) camera=<name> peer_ip=<ip>` in the bairelay log. The downstream `status/motion=on` MQTT publish + connect-loop reconnect + watchdog disconnect cycle is observable in the same log via `RUST_LOG=bairelay=debug`.
+Same shape as Part I's recipe (`docs/testing.md` § "Local wake server live-verify"). Short version: enable both `[wake_server]` and `[push_listener]`, redirect both DNS names at the LAN resolver, run bairelay (with permission to bind 443), wait for the cameras to drop into idle-sleep, then trigger motion in front of one camera. Watch for `Motion push from camera (treating TCP-accept as motion edge) camera=<name> peer_ip=<ip>` in the bairelay log. The downstream `status/motion=on` MQTT publish + connect-loop reconnect + watchdog disconnect cycle is observable in the same log via `RUST_LOG=bairelay=debug`. With `forward_upstream`, the same debug log shows `push forwarded upstream bytes_up=… bytes_down=…` per push, and the Reolink app should still raise its notification.
+
+### II.5.2 Keeping Reolink's own notifications (`forward_upstream`)
+
+Dropping the socket costs the official app its notification: Reolink's cloud never hears about the motion. `forward_upstream = true` closes that gap. After the motion edge fires, the listener looks up `pushx.reolink.com` at `upstream_resolver` (plain DNS, default `1.1.1.1:53` — the LAN resolver can't be used, it points the name here), connects to the answer on 443, and copies bytes both ways until either end closes. Nothing is decrypted or rewritten, so the camera's pinned handshake completes against Reolink and the push reaches the app.
+
+Details that matter in operation:
+
+- **Every connection is relayed**, matched camera or not. The DNS override catches every Reolink device on the LAN, and relaying restores normal behaviour for the ones bairelay doesn't manage.
+- **Loop guard.** An answer equal to the IP the camera reached us on (or `0.0.0.0`, a blocking resolver's reply) is dropped; with nothing left the relay is refused and logged. This catches a resolver that also carries the override, and networks that silently redirect outbound port 53 to the LAN resolver.
+- **Bounds.** At most 32 relays in flight; DNS 2 s per attempt (two attempts), connect 5 s, relay 60 s. On any failure the camera's connection closes, exactly as without forwarding.
+
+Pair it with matching by `address` (§II.3) and no wake server to leave Reolink's cloud entirely intact — P2P for the app's live view, push for its notifications — while bairelay still sees every motion edge.
 
 ## II.6 Implementation pointers
 
@@ -485,6 +499,8 @@ Same shape as Part I's recipe (`docs/testing.md` § "Local wake server live-veri
 | Long-form UID → camera handle (prefix match)  | `src/push_listener.rs::match_camera_by_uid`                          |
 | Peer-IP → configured `address` (fallback)     | `src/push_listener.rs::match_camera_by_address`                      |
 | Motion publish + wake-lock + fallback off     | `src/push_listener.rs::fire_motion`                                  |
+| Upstream relay + loop guard                   | `src/push_listener.rs::relay_upstream`, `upstream_targets`           |
+| Resolver-pinned A lookup                      | `src/dns.rs::lookup_a`                                               |
 | Operator-facing config schema                 | `src/config.rs::PushListenerConfig`, `sample_config.toml`            |
 | Shared-registry construction                  | `crates/wake-server/src/lib.rs::make_registry`                       |
 | Orchestrator integration                      | `src/main.rs` (the spawn block alongside the wake server)            |

@@ -19,6 +19,8 @@ bytes = "1"
 bairelay-neolink-core = { path = "../crates/core", features = ["fuzz-api"] }
 bairelay-rtsp = { path = "../crates/rtsp" }
 bairelay-wake-server = { path = "../crates/wake-server" }
+# The binary's own parsers (the push listener's DNS client).
+bairelay = { path = ".." }
 
 # Detach from the parent workspace. Without this, cargo would try to
 # pull this crate into the bairelay workspace and `cargo +nightly fuzz
@@ -74,6 +76,13 @@ bench = false
 [[bin]]
 name = "udp_flow_state"
 path = "fuzz_targets/udp_flow_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_parse_a_response"
+path = "fuzz_targets/dns_parse_a_response.rs"
 test = false
 doc = false
 bench = false

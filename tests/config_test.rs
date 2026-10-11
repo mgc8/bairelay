@@ -1901,6 +1901,7 @@ fn push_listener_cfg(
 		push_listener_addr: None,
 		push_listener_port,
 		motion_wake_hold_secs,
+		..Default::default()
 	});
 	cfg
 }
@@ -1995,6 +1996,20 @@ fn validate_accepts_disabled_push_listener_without_wake_server() {
 		push_listener_addr: None,
 		push_listener_port: 443,
 		motion_wake_hold_secs: 30.0,
+		..Default::default()
 	});
 	validate_config(&cfg).expect("disabled push_listener must pass");
+}
+
+#[test]
+fn validate_rejects_forward_upstream_with_a_hostname_resolver() {
+	let mut cfg = push_listener_cfg(30.0, 443);
+	let pl = cfg.push_listener.as_mut().unwrap();
+	pl.forward_upstream = true;
+	pl.upstream_resolver = Some("dns.example".to_string());
+	let err = validate_config(&cfg).expect_err("must reject");
+	assert!(err.contains("upstream_resolver"), "error: {err}");
+	// The resolver isn't consulted unless forwarding is on.
+	cfg.push_listener.as_mut().unwrap().forward_upstream = false;
+	validate_config(&cfg).expect("unused resolver is not validated");
 }

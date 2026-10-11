@@ -548,6 +548,17 @@ async fn async_main() -> Result<()> {
 				.wake_server_config()
 				.map(|w| std::time::Duration::from_millis(w.stale_after_ms))
 				.unwrap_or_else(|| std::time::Duration::from_millis(80_000));
+			let forward = if pl_block.forward_upstream {
+				Some(bairelay::push_listener::ForwardConfig {
+					resolver: pl_block
+						.upstream_resolver_addr()
+						.map_err(|e| anyhow::anyhow!(e))?,
+					host: bairelay::push_listener::PUSH_HOST.to_string(),
+					port: 443,
+				})
+			} else {
+				None
+			};
 			let cfg = bairelay::push_listener::RuntimeConfig {
 				bind_addr,
 				bind_port: pl_block.push_listener_port,
@@ -555,6 +566,7 @@ async fn async_main() -> Result<()> {
 					pl_block.motion_wake_hold_secs,
 				),
 				stale_after,
+				forward,
 			};
 			let listener_addr = std::net::SocketAddr::new(bind_addr, pl_block.push_listener_port);
 			let listener = tokio::net::TcpListener::bind(listener_addr)

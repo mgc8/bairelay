@@ -13,6 +13,15 @@
 //! known camera's IP as a motion event, fire `status/motion=on`
 //! plus a `motion_wake_hold_secs` wake-lock, and close the socket.
 //!
+//! With `forward_upstream`, the socket is relayed to the real
+//! `pushx.reolink.com:443` instead of closed — bytes only, no TLS
+//! termination — so the camera's pinned handshake completes against
+//! Reolink and the official app still gets its notification. Every
+//! connection is relayed, matched camera or not, since the DNS override
+//! catches every Reolink device on the LAN. The real address comes from
+//! a separate resolver (the LAN one points `pushx` here); an answer that
+//! leads back to this host is refused rather than looped.
+//!
 //! A camera is known by its source IP: first through the wake server's
 //! heartbeat registry, then through a camera's configured IP `address`
 //! — the latter lets the listener run without the wake server, leaving
@@ -52,7 +61,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
@@ -72,7 +82,30 @@ pub struct RuntimeConfig {
 	/// `stale_after_ms` so a long-silent camera doesn't get its push
 	/// matched against an ancient heartbeat.
 	pub stale_after: Duration,
+	/// `Some` relays each connection upstream instead of dropping it.
+	pub forward: Option<ForwardConfig>,
 }
+
+/// Where `forward_upstream` relays to.
+#[derive(Debug, Clone)]
+pub struct ForwardConfig {
+	/// Resolver for `host`; must not carry the LAN's `pushx` override.
+	pub resolver: SocketAddr,
+	pub host: String,
+	pub port: u16,
+}
+
+/// The real push endpoint the camera was trying to reach.
+pub const PUSH_HOST: &str = "pushx.reolink.com";
+
+/// Relays in flight at once; past this a connection is dropped, as it
+/// would be without forwarding.
+const MAX_RELAYS: usize = 32;
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A push is one small POST and its reply; this only bounds a relay
+/// whose ends never close.
+const RELAY_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum PushListenerError {
@@ -122,6 +155,14 @@ pub async fn run_with_listener(
 		motion_wake_hold_secs = cfg.motion_wake_hold.as_secs_f64(),
 		"Push listener started"
 	);
+	if let Some(ref fwd) = cfg.forward {
+		tracing::info!(
+			upstream = %format!("{}:{}", fwd.host, fwd.port),
+			resolver = %fwd.resolver,
+			"Push listener forwarding upstream"
+		);
+	}
+	let relays = Arc::new(Semaphore::new(MAX_RELAYS));
 
 	// Before the first accept, so it can't race a push. Connections
 	// meanwhile wait in the listen backlog.
@@ -138,10 +179,24 @@ pub async fn run_with_listener(
 			accept = listener.accept() => {
 				match accept {
 					Ok((sock, peer)) => {
-						drop(sock);
 						// An IPv4 camera reaching a dual-stack bind shows
 						// up as `::ffff:a.b.c.d`; match on the plain form.
 						handle_push(peer.ip().to_canonical(), &registry, &cameras, mqtt.as_ref(), &topic_prefix, &cfg, &cancel);
+						if let Some(ref fwd) = cfg.forward {
+							match Arc::clone(&relays).try_acquire_owned() {
+								Ok(permit) => {
+									let fwd = fwd.clone();
+									let cancel = cancel.clone();
+									tokio::spawn(async move {
+										relay_upstream(sock, &fwd, &cancel).await;
+										drop(permit);
+									});
+								}
+								Err(_) => {
+									tracing::warn!(peer = %peer, "push forward: relay limit reached; dropping connection");
+								}
+							}
+						}
 					}
 					Err(e) => {
 						tracing::warn!(error = %e, "push listener accept failed");
@@ -253,6 +308,93 @@ pub(crate) fn match_camera_by_address(
 	});
 	let first = matches.next()?;
 	matches.next().is_none().then_some(first)
+}
+
+/// Relay `client` to the real push endpoint until either side closes.
+/// Failures leave the camera where it'd be without forwarding: its
+/// connection closes.
+async fn relay_upstream(client: TcpStream, fwd: &ForwardConfig, cancel: &CancellationToken) {
+	let local_ip = match client.local_addr() {
+		Ok(addr) => addr.ip().to_canonical(),
+		Err(e) => {
+			tracing::warn!(error = %e, "push forward: no local address");
+			return;
+		}
+	};
+	let Some(targets) = resolve_upstream(fwd, local_ip).await else {
+		return;
+	};
+	let Some(upstream) = connect_first(&targets).await else {
+		tracing::warn!(targets = ?targets, "push forward: couldn't connect upstream");
+		return;
+	};
+	splice(client, upstream, cancel).await;
+}
+
+/// Look up the upstream and drop answers that lead back here. `None`
+/// (logged) when nothing usable is left.
+async fn resolve_upstream(fwd: &ForwardConfig, local_ip: IpAddr) -> Option<Vec<SocketAddr>> {
+	let addrs = match crate::dns::lookup_a(fwd.resolver, &fwd.host, LOOKUP_TIMEOUT).await {
+		Ok(addrs) => addrs,
+		Err(e) => {
+			tracing::warn!(resolver = %fwd.resolver, error = %e, "push forward: upstream lookup failed");
+			return None;
+		}
+	};
+	let targets = upstream_targets(&addrs, local_ip, fwd.port);
+	if targets.is_empty() {
+		tracing::warn!(
+			resolver = %fwd.resolver,
+			answers = ?addrs,
+			"push forward: resolver gave no usable address for {} (an answer pointing back at this host means it has the LAN override; set upstream_resolver to one without it)",
+			fwd.host
+		);
+		return None;
+	}
+	Some(targets)
+}
+
+async fn splice(mut client: TcpStream, mut upstream: TcpStream, cancel: &CancellationToken) {
+	let relay = tokio::time::timeout(
+		RELAY_TIMEOUT,
+		tokio::io::copy_bidirectional(&mut client, &mut upstream),
+	);
+	tokio::select! {
+		_ = cancel.cancelled() => {}
+		result = relay => match result {
+			Ok(Ok((up, down))) => {
+				tracing::debug!(bytes_up = up, bytes_down = down, "push forwarded upstream");
+			}
+			Ok(Err(e)) => tracing::debug!(error = %e, "push forward: relay ended with an error"),
+			Err(_) => tracing::debug!("push forward: relay timed out"),
+		},
+	}
+}
+
+/// Socket addresses to try for the upstream, minus this host itself
+/// (and `0.0.0.0`, a resolver's "blocked" answer): with the resolver
+/// also overriding `pushx`, connecting there would loop back into this
+/// listener.
+fn upstream_targets(addrs: &[std::net::Ipv4Addr], local_ip: IpAddr, port: u16) -> Vec<SocketAddr> {
+	addrs
+		.iter()
+		.map(|&ip| IpAddr::V4(ip))
+		.filter(|&ip| ip != local_ip && !ip.is_unspecified())
+		.map(|ip| SocketAddr::new(ip, port))
+		.collect()
+}
+
+async fn connect_first(targets: &[SocketAddr]) -> Option<TcpStream> {
+	for &target in targets {
+		match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+			Ok(Ok(stream)) => return Some(stream),
+			Ok(Err(e)) => {
+				tracing::debug!(target = %target, error = %e, "push forward: connect failed")
+			}
+			Err(_) => tracing::debug!(target = %target, "push forward: connect timed out"),
+		}
+	}
+	None
 }
 
 /// Publish `status/push=off` for every camera, so a retained `on` from
@@ -496,6 +638,7 @@ mod tests {
 			bind_port: port,
 			motion_wake_hold: Duration::from_millis(10),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let cancel_clone = cancel.clone();
 		let task = tokio::spawn(async move {
@@ -529,6 +672,7 @@ mod tests {
 			bind_port: 0, // ephemeral
 			motion_wake_hold: Duration::from_millis(10),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let cancel_clone = cancel.clone();
 		let task = tokio::spawn(async move {
@@ -567,6 +711,7 @@ mod tests {
 			bind_port: port,
 			motion_wake_hold: Duration::from_millis(10),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let err = run(cfg, registry, cameras, None, "bairelay".into(), cancel)
 			.await
@@ -596,6 +741,7 @@ mod tests {
 			bind_port: port,
 			motion_wake_hold: Duration::from_millis(150),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let server = tokio::spawn(run_with_listener(
 			listener,
@@ -649,6 +795,7 @@ mod tests {
 			bind_port: port,
 			motion_wake_hold: Duration::from_millis(120),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let cancel_for_run = cancel.clone();
 		let server = tokio::spawn(async move {
@@ -719,6 +866,7 @@ mod tests {
 			bind_port: port,
 			motion_wake_hold: Duration::from_millis(150),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let cancel_for_run = cancel.clone();
 		let registry_for_run = Arc::clone(&registry);
@@ -794,6 +942,7 @@ mod tests {
 			bind_port: port,
 			motion_wake_hold: Duration::from_millis(150),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let cancel_for_run = cancel.clone();
 		let registry_for_run = Arc::clone(&registry);
@@ -895,6 +1044,7 @@ mod tests {
 			bind_port: port,
 			motion_wake_hold: Duration::from_millis(600),
 			stale_after: Duration::from_secs(80),
+			forward: None,
 		};
 		let server = tokio::spawn(run_with_listener(
 			listener,
@@ -952,6 +1102,161 @@ mod tests {
 				b"off".to_vec()
 			]
 		);
+
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+	}
+
+	fn forward_via(resolver: SocketAddr, port: u16) -> ForwardConfig {
+		ForwardConfig {
+			resolver,
+			host: PUSH_HOST.to_string(),
+			port,
+		}
+	}
+
+	#[test]
+	fn upstream_targets_skip_this_host_and_unspecified() {
+		let addrs = [
+			std::net::Ipv4Addr::new(192, 168, 1, 5),
+			std::net::Ipv4Addr::UNSPECIFIED,
+			std::net::Ipv4Addr::new(104, 18, 1, 1),
+		];
+		let local: IpAddr = "192.168.1.5".parse().unwrap();
+		assert_eq!(
+			upstream_targets(&addrs, local, 443),
+			["104.18.1.1:443".parse::<SocketAddr>().unwrap()]
+		);
+	}
+
+	#[tokio::test]
+	async fn resolve_upstream_keeps_real_answers_and_refuses_a_loop() {
+		let local: IpAddr = "127.0.0.1".parse().unwrap();
+		let mixed = crate::dns::test_support::fake_resolver(vec![
+			std::net::Ipv4Addr::LOCALHOST,
+			std::net::Ipv4Addr::new(203, 0, 113, 5),
+		])
+		.await;
+		assert_eq!(
+			resolve_upstream(&forward_via(mixed, 443), local).await,
+			Some(vec!["203.0.113.5:443".parse().unwrap()])
+		);
+		let only_us =
+			crate::dns::test_support::fake_resolver(vec![std::net::Ipv4Addr::LOCALHOST]).await;
+		assert_eq!(
+			resolve_upstream(&forward_via(only_us, 443), local).await,
+			None
+		);
+	}
+
+	#[tokio::test]
+	async fn resolve_upstream_gives_up_when_the_resolver_is_unreachable() {
+		// A closed UDP port answers with ICMP unreachable, so the lookup
+		// fails fast rather than timing out.
+		let closed = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let resolver = closed.local_addr().unwrap();
+		drop(closed);
+		let local: IpAddr = "127.0.0.1".parse().unwrap();
+		let result = tokio::time::timeout(
+			Duration::from_secs(10),
+			resolve_upstream(&forward_via(resolver, 443), local),
+		)
+		.await
+		.expect("lookup gives up");
+		assert_eq!(result, None);
+	}
+
+	#[tokio::test]
+	async fn splice_relays_both_directions_untouched() {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		// Upstream: read the ClientHello stand-in, answer, close.
+		let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let upstream_addr = upstream_listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			let (mut s, _) = upstream_listener.accept().await.unwrap();
+			let mut buf = [0u8; 5];
+			s.read_exact(&mut buf).await.unwrap();
+			assert_eq!(&buf, b"\x16\x03\x01hi");
+			s.write_all(b"\x16\x03\x03ok").await.unwrap();
+		});
+		// Camera side: our accepted end goes into the splice.
+		let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let mut camera = TcpStream::connect(front.local_addr().unwrap())
+			.await
+			.unwrap();
+		let (accepted, _) = front.accept().await.unwrap();
+		let upstream = connect_first(&[upstream_addr]).await.expect("connects");
+		let cancel = CancellationToken::new();
+		let relay = tokio::spawn(async move { splice(accepted, upstream, &cancel).await });
+
+		camera.write_all(b"\x16\x03\x01hi").await.unwrap();
+		let mut reply = Vec::new();
+		tokio::time::timeout(Duration::from_secs(2), camera.read_to_end(&mut reply))
+			.await
+			.expect("upstream close propagates")
+			.unwrap();
+		assert_eq!(reply, b"\x16\x03\x03ok");
+		drop(camera);
+		tokio::time::timeout(Duration::from_secs(2), relay)
+			.await
+			.expect("relay ends")
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn forwarding_listener_still_fires_motion_and_refuses_a_loop() {
+		use tokio::io::AsyncReadExt;
+		// The "upstream resolver" answers with this host, as a resolver
+		// carrying the LAN override would: motion must still fire, and
+		// the camera's connection must be closed rather than looped.
+		let resolver =
+			crate::dns::test_support::fake_resolver(vec![std::net::Ipv4Addr::LOCALHOST]).await;
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		cameras.insert(
+			"gate".into(),
+			handle_with_address("gate", Some("127.0.0.1")),
+		);
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let cfg = RuntimeConfig {
+			bind_addr: "127.0.0.1".parse().unwrap(),
+			bind_port: port,
+			motion_wake_hold: Duration::from_millis(150),
+			stale_after: Duration::from_secs(80),
+			forward: Some(forward_via(resolver, port)),
+		};
+		let server = tokio::spawn(run_with_listener(
+			listener,
+			cfg,
+			bairelay_wake_server::make_registry(),
+			Arc::new(cameras),
+			Some(mqtt),
+			"bairelay".into(),
+			cancel.clone(),
+		));
+
+		let mut camera = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.expect("connect");
+		let saw_on = poll_published(&mock, Duration::from_secs(2), |t, p| {
+			t == "bairelay/gate/status/motion" && p == b"on"
+		})
+		.await;
+		assert!(saw_on, "forwarding must not delay the motion edge");
+		let mut buf = [0u8; 1];
+		let read = tokio::time::timeout(Duration::from_secs(5), camera.read(&mut buf))
+			.await
+			.expect("refused relay closes the camera's connection");
+		assert!(matches!(read, Ok(0) | Err(_)), "got {read:?}");
+		// One push, so exactly one motion edge: no relay looped back in.
+		let edges = mock
+			.published()
+			.iter()
+			.filter(|(t, p, _)| t == "bairelay/gate/status/motion" && p == b"on")
+			.count();
+		assert_eq!(edges, 1);
 
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
