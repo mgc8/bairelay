@@ -1952,31 +1952,35 @@ fn validate_rejects_push_listener_zero_port() {
 }
 
 #[test]
-fn validate_rejects_push_listener_without_wake_server() {
-	// push_listener depends on the registry being populated by the wake
-	// server's heartbeat handler. Enabling push_listener alone is a
-	// silent foot-gun — every IP lookup misses.
+fn validate_accepts_push_listener_without_wake_server_when_a_camera_has_an_ip() {
+	// No heartbeat registry, but `minimal_camera_config`'s literal IP
+	// `address` lets pushes be matched by source IP.
 	let mut cfg = push_listener_cfg(30.0, 443);
 	cfg.wake_server = None;
-	let err = validate_config(&cfg).expect_err("must reject");
-	assert!(
-		err.contains("push_listener") && err.contains("wake_server"),
-		"error: {err}"
-	);
+	validate_config(&cfg).expect("address-matched push_listener must pass");
 }
 
 #[test]
-fn validate_rejects_push_listener_with_disabled_wake_server() {
-	let mut cfg = push_listener_cfg(30.0, 443);
-	cfg.wake_server = Some(bairelay_wake_server::WakeServerConfig {
-		enable: false,
-		..Default::default()
-	});
-	let err = validate_config(&cfg).expect_err("must reject");
-	assert!(
-		err.contains("push_listener") && err.contains("wake_server"),
-		"error: {err}"
-	);
+fn validate_rejects_push_listener_with_no_way_to_match_a_camera() {
+	// Wake server off and no camera has a literal IP: every push would
+	// miss silently.
+	for wake_server in [
+		None,
+		Some(bairelay_wake_server::WakeServerConfig {
+			enable: false,
+			..Default::default()
+		}),
+	] {
+		let mut cfg = push_listener_cfg(30.0, 443);
+		cfg.wake_server = wake_server;
+		cfg.cameras[0].address = Some("cam.local:9000".to_string());
+		cfg.cameras[0].uid = Some("9527000TESTCAM00".to_string());
+		let err = validate_config(&cfg).expect_err("must reject");
+		assert!(
+			err.contains("push_listener") && err.contains("wake_server") && err.contains("address"),
+			"error: {err}"
+		);
+	}
 }
 
 #[test]

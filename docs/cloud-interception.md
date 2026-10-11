@@ -404,7 +404,9 @@ If a future firmware ever loosens cert validation, `tests/scripts/pushx-sink/run
 
 But cert validation only blocks the body; the **connection attempt** is plaintext at the TCP layer. And the baseline capture establishes the key invariant: zero connections to `pushx.reolink.com` from the camera over 100 s of idle, and exactly one connection per motion event. So the SYN itself is the motion signal.
 
-What we need is the source IP → camera UID mapping, and we already have it: the wake server's `CameraRegistry` (Part I, §I.6.1) populates this map from `D2R_HB` heartbeats. The camera's TCP source IP for the motion push is the same as its UDP heartbeat source IP (different ephemeral port, same host). `CameraRegistry::lookup_by_ip` does the reverse lookup in one call.
+What we need is the source IP → camera mapping, and with the wake server running we already have it: its `CameraRegistry` (Part I, §I.6.1) populates this map from `D2R_HB` heartbeats. The camera's TCP source IP for the motion push is the same as its UDP heartbeat source IP (different ephemeral port, same host). `CameraRegistry::lookup_by_ip` does the reverse lookup in one call.
+
+When the registry has no entry (wake server disabled, or no fresh heartbeat), the listener falls back to the camera whose configured `address` is the peer IP. That only needs a literal IP and a stable lease, and it lets an operator hijack `pushx` alone — leaving `p2p*.reolink.com` with Reolink so the official app's remote access keeps working. Two cameras configured on one IP are ambiguous and match neither.
 
 The implementation drops the socket the instant `accept()` returns. There's no TLS termination, no read of bytes, no reply. The camera RSTs us back, then retries — possibly to the real `pushx.reolink.com` if the operator's resolver only redirects on a TTL window, or right back to us if the redirect is sticky. Either way the local motion event has already fired by the time the camera's retry kicks off.
 
@@ -425,7 +427,8 @@ The implementation drops the socket the instant `accept()` returns. There's no T
 
 5. Linear scan of the camera HashMap finds the CameraHandle whose
    configured (short) UID is a prefix of the registry (long) UID.
-   Same trick as `lookup_fresh` (§I.6.2).
+   Same trick as `lookup_fresh` (§I.6.2). No registry entry (wake
+   server off) -> the camera whose configured `address` is peer_ip.
 
 6. push_listener:
    - publishes status/motion=on to MQTT
@@ -464,7 +467,7 @@ The fallback `motion=off` in step 9 can race with step 8's live `motion=off` in 
 To make the listener fire on real motion, three things must be in place:
 
 1. **DNS hijack of `pushx.reolink.com`.** Same mechanism as Part I (§I.7) — operator's LAN resolver overrides the hostname to the bairelay box's IP. Pi-hole / AdGuard / unbound / dnsmasq all support this. Verify with `dig +short pushx.reolink.com` from another LAN host.
-2. **DNS hijack of `p2p*.reolink.com`** (Part I prerequisite). The push_listener relies on the wake server's registry, which is populated by `D2R_HB` heartbeats. Without the heartbeats hitting our wake server, the registry stays empty, peer-IP lookups all miss, and every motion connect logs "push from unknown IP — no registry match" and bails. Both DNS overrides are required together.
+2. **A way to match the pushing camera.** Either the wake server (Part I — DNS hijack of `p2p*.reolink.com` plus `[wake_server] enable = true`), whose `D2R_HB` heartbeats populate the registry, or a literal IP `address` on each camera with a DHCP reservation. With neither, every motion connect logs "push from unknown IP — no registry or address match" and bails; config validation refuses that combination up front.
 3. **`[push_listener] enable = true`** in `config.toml`. Defaults are sensible for the common case (bind inherits the wake-server bind, port 443, 30 s wake-hold). Override `push_listener_port` only when the bairelay host already runs another HTTPS service. Override `push_listener_addr` only on multi-homed hosts. See `sample_config.toml`.
 
 Bind-permission caveat: port 443 needs root on Linux/macOS (or `CAP_NET_BIND_SERVICE` on Linux). Operators running bairelay as a non-root systemd unit either grant the capability via `AmbientCapabilities=CAP_NET_BIND_SERVICE` or override the port to something un-privileged plus a redirecting iptables / pf rule.
@@ -480,6 +483,7 @@ Same shape as Part I's recipe (`docs/testing.md` § "Local wake server live-veri
 | TCP listener + accept loop                    | `src/push_listener.rs::run`                                          |
 | Peer-IP → registry UID                        | `crates/wake-server/src/registry.rs::CameraRegistry::lookup_by_ip`   |
 | Long-form UID → camera handle (prefix match)  | `src/push_listener.rs::match_camera_by_uid`                          |
+| Peer-IP → configured `address` (fallback)     | `src/push_listener.rs::match_camera_by_address`                      |
 | Motion publish + wake-lock + fallback off     | `src/push_listener.rs::fire_motion`                                  |
 | Operator-facing config schema                 | `src/config.rs::PushListenerConfig`, `sample_config.toml`            |
 | Shared-registry construction                  | `crates/wake-server/src/lib.rs::make_registry`                       |

@@ -251,7 +251,7 @@ Set `tls = true` in `[mqtt]` to connect over TLS (port is usually 8883). By defa
 Bairelay assumes a **trusted LAN** as its deployment context. That assumption shows up in a few places worth calling out:
 
 - **RTSP authentication is opt-in.** Without a `[[users]]` block, the RTSP server accepts anonymous connections. Add a `[[users]]` with name + pass (and optional per-camera `permitted_users` allow-list) to require Digest / Basic auth. Digest enforces a 5-minute nonce TTL and binds the digest URI to the request line per RFC 7616; Basic is offered alongside on plain transport for drop-in compatibility with permissive clients but is, of course, plaintext.
-- **Push listener trusts source IP.** Any TCP connection from a registered camera's IP is treated as motion. This is correct on a trusted LAN behind NAT, and the listener intentionally rejects when `[push_listener]` is enabled without `[wake_server] enable = true` (the registry would otherwise be empty).
+- **Push listener trusts source IP.** Any TCP connection from a known camera's IP (wake-server registry or configured `address`) is treated as motion. This is correct on a trusted LAN behind NAT, and the listener refuses to start when it has no way to match a camera — `[wake_server]` disabled and no camera with an IP `address`.
 
 ### Cloud ("account device") cameras
 
@@ -419,7 +419,9 @@ bind_port = 443                       # rebind if 443 is taken
 motion_wake_hold_secs = 30
 ```
 
-**What you have to do**: redirect DNS for `pushx.reolink.com` to bairelay. The camera connects, bairelay does a peer-IP → registered-UID reverse lookup, fires a `status/motion=on` MQTT publish, holds a wake-lock for `motion_wake_hold_secs`, and tears the socket. The TLS handshake never completes; the camera's retry state machine moves on within a few hundred milliseconds with no observable downstream effect.
+**What you have to do**: redirect DNS for `pushx.reolink.com` to bairelay. The camera connects, bairelay maps the peer IP to a camera — through the wake server's heartbeat registry, or failing that a camera whose `address` is that IP — fires a `status/motion=on` MQTT publish, holds a wake-lock for `motion_wake_hold_secs`, and tears the socket. The TLS handshake never completes; the camera's retry state machine moves on within a few hundred milliseconds with no observable downstream effect.
+
+**Without the wake server.** The push listener doesn't need `[wake_server]` if each camera has a literal IP `address` (with a DHCP reservation, since that's what pushes are matched on). Leaving `p2p*.reolink.com` with Reolink keeps the Reolink app's remote live view working; bairelay then reaches the camera — awake from the motion that triggered the push — through its configured discovery.
 
 The "real" `motion=off` arrives once bairelay reconnects in-session and the camera reports `MotionStatus::Stop` natively. The hold-window timeout is a fallback so HA never sticks on `on`.
 

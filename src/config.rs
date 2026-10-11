@@ -181,7 +181,8 @@ impl Default for Config {
 /// event. Operator-side DNS hijack for `pushx.reolink.com` →
 /// `push_listener_addr` is the prerequisite. Listener doesn't
 /// terminate TLS — the connection's existence is the signal; we
-/// close immediately.
+/// close immediately. The source IP is matched against the wake
+/// server's heartbeat registry, then each camera's IP `address`.
 ///
 /// Field names are deliberately prefixed (`push_listener_addr` /
 /// `push_listener_port`) rather than `bind_addr` / `bind_port` so an
@@ -1323,13 +1324,19 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 					"[push_listener]: push_listener_port must be greater than 0".to_string()
 				);
 			}
-			// The push listener depends on the shared `CameraRegistry` being
-			// populated by the wake server's `D2R_HB` handler. Without it
-			// every `lookup_by_ip` misses silently and motion never fires.
+			// A push is attributed to a camera by its source IP, via the
+			// wake server's heartbeat registry or a camera's literal IP
+			// `address`. With neither, every push misses silently.
 			let wake_enabled = config.wake_server.as_ref().is_some_and(|w| w.enable);
-			if !wake_enabled {
+			let any_ip_address = config.cameras.iter().any(|c| {
+				c.address
+					.as_deref()
+					.and_then(|a| crate::bc_opts::parse_address(a).0)
+					.is_some()
+			});
+			if !wake_enabled && !any_ip_address {
 				return Err(
-					"[push_listener] requires [wake_server] enable = true; the push listener resolves peer IPs against the wake server's heartbeat registry"
+					"[push_listener] can't tell which camera pushed: enable [wake_server] (matches pushes against its heartbeat registry) or give each camera an IP `address`"
 						.to_string(),
 				);
 			}

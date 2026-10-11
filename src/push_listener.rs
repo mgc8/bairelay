@@ -10,8 +10,13 @@
 //! need to. The TCP-SYN itself is the motion signal: in a 100 s baseline
 //! capture, the camera made zero connections to `pushx.reolink.com`
 //! outside the two motion edges. So we treat any `accept()` from a
-//! registered camera's IP as a motion event, fire `status/motion=on`
+//! known camera's IP as a motion event, fire `status/motion=on`
 //! plus a `motion_wake_hold_secs` wake-lock, and close the socket.
+//!
+//! A camera is known by its source IP: first through the wake server's
+//! heartbeat registry, then through a camera's configured IP `address`
+//! — the latter lets the listener run without the wake server, leaving
+//! `p2p*.reolink.com` (and so the Reolink app) untouched.
 //!
 //! The wake-lock acquire kicks the connect loop, which uses the local
 //! BcUdp wake server to bring the camera online. Once the
@@ -27,7 +32,8 @@
 //! `AlarmEvent`; the fallback clears them alongside `motion`.
 //!
 //! **Threat model — source-IP trust.** A peer IP that resolves through
-//! the wake-server registry is treated as authentic; we have no further
+//! the wake-server registry or a configured address is treated as
+//! authentic; we have no further
 //! authentication on the TCP-accept itself (the camera's TLS handshake
 //! never completes — the cert chain is pinned to Reolink's CA). On a
 //! flat home LAN, anyone able to spoof the camera's IP can fire a fake
@@ -123,7 +129,9 @@ pub async fn run_with_listener(
 				match accept {
 					Ok((sock, peer)) => {
 						drop(sock);
-						handle_push(peer.ip(), &registry, &cameras, mqtt.as_ref(), &topic_prefix, &cfg, &cancel);
+						// An IPv4 camera reaching a dual-stack bind shows
+						// up as `::ffff:a.b.c.d`; match on the plain form.
+						handle_push(peer.ip().to_canonical(), &registry, &cameras, mqtt.as_ref(), &topic_prefix, &cfg, &cancel);
 					}
 					Err(e) => {
 						tracing::warn!(error = %e, "push listener accept failed");
@@ -147,19 +155,21 @@ fn handle_push(
 	cfg: &RuntimeConfig,
 	cancel: &CancellationToken,
 ) {
-	let Some((registry_uid, _entry)) =
-		registry.lookup_by_ip(peer_ip, Instant::now(), cfg.stale_after)
-	else {
-		tracing::debug!(peer_ip = %peer_ip, "push from unknown IP — no registry match");
-		return;
-	};
-
-	let Some(handle) = match_camera_by_uid(cameras, &registry_uid) else {
-		tracing::debug!(
-			peer_ip = %peer_ip,
-			registry_uid = %registry_uid,
-			"push matched registry UID but no camera handle has a matching configured UID"
-		);
+	let by_registry = registry
+		.lookup_by_ip(peer_ip, Instant::now(), cfg.stale_after)
+		.and_then(|(registry_uid, _entry)| {
+			let handle = match_camera_by_uid(cameras, &registry_uid);
+			if handle.is_none() {
+				tracing::debug!(
+					peer_ip = %peer_ip,
+					registry_uid = %registry_uid,
+					"push matched registry UID but no camera handle has a matching configured UID"
+				);
+			}
+			handle
+		});
+	let Some(handle) = by_registry.or_else(|| match_camera_by_address(cameras, peer_ip)) else {
+		tracing::debug!(peer_ip = %peer_ip, "push from unknown IP — no registry or address match");
 		return;
 	};
 
@@ -214,6 +224,25 @@ pub(crate) fn match_camera_by_uid<'a>(
 				.is_some_and(|cfg_uid| registry_uid.starts_with(cfg_uid))
 		})
 		.max_by_key(|h| h.config().uid.as_deref().map_or(0, str::len))
+}
+
+/// Resolve the camera whose configured `address` is `peer_ip`. Needs a
+/// literal IP (and, in practice, a DHCP reservation). Two cameras on
+/// one IP are ambiguous, so neither is matched.
+pub(crate) fn match_camera_by_address(
+	cameras: &HashMap<String, Arc<CameraHandle>>,
+	peer_ip: IpAddr,
+) -> Option<&Arc<CameraHandle>> {
+	let mut matches = cameras.values().filter(|h| {
+		h.config()
+			.address
+			.as_deref()
+			.and_then(|a| crate::bc_opts::parse_address(a).0)
+			.map(|ip| ip.to_canonical())
+			== Some(peer_ip)
+	});
+	let first = matches.next()?;
+	matches.next().is_none().then_some(first)
 }
 
 /// Fire the motion event: publish `status/motion=on`, hold a wake-lock
@@ -295,6 +324,45 @@ mod tests {
 		let mut cfg = minimal_camera_config(name);
 		cfg.uid = uid.map(str::to_string);
 		Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None))
+	}
+
+	fn handle_with_address(name: &str, address: Option<&str>) -> Arc<CameraHandle> {
+		let mut cfg = minimal_camera_config(name);
+		cfg.address = address.map(str::to_string);
+		Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None))
+	}
+
+	#[test]
+	fn match_by_address_with_and_without_port() {
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		cameras.insert(
+			"front".into(),
+			handle_with_address("front", Some("192.168.1.20:9000")),
+		);
+		cameras.insert(
+			"back".into(),
+			handle_with_address("back", Some("192.168.1.21")),
+		);
+		cameras.insert(
+			"named".into(),
+			handle_with_address("named", Some("cam.local")),
+		);
+		let front = match_camera_by_address(&cameras, "192.168.1.20".parse().unwrap());
+		assert_eq!(front.expect("match").name(), "front");
+		let back = match_camera_by_address(&cameras, "192.168.1.21".parse().unwrap());
+		assert_eq!(back.expect("match").name(), "back");
+		assert!(match_camera_by_address(&cameras, "192.168.1.22".parse().unwrap()).is_none());
+	}
+
+	#[test]
+	fn match_by_address_refuses_ambiguous_ip() {
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		cameras.insert("a".into(), handle_with_address("a", Some("192.168.1.20")));
+		cameras.insert(
+			"b".into(),
+			handle_with_address("b", Some("192.168.1.20:9000")),
+		);
+		assert!(match_camera_by_address(&cameras, "192.168.1.20".parse().unwrap()).is_none());
 	}
 
 	#[test]
@@ -463,6 +531,50 @@ mod tests {
 			PushListenerError::Bind { addr, .. } => assert_eq!(addr.port(), port),
 			other => panic!("expected Bind, got {other:?}"),
 		}
+	}
+
+	#[tokio::test]
+	async fn end_to_end_tcp_connect_matches_by_address_without_registry() {
+		// Wake server off: the registry stays empty and the camera is
+		// found by its configured IP instead.
+		let registry = bairelay_wake_server::make_registry();
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		let handle = handle_with_address("porch", Some("127.0.0.1:9000"));
+		cameras.insert("porch".into(), Arc::clone(&handle));
+		let cameras = Arc::new(cameras);
+
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let cfg = RuntimeConfig {
+			bind_addr: "127.0.0.1".parse().unwrap(),
+			bind_port: port,
+			motion_wake_hold: Duration::from_millis(150),
+			stale_after: Duration::from_secs(80),
+		};
+		let server = tokio::spawn(run_with_listener(
+			listener,
+			cfg,
+			registry,
+			cameras,
+			Some(mqtt),
+			"bairelay".into(),
+			cancel.clone(),
+		));
+
+		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.expect("connect");
+		let saw_on = poll_published(&mock, Duration::from_secs(2), |t, p| {
+			t == "bairelay/porch/status/motion" && p == b"on"
+		})
+		.await;
+		assert!(saw_on, "address match must fire status/motion=on");
+		assert!(handle.wake_lock().count() >= 1);
+
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 	}
 
 	#[tokio::test]

@@ -6,23 +6,29 @@ use bairelay_neolink_core::bc_protocol::{
 };
 use std::net::IpAddr;
 
+/// Split a camera `address` (`ip`, `ip:port`, `[v6]:port`) into its IP
+/// and optional port. Hostnames yield no IP — only literals are used.
+pub fn parse_address(addr: &str) -> (Option<IpAddr>, Option<u16>) {
+	if let Ok(ip) = addr.parse::<IpAddr>() {
+		return (Some(ip), None);
+	}
+	match addr.rsplit_once(':') {
+		Some((host, port)) => (
+			host.trim_start_matches('[')
+				.trim_end_matches(']')
+				.parse()
+				.ok(),
+			port.parse().ok(),
+		),
+		None => (None, None),
+	}
+}
+
 /// Build a `BcCameraOpt` from the service `CameraConfig` using the same
 /// rules the long-running camera connect loop uses.
 pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
-	let mut addrs = vec![];
-	let mut port = None;
-
-	if let Some(ref addr_str) = cfg.address {
-		// Parse "host:port" format
-		if let Some((host, p)) = addr_str.rsplit_once(':') {
-			if let Ok(ip) = host.parse::<IpAddr>() {
-				addrs.push(ip);
-			}
-			port = p.parse().ok();
-		} else if let Ok(ip) = addr_str.parse::<IpAddr>() {
-			addrs.push(ip);
-		}
-	}
+	let (ip, port) = cfg.address.as_deref().map_or((None, None), parse_address);
+	let addrs: Vec<IpAddr> = ip.into_iter().collect();
 
 	let discovery = match cfg.discovery {
 		config::DiscoveryMethod::Local => DiscoveryMethods::Local,
@@ -88,6 +94,18 @@ mod tests {
 			"#,
 		)
 		.unwrap()
+	}
+
+	#[test]
+	fn parse_address_accepts_ip_with_and_without_port() {
+		let v4: IpAddr = "192.168.1.187".parse().unwrap();
+		let v6: IpAddr = "fe80::1".parse().unwrap();
+		assert_eq!(parse_address("192.168.1.187"), (Some(v4), None));
+		assert_eq!(parse_address("192.168.1.187:9000"), (Some(v4), Some(9000)));
+		assert_eq!(parse_address("fe80::1"), (Some(v6), None));
+		assert_eq!(parse_address("[fe80::1]:9000"), (Some(v6), Some(9000)));
+		assert_eq!(parse_address("cam.local:9000"), (None, Some(9000)));
+		assert_eq!(parse_address("cam.local"), (None, None));
 	}
 
 	#[test]

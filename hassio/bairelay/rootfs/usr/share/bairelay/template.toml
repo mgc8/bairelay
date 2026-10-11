@@ -67,6 +67,10 @@ bind = "0.0.0.0"
 # Motion-push listener.
 # Treats the camera's TCP connect to pushx.reolink.com as a motion event.
 # Operator must redirect DNS for pushx.reolink.com to push_listener_addr.
+# The pushing camera is found by source IP: via [wake_server]'s heartbeat
+# registry when enabled, else by a camera's IP `address` (give it a DHCP
+# reservation). Without the wake server, p2p*.reolink.com stays with
+# Reolink, so the Reolink app keeps working.
 # [push_listener]
 # enable = false                       # opt-in
 # push_listener_addr = "0.0.0.0"       # default: wake_server bind / top-level bind
