@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::status::MotionClass;
+
 pub mod publisher;
 
 pub use publisher::{CameraEnableFlags, DiscoveryPublisher};
@@ -46,6 +48,8 @@ pub enum Feature {
 	Floodlight,
 	Camera,
 	Motion,
+	/// Per-class (person / vehicle / animal / other) motion sensors.
+	MotionClass,
 	Led,
 	Ir,
 	Reboot,
@@ -59,10 +63,11 @@ pub enum Feature {
 impl Feature {
 	/// Full set of features emitted when `[mqtt.discovery]` is
 	/// present and no explicit `features = [...]` list is supplied.
-	pub const ALL: [Feature; 11] = [
+	pub const ALL: [Feature; 12] = [
 		Feature::Floodlight,
 		Feature::Camera,
 		Feature::Motion,
+		Feature::MotionClass,
 		Feature::Led,
 		Feature::Ir,
 		Feature::Reboot,
@@ -463,6 +468,47 @@ pub fn build_motion(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	))
 }
 
+/// One `binary_sensor` per [`MotionClass`], each refining the
+/// aggregate `md` sensor. Unique ids extend neolink's `_md` suffix
+/// (`_md_person`, …) so they group with it in the HA registry.
+pub fn build_motion_classes(ctx: &DiscoveryContext) -> Vec<(String, Vec<u8>)> {
+	let friendly = title_case(ctx.camera_name);
+	MotionClass::ALL
+		.into_iter()
+		.map(|class| {
+			let (label, icon) = match class {
+				MotionClass::Person => ("Person", "mdi:walk"),
+				MotionClass::Vehicle => ("Vehicle", "mdi:car"),
+				MotionClass::Animal => ("Animal", "mdi:paw"),
+				MotionClass::Other => ("Other Motion", "mdi:motion-sensor"),
+			};
+			let unique_id = unique(
+				ctx.topic_prefix,
+				ctx.camera_name,
+				&format!("md_{}", class.as_str()),
+			);
+			let payload = DiscoveryBinarySensor {
+				name: format!("{friendly} {label}"),
+				unique_id: unique_id.clone(),
+				icon: Some(icon.to_string()),
+				device: device_block(ctx, &friendly),
+				availability: availability_block(ctx),
+				payload_off: "off".to_string(),
+				payload_on: "on".to_string(),
+				state_topic: crate::topics::status_motion_class(
+					ctx.topic_prefix,
+					ctx.camera_name,
+					class,
+				),
+			};
+			(
+				config_topic(ctx, "binary_sensor", &unique_id),
+				to_json(&payload),
+			)
+		})
+		.collect()
+}
+
 /// `(unique_id, config topic)` of the status-LED switch.
 fn led_ids(ctx: &DiscoveryContext) -> (String, String) {
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "led");
@@ -754,6 +800,7 @@ mod tests {
 				Feature::Floodlight
 				| Feature::Camera
 				| Feature::Motion
+				| Feature::MotionClass
 				| Feature::Led
 				| Feature::Ir
 				| Feature::Reboot
@@ -767,7 +814,7 @@ mod tests {
 		for f in Feature::ALL {
 			touch(f);
 		}
-		assert_eq!(Feature::ALL.len(), 11);
+		assert_eq!(Feature::ALL.len(), 12);
 	}
 
 	#[test]
@@ -995,6 +1042,55 @@ mod tests {
 		let (_, ir) = build_ir(&ctx).expect("emitted");
 		let v = parse(&ir);
 		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/ir");
+	}
+
+	#[test]
+	fn motion_classes_emit_one_binary_sensor_per_class() {
+		let f = Fixture::new("bairelay");
+		let caps = CameraCapabilitiesView::default();
+		let ctx = f.ctx(&caps);
+		let emitted = build_motion_classes(&ctx);
+		let got: Vec<(String, String, String, String)> = emitted
+			.iter()
+			.map(|(topic, json)| {
+				let v = parse(json);
+				(
+					topic.clone(),
+					v["unique_id"].as_str().unwrap().to_string(),
+					v["name"].as_str().unwrap().to_string(),
+					v["state_topic"].as_str().unwrap().to_string(),
+				)
+			})
+			.collect();
+		let expected: Vec<(String, String, String, String)> = [
+			("person", "Person"),
+			("vehicle", "Vehicle"),
+			("animal", "Animal"),
+			("other", "Other Motion"),
+		]
+		.into_iter()
+		.map(|(class, label)| {
+			(
+				format!("homeassistant/binary_sensor/bairelay_frontdoor_md_{class}/config"),
+				format!("bairelay_frontdoor_md_{class}"),
+				format!("Frontdoor {label}"),
+				format!("bairelay/frontdoor/status/motion/{class}"),
+			)
+		})
+		.collect();
+		assert_eq!(got, expected);
+		for (_, json) in &emitted {
+			let v = parse(json);
+			assert_eq!(v["payload_on"], "on");
+			assert_eq!(v["payload_off"], "off");
+			assert_eq!(v["availability"]["topic"], "bairelay/frontdoor/status");
+		}
+	}
+
+	#[test]
+	fn motion_class_feature_parses_from_snake_case() {
+		let f: Feature = serde_json::from_str("\"motion_class\"").unwrap();
+		assert_eq!(f, Feature::MotionClass);
 	}
 
 	#[test]

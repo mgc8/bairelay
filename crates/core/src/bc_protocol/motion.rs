@@ -8,11 +8,51 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::bc_protocol::connection::mock::{reply_200_empty, reply_err_code, MockConnection};
 
+/// Object classes the camera attributed an active alarm to, parsed
+/// from the comma-separated `AItype` of an `AlarmEvent`.
+///
+/// `other` is the camera's own `other` token (battery cameras report
+/// PIR-triggered motion this way) and is also set when no person,
+/// vehicle or animal is reported, so every active alarm carries at
+/// least one class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AiDetections {
+	/// `people`
+	pub person: bool,
+	/// `vehicle`
+	pub vehicle: bool,
+	/// `dog_cat`
+	pub animal: bool,
+	/// `other`, or no recognised class
+	pub other: bool,
+}
+
+impl AiDetections {
+	/// Classify an active alarm from its `AItype` field
+	pub fn from_ai_type(ai_type: Option<&str>) -> Self {
+		let mut detections = Self::default();
+		for token in ai_type.unwrap_or_default().split(',') {
+			match token.trim() {
+				"people" => detections.person = true,
+				"vehicle" => detections.vehicle = true,
+				"dog_cat" => detections.animal = true,
+				"other" => detections.other = true,
+				_ => {}
+			}
+		}
+		if !(detections.person || detections.vehicle || detections.animal) {
+			detections.other = true;
+		}
+		detections
+	}
+}
+
 /// Motion Status that the callback can send
 #[derive(Clone, Copy, Debug)]
 pub enum MotionStatus {
-	/// Sent when motion is first detected
-	Start(Instant),
+	/// Sent when motion is first detected, and again whenever the
+	/// camera re-reports the alarm (e.g. its AI classification changes)
+	Start(Instant, AiDetections),
 	/// Sent when motion stops
 	Stop(Instant),
 	/// Sent when an Alarm about something other than motion was received
@@ -43,7 +83,7 @@ impl MotionData {
 	pub fn motion_detected(&mut self) -> Result<Option<bool>> {
 		self.consume_motion_events()?;
 		Ok(match &self.last_update {
-			MotionStatus::Start(_) => Some(true),
+			MotionStatus::Start(..) => Some(true),
 			MotionStatus::Stop(_) => Some(false),
 			MotionStatus::NoChange(_) => None,
 		})
@@ -56,7 +96,7 @@ impl MotionData {
 	pub fn motion_detected_within(&mut self, duration: Duration) -> Result<Option<bool>> {
 		self.consume_motion_events()?;
 		Ok(match &self.last_update {
-			MotionStatus::Start(_) => Some(true),
+			MotionStatus::Start(..) => Some(true),
 			MotionStatus::Stop(time) => Some((Instant::now() - *time) < duration),
 			MotionStatus::NoChange(_) => None,
 		})
@@ -119,7 +159,7 @@ impl MotionData {
 						v = async {
 							loop {
 								match self.next_motion().await {
-									n @ Ok(MotionStatus::Start(_)) => {return n;},
+									n @ Ok(MotionStatus::Start(..)) => {return n;},
 									n @ Err(_) => {return n;},
 									_ => {continue;}
 								}
@@ -144,7 +184,7 @@ impl MotionData {
 		let motions = self.consume_motion_events()?;
 		let mut last_motion = motions.last().copied();
 		loop {
-			if let Some(MotionStatus::Start(time)) = last_motion {
+			if let Some(MotionStatus::Start(time, _)) = last_motion {
 				// In start state
 				if duration.is_zero() || (Instant::now() - time) > duration {
 					return Ok(());
@@ -261,7 +301,12 @@ impl BcCamera {
 													.map(|ai_type| ai_type != "none")
 													.unwrap_or(false)
 											{
-												result = MotionStatus::Start(Instant::now());
+												result = MotionStatus::Start(
+													Instant::now(),
+													AiDetections::from_ai_type(
+														alarm_event.ai_type.as_deref(),
+													),
+												);
 												break;
 											} else {
 												result = MotionStatus::Stop(Instant::now());
@@ -372,6 +417,89 @@ mod tests {
 		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
 
+	// ---- AItype classification ----
+
+	#[test]
+	fn ai_detections_maps_each_wire_class() {
+		for (ai_type, expected) in [
+			(
+				"people",
+				AiDetections {
+					person: true,
+					..Default::default()
+				},
+			),
+			(
+				"vehicle",
+				AiDetections {
+					vehicle: true,
+					..Default::default()
+				},
+			),
+			(
+				"dog_cat",
+				AiDetections {
+					animal: true,
+					..Default::default()
+				},
+			),
+			(
+				"other",
+				AiDetections {
+					other: true,
+					..Default::default()
+				},
+			),
+		] {
+			assert_eq!(
+				AiDetections::from_ai_type(Some(ai_type)),
+				expected,
+				"AItype {ai_type:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn ai_detections_splits_comma_separated_list() {
+		assert_eq!(
+			AiDetections::from_ai_type(Some("people, dog_cat")),
+			AiDetections {
+				person: true,
+				animal: true,
+				..Default::default()
+			}
+		);
+	}
+
+	#[test]
+	fn ai_detections_keeps_explicit_other_alongside_a_class() {
+		assert_eq!(
+			AiDetections::from_ai_type(Some("vehicle,other")),
+			AiDetections {
+				vehicle: true,
+				other: true,
+				..Default::default()
+			}
+		);
+	}
+
+	#[test]
+	fn ai_detections_unclassified_alarm_is_other() {
+		// `MD` with `AItype` absent, `none`, or a class we don't map
+		// (`face`, `package`) is still motion — it lands in `other`.
+		let other_only = AiDetections {
+			other: true,
+			..Default::default()
+		};
+		for ai_type in [None, Some("none"), Some(""), Some("face"), Some("package")] {
+			assert_eq!(
+				AiDetections::from_ai_type(ai_type),
+				other_only,
+				"AItype {ai_type:?}"
+			);
+		}
+	}
+
 	// ---- MotionData state-machine tests driven by `test_new` ----
 
 	#[tokio::test]
@@ -387,9 +515,12 @@ mod tests {
 	async fn motion_detected_after_start_event_is_true() {
 		let (tx, rx) = channel::<Result<MotionStatus>>(4);
 		let mut md = MotionData::test_new(rx);
-		tx.send(Ok(MotionStatus::Start(Instant::now())))
-			.await
-			.unwrap();
+		tx.send(Ok(MotionStatus::Start(
+			Instant::now(),
+			AiDetections::default(),
+		)))
+		.await
+		.unwrap();
 		// Yield so the channel is drained on try_recv.
 		tokio::task::yield_now().await;
 		assert_eq!(md.motion_detected().expect("ok"), Some(true));
@@ -443,9 +574,12 @@ mod tests {
 	async fn motion_detected_within_start_is_some_true() {
 		let (tx, rx) = channel::<Result<MotionStatus>>(4);
 		let mut md = MotionData::test_new(rx);
-		tx.send(Ok(MotionStatus::Start(Instant::now())))
-			.await
-			.unwrap();
+		tx.send(Ok(MotionStatus::Start(
+			Instant::now(),
+			AiDetections::default(),
+		)))
+		.await
+		.unwrap();
 		tokio::task::yield_now().await;
 		assert_eq!(
 			md.motion_detected_within(Duration::from_secs(60))
@@ -468,13 +602,15 @@ mod tests {
 		let (tx, rx) = channel::<Result<MotionStatus>>(4);
 		let mut md = MotionData::test_new(rx);
 		let t = Instant::now();
-		tx.send(Ok(MotionStatus::Start(t))).await.unwrap();
+		tx.send(Ok(MotionStatus::Start(t, AiDetections::default())))
+			.await
+			.unwrap();
 		tokio::task::yield_now().await;
 		let status = tokio::time::timeout(Duration::from_millis(200), md.next_motion())
 			.await
 			.expect("did not hang")
 			.expect("ok");
-		assert!(matches!(status, MotionStatus::Start(_)));
+		assert!(matches!(status, MotionStatus::Start(..)));
 	}
 
 	#[tokio::test]
@@ -533,9 +669,12 @@ mod tests {
 	async fn await_start_zero_duration_returns_immediately() {
 		let (tx, rx) = channel::<Result<MotionStatus>>(4);
 		let mut md = MotionData::test_new(rx);
-		tx.send(Ok(MotionStatus::Start(Instant::now())))
-			.await
-			.unwrap();
+		tx.send(Ok(MotionStatus::Start(
+			Instant::now(),
+			AiDetections::default(),
+		)))
+		.await
+		.unwrap();
 		tokio::task::yield_now().await;
 		tokio::time::timeout(Duration::from_millis(200), md.await_start(Duration::ZERO))
 			.await
@@ -570,6 +709,7 @@ mod tests {
 		let mut md = MotionData::test_new(rx);
 		tx.send(Ok(MotionStatus::Start(
 			Instant::now() - Duration::from_secs(3600),
+			AiDetections::default(),
 		)))
 		.await
 		.unwrap();
@@ -607,9 +747,12 @@ mod tests {
 	async fn await_start_sleep_satisfies_after_recent_start() {
 		let (tx, rx) = channel::<Result<MotionStatus>>(4);
 		let mut md = MotionData::test_new(rx);
-		tx.send(Ok(MotionStatus::Start(Instant::now())))
-			.await
-			.unwrap();
+		tx.send(Ok(MotionStatus::Start(
+			Instant::now(),
+			AiDetections::default(),
+		)))
+		.await
+		.unwrap();
 		tokio::task::yield_now().await;
 		tokio::time::timeout(
 			Duration::from_millis(200),
@@ -674,6 +817,7 @@ mod tests {
 		tokio::spawn(async move {
 			tx.send(Ok(MotionStatus::Start(
 				Instant::now() - Duration::from_secs(3600),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();
@@ -743,7 +887,17 @@ mod tests {
 			.await
 			.expect("did not hang")
 			.expect("ok");
-		assert!(matches!(status, MotionStatus::Start(_)));
+		// Plain `MD` with no `AItype` is unclassified motion.
+		let MotionStatus::Start(_, detections) = status else {
+			panic!("expected Start, got {status:?}");
+		};
+		assert_eq!(
+			detections,
+			AiDetections {
+				other: true,
+				..Default::default()
+			}
+		);
 	}
 
 	#[tokio::test]
@@ -829,7 +983,7 @@ mod tests {
 							status: "none".into(),
 							recording: 0,
 							timeStamp: 0,
-							ai_type: Some("person".into()),
+							ai_type: Some("people".into()),
 						}],
 					}),
 					..Default::default()
@@ -841,7 +995,16 @@ mod tests {
 			.await
 			.expect("did not hang")
 			.expect("ok");
-		assert!(matches!(status, MotionStatus::Start(_)));
+		let MotionStatus::Start(_, detections) = status else {
+			panic!("expected Start, got {status:?}");
+		};
+		assert_eq!(
+			detections,
+			AiDetections {
+				person: true,
+				..Default::default()
+			}
+		);
 	}
 
 	#[tokio::test]
@@ -967,9 +1130,12 @@ mod tests {
 		tokio::spawn(async move {
 			// Start arrives 10 ms in → wins the select; outer loop loops.
 			tokio::time::sleep(Duration::from_millis(10)).await;
-			tx_c.send(Ok(MotionStatus::Start(Instant::now())))
-				.await
-				.unwrap();
+			tx_c.send(Ok(MotionStatus::Start(
+				Instant::now(),
+				AiDetections::default(),
+			)))
+			.await
+			.unwrap();
 			// Then Stop "long ago" → second iteration's sleep is ZERO so
 			// fast-path returns Ok immediately.
 			tokio::time::sleep(Duration::from_millis(10)).await;
@@ -995,9 +1161,12 @@ mod tests {
 	async fn await_start_resets_when_motion_stops_during_sleep() {
 		let (tx, rx) = channel::<Result<MotionStatus>>(8);
 		let mut md = MotionData::test_new(rx);
-		tx.send(Ok(MotionStatus::Start(Instant::now())))
-			.await
-			.unwrap();
+		tx.send(Ok(MotionStatus::Start(
+			Instant::now(),
+			AiDetections::default(),
+		)))
+		.await
+		.unwrap();
 		let tx_c = tx.clone();
 		tokio::spawn(async move {
 			tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1007,6 +1176,7 @@ mod tests {
 			tokio::time::sleep(Duration::from_millis(10)).await;
 			tx_c.send(Ok(MotionStatus::Start(
 				Instant::now() - Duration::from_secs(60),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();
@@ -1049,9 +1219,12 @@ mod tests {
 	async fn await_start_propagates_inner_err() {
 		let (tx, rx) = channel::<Result<MotionStatus>>(4);
 		let mut md = MotionData::test_new(rx);
-		tx.send(Ok(MotionStatus::Start(Instant::now())))
-			.await
-			.unwrap();
+		tx.send(Ok(MotionStatus::Start(
+			Instant::now(),
+			AiDetections::default(),
+		)))
+		.await
+		.unwrap();
 		tokio::spawn(async move {
 			tokio::time::sleep(Duration::from_millis(10)).await;
 			tx.send(Err(Error::Other("boom"))).await.unwrap();

@@ -57,7 +57,7 @@ pub use errors::Error;
 pub use fake_camera::{FakeCalls, FakeCamera, FakeCameraBuilder};
 pub use ledstate::LightState;
 pub use login::MaxEncryption;
-pub use motion::{MotionData, MotionStatus};
+pub use motion::{AiDetections, MotionData, MotionStatus};
 pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;

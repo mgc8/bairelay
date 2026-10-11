@@ -6,6 +6,8 @@
 //! deployment). Every helper is a pure function of `(prefix, cam)` —
 //! no global state, no hidden defaults.
 
+use crate::status::MotionClass;
+
 // ── Status topics ──────────────────────────────────────────────────────
 
 /// Camera online/offline status: `{prefix}/{cam}/status`
@@ -16,6 +18,11 @@ pub fn status(prefix: &str, cam: &str) -> String {
 /// Motion detection events: `{prefix}/{cam}/status/motion`
 pub fn status_motion(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/status/motion")
+}
+
+/// Per-class motion detection: `{prefix}/{cam}/status/motion/{class}`
+pub fn status_motion_class(prefix: &str, cam: &str, class: MotionClass) -> String {
+	format!("{prefix}/{cam}/status/motion/{}", class.as_str())
 }
 
 /// Battery level percentage: `{prefix}/{cam}/status/battery_level`

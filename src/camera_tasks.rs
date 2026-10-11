@@ -10,10 +10,12 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use bairelay_neolink_core::bc_protocol::{CameraDriver, Error as CoreError, MotionStatus};
+use bairelay_neolink_core::bc_protocol::{
+	AiDetections, CameraDriver, Error as CoreError, MotionStatus,
+};
 
 use bairelay_mqtt::control::IrMode;
-use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
+use bairelay_mqtt::{MotionClass, MqttError, SharedMqttClient, StatusPublisher};
 use bairelay_rtsp::buffer::LastFrameBuffer;
 
 use crate::camera::ReconnectBackoff;
@@ -26,6 +28,38 @@ use crate::status_cache::StatusCache;
 use crate::wake_lock::{WakeLockCounter, WakeLockGuard};
 
 // ── Motion Detection ─────────────────────────────────────────────────
+
+fn class_detected(detections: AiDetections, class: MotionClass) -> bool {
+	match class {
+		MotionClass::Person => detections.person,
+		MotionClass::Vehicle => detections.vehicle,
+		MotionClass::Animal => detections.animal,
+		MotionClass::Other => detections.other,
+	}
+}
+
+fn detected_class_names(detections: AiDetections) -> String {
+	MotionClass::ALL
+		.into_iter()
+		.filter(|&class| class_detected(detections, class))
+		.map(MotionClass::as_str)
+		.collect::<Vec<_>>()
+		.join(",")
+}
+
+/// Publish every per-class motion topic from one set of detections;
+/// `AiDetections::default()` turns every class off.
+pub(crate) async fn publish_motion_classes(
+	publisher: &StatusPublisher<'_>,
+	detections: AiDetections,
+) -> Result<(), MqttError> {
+	for class in MotionClass::ALL {
+		publisher
+			.publish_motion_class(class, class_detected(detections, class))
+			.await?;
+	}
+	Ok(())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn motion_listener(
@@ -89,8 +123,12 @@ pub async fn motion_listener(
 				}
 				result = motion_data.next_motion() => {
 					match result {
-						Ok(MotionStatus::Start(_)) => {
-							tracing::info!(camera = %camera_name, "Motion detected");
+						Ok(MotionStatus::Start(_, detections)) => {
+							tracing::info!(
+								camera = %camera_name,
+								classes = %detected_class_names(detections),
+								"Motion detected"
+							);
 							// New motion cancels any pending release;
 							// re-acquire only if we don't already hold
 							// one (a back-to-back Start without an
@@ -101,11 +139,16 @@ pub async fn motion_listener(
 							}
 							let _ = publisher.publish_motion(true).await;
 							status_cache.set_motion(true);
+							let _ = publish_motion_classes(&publisher, detections).await;
+							status_cache.set_motion_classes(detections);
 						}
 						Ok(MotionStatus::Stop(_)) => {
 							tracing::info!(camera = %camera_name, "Motion stopped");
 							let _ = publisher.publish_motion(false).await;
 							status_cache.set_motion(false);
+							let none = AiDetections::default();
+							let _ = publish_motion_classes(&publisher, none).await;
+							status_cache.set_motion_classes(none);
 							if wake_guard.is_some() {
 								release_at = Some(
 									tokio::time::Instant::now() + motion_wake_hold,
@@ -721,6 +764,7 @@ mod tests {
 		motion_tx
 			.send(Ok(bairelay_neolink_core::bc_protocol::MotionStatus::Start(
 				std::time::Instant::now(),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();
@@ -738,6 +782,128 @@ mod tests {
 			"motion_listener should publish status/motion=on after MotionStatus::Start; observed: {:?}",
 			mock.published_topics()
 		);
+	}
+
+	/// Each `Start` publishes the full per-class state (so a camera
+	/// re-classifying an ongoing alarm flips the right topics) and
+	/// `Stop` turns every class off. All retained, all cached.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn motion_listener_publishes_per_class_state() {
+		type MotionItem = std::result::Result<
+			bairelay_neolink_core::bc_protocol::MotionStatus,
+			bairelay_neolink_core::bc_protocol::Error,
+		>;
+		let (motion_tx, motion_rx) = tokio::sync::mpsc::channel::<MotionItem>(8);
+		let motion_data = bairelay_neolink_core::bc_protocol::MotionData::test_new(motion_rx);
+		let fake = FakeCameraBuilder::new()
+			.with_motion_stream(motion_data)
+			.build();
+		let driver: Arc<dyn CameraDriver> = fake.clone();
+		let cancel = CancellationToken::new();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cache = empty_cache();
+		let task = tokio::spawn(motion_listener(
+			"cam1".to_string(),
+			driver,
+			mqtt,
+			"bairelay".to_string(),
+			crate::wake_lock::WakeLockCounter::new(),
+			cancel.clone(),
+			Duration::from_secs(30),
+			Arc::clone(&cache),
+		));
+
+		let class_states = |mock: &MockHandle| -> Vec<(String, String)> {
+			MotionClass::ALL
+				.into_iter()
+				.map(|class| {
+					let topic = format!("bairelay/cam1/status/motion/{}", class.as_str());
+					let last = mock
+						.published()
+						.into_iter()
+						.rev()
+						.find(|(t, _, r)| *t == topic && *r)
+						.map(|(_, p, _)| String::from_utf8(p).unwrap())
+						.unwrap_or_default();
+					(class.as_str().to_string(), last)
+				})
+				.collect()
+		};
+		let expect = |person: &str, vehicle: &str, animal: &str, other: &str| {
+			[
+				("person", person),
+				("vehicle", vehicle),
+				("animal", animal),
+				("other", other),
+			]
+			.map(|(c, s)| (c.to_string(), s.to_string()))
+			.to_vec()
+		};
+		async fn send_and_settle(
+			tx: &tokio::sync::mpsc::Sender<MotionItem>,
+			mock: &MockHandle,
+			status: bairelay_neolink_core::bc_protocol::MotionStatus,
+		) {
+			let before = mock.count();
+			tx.send(Ok(status)).await.unwrap();
+			// One aggregate + four per-class publishes per event.
+			let settled = tokio::time::timeout(Duration::from_secs(2), async {
+				while mock.count() < before + 5 {
+					tokio::time::sleep(Duration::from_millis(10)).await;
+				}
+			})
+			.await;
+			assert!(settled.is_ok(), "event publishes did not land");
+		}
+
+		let person = AiDetections {
+			person: true,
+			..Default::default()
+		};
+		send_and_settle(
+			&motion_tx,
+			&mock,
+			MotionStatus::Start(std::time::Instant::now(), person),
+		)
+		.await;
+		assert_eq!(class_states(&mock), expect("on", "off", "off", "off"));
+		assert_eq!(cache.motion_classes(), Some(person));
+
+		let other = AiDetections {
+			other: true,
+			..Default::default()
+		};
+		send_and_settle(
+			&motion_tx,
+			&mock,
+			MotionStatus::Start(std::time::Instant::now(), other),
+		)
+		.await;
+		assert_eq!(class_states(&mock), expect("off", "off", "off", "on"));
+
+		send_and_settle(
+			&motion_tx,
+			&mock,
+			MotionStatus::Stop(std::time::Instant::now()),
+		)
+		.await;
+		assert_eq!(class_states(&mock), expect("off", "off", "off", "off"));
+		assert_eq!(cache.motion_classes(), Some(AiDetections::default()));
+		assert_eq!(cache.motion(), Some(false));
+
+		cancel.cancel();
+		let _ = task.await;
+	}
+
+	#[test]
+	fn detected_class_names_lists_active_classes_in_order() {
+		let d = AiDetections {
+			person: true,
+			animal: true,
+			..Default::default()
+		};
+		assert_eq!(detected_class_names(d), "person,animal");
+		assert_eq!(detected_class_names(AiDetections::default()), "");
 	}
 
 	/// `battery_poller` publishes `status/battery_level = "<percent>"`
@@ -1398,6 +1564,7 @@ mod tests {
 		motion_tx
 			.send(Ok(bairelay_neolink_core::bc_protocol::MotionStatus::Start(
 				std::time::Instant::now(),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();
@@ -1458,6 +1625,7 @@ mod tests {
 		motion_tx
 			.send(Ok(bairelay_neolink_core::bc_protocol::MotionStatus::Start(
 				std::time::Instant::now(),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();
@@ -1528,6 +1696,7 @@ mod tests {
 		motion_tx
 			.send(Ok(bairelay_neolink_core::bc_protocol::MotionStatus::Start(
 				std::time::Instant::now(),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();
@@ -1542,6 +1711,7 @@ mod tests {
 		motion_tx
 			.send(Ok(bairelay_neolink_core::bc_protocol::MotionStatus::Start(
 				std::time::Instant::now(),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();
@@ -1601,6 +1771,7 @@ mod tests {
 		motion_tx
 			.send(Ok(bairelay_neolink_core::bc_protocol::MotionStatus::Start(
 				std::time::Instant::now(),
+				AiDetections::default(),
 			)))
 			.await
 			.unwrap();

@@ -31,6 +31,23 @@ fn motion_topic_format() {
 }
 
 #[test]
+fn motion_class_topic_format() {
+	let topics: Vec<String> = bairelay_mqtt::MotionClass::ALL
+		.into_iter()
+		.map(|class| bairelay_mqtt::topics::status_motion_class(PREFIX, "garden", class))
+		.collect();
+	assert_eq!(
+		topics,
+		[
+			"bairelay/garden/status/motion/person",
+			"bairelay/garden/status/motion/vehicle",
+			"bairelay/garden/status/motion/animal",
+			"bairelay/garden/status/motion/other",
+		]
+	);
+}
+
+#[test]
 fn control_topic_pattern() {
 	assert_eq!(
 		bairelay_mqtt::topics::control_floodlight(PREFIX, "cam1"),

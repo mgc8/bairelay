@@ -47,6 +47,11 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 
 	cam.status_cache().set_battery_level(73);
 	cam.status_cache().set_motion(true);
+	cam.status_cache()
+		.set_motion_classes(bairelay_neolink_core::bc_protocol::AiDetections {
+			vehicle: true,
+			..Default::default()
+		});
 	cam.status_cache().set_floodlight(false);
 	cam.status_cache().set_floodlight_tasks(true);
 	cam.status_cache().set_pir(false);
@@ -73,6 +78,19 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 		saw("bairelay/cam1/status/motion", b"on"),
 		"motion=on retained must land"
 	);
+	for (class, payload) in [
+		("person", "off"),
+		("vehicle", "on"),
+		("animal", "off"),
+		("other", "off"),
+	] {
+		let topic = format!("bairelay/cam1/status/motion/{class}");
+		assert!(
+			saw(&topic, payload.as_bytes()),
+			"{topic} retained must land; got {:?}",
+			mock.published_topics()
+		);
+	}
 	assert!(
 		saw("bairelay/cam1/status/floodlight", br#"{"state":"off"}"#),
 		"floodlight off retained must land"

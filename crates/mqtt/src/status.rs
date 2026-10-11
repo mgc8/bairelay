@@ -20,6 +20,37 @@ pub(crate) fn floodlight_state_json(on: bool) -> &'static str {
 	}
 }
 
+/// Object class a motion alarm is attributed to. Each class has its
+/// own retained `status/motion/{class}` topic alongside the aggregate
+/// `status/motion`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MotionClass {
+	Person,
+	Vehicle,
+	Animal,
+	/// Motion the camera didn't attribute to any of the other classes.
+	Other,
+}
+
+impl MotionClass {
+	pub const ALL: [MotionClass; 4] = [
+		MotionClass::Person,
+		MotionClass::Vehicle,
+		MotionClass::Animal,
+		MotionClass::Other,
+	];
+
+	/// Topic leaf and HA `unique_id` suffix.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			MotionClass::Person => "person",
+			MotionClass::Vehicle => "vehicle",
+			MotionClass::Animal => "animal",
+			MotionClass::Other => "other",
+		}
+	}
+}
+
 /// Convenience wrapper that publishes camera status messages.
 ///
 /// Binds together a shared MQTT client, the `topic_prefix` (from the
@@ -59,11 +90,31 @@ impl<'a> StatusPublisher<'a> {
 			.await
 	}
 
-	/// Publish "unknown" motion state (retained). Used at startup before
-	/// the motion listener has determined the actual state.
+	/// Publish one motion class's detection state (retained).
+	pub async fn publish_motion_class(
+		&self,
+		class: MotionClass,
+		detected: bool,
+	) -> Result<(), MqttError> {
+		let payload = if detected { "on" } else { "off" };
+		let topic = topics::status_motion_class(&self.topic_prefix, &self.camera_name, class);
+		self.client
+			.publish_retained(&topic, payload.as_bytes())
+			.await
+	}
+
+	/// Publish "unknown" on the motion topic and every per-class
+	/// motion topic (retained). Used at startup before the motion
+	/// listener has determined the actual state, so a retained `on`
+	/// from a previous run can't linger.
 	pub async fn publish_motion_unknown(&self) -> Result<(), MqttError> {
 		let topic = topics::status_motion(&self.topic_prefix, &self.camera_name);
-		self.client.publish_retained(&topic, b"unknown").await
+		self.client.publish_retained(&topic, b"unknown").await?;
+		for class in MotionClass::ALL {
+			let topic = topics::status_motion_class(&self.topic_prefix, &self.camera_name, class);
+			self.client.publish_retained(&topic, b"unknown").await?;
+		}
+		Ok(())
 	}
 
 	/// Publish battery level as a percentage string (retained).
@@ -175,6 +226,39 @@ mod tests {
 		pub_.publish_motion(true).await.unwrap();
 		pub_.publish_motion(false).await.unwrap();
 		pub_.publish_motion_unknown().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn publish_motion_class_both_states() {
+		let (c, p, n) = stub_publisher();
+		let pub_ = StatusPublisher::new(&c, &p, &n);
+		for class in MotionClass::ALL {
+			pub_.publish_motion_class(class, true).await.unwrap();
+			pub_.publish_motion_class(class, false).await.unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn publish_motion_unknown_resets_every_class_topic() {
+		let (client, mock) = crate::test_support::mock_client();
+		let pub_ = StatusPublisher::new(&client, "bairelay", "cam1");
+		pub_.publish_motion_unknown().await.unwrap();
+		let published = mock.published();
+		let unknown: Vec<&str> = published
+			.iter()
+			.filter(|(_, payload, retained)| payload == b"unknown" && *retained)
+			.map(|(topic, _, _)| topic.as_str())
+			.collect();
+		assert_eq!(
+			unknown,
+			[
+				"bairelay/cam1/status/motion",
+				"bairelay/cam1/status/motion/person",
+				"bairelay/cam1/status/motion/vehicle",
+				"bairelay/cam1/status/motion/animal",
+				"bairelay/cam1/status/motion/other",
+			]
+		);
 	}
 
 	#[tokio::test]

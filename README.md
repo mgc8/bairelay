@@ -196,7 +196,7 @@ topic_prefix = "bairelay"
 
 [mqtt.discovery]
 topic = "homeassistant"
-features = ["floodlight", "camera", "motion", "led", "ir", "reboot", "pt", "battery", "siren"]
+features = ["floodlight", "camera", "motion", "motion_class", "led", "ir", "reboot", "pt", "battery", "siren"]
 
 [[cameras]]
 name = "driveway"
@@ -422,6 +422,8 @@ motion_wake_hold_secs = 30
 **What you have to do**: redirect DNS for `pushx.reolink.com` to bairelay. The camera connects, bairelay does a peer-IP → registered-UID reverse lookup, fires a `status/motion=on` MQTT publish, holds a wake-lock for `motion_wake_hold_secs`, and tears the socket. The TLS handshake never completes; the camera's retry state machine moves on within a few hundred milliseconds with no observable downstream effect.
 
 The "real" `motion=off` arrives once bairelay reconnects in-session and the camera reports `MotionStatus::Stop` natively. The hold-window timeout is a fallback so HA never sticks on `on`.
+
+**Person / vehicle / animal / other.** The push can't say *what* moved — that's in the TLS body. The class comes from the reconnected Baichuan session: the camera's alarm event carries an `AItype` (`people`, `vehicle`, `dog_cat`, `other`), and bairelay publishes it as retained `on`/`off` on `status/motion/person`, `status/motion/vehicle`, `status/motion/animal` and `status/motion/other` alongside the aggregate `status/motion`. `other` is any motion not attributed to the first three, including all motion from cameras without on-board AI. Expect the class a few seconds after the push-driven `motion=on`, once the wake completes; the hold-window fallback clears the class topics along with `motion`. In HA these are four `binary_sensor`s under the `motion_class` discovery feature.
 
 ### Caveats
 

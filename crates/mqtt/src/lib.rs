@@ -11,7 +11,7 @@ pub use client::{connect, ClientAuth, MqttConfig, MqttEventLoop, SharedMqttClien
 pub use control::{parse_control_message, ControlCommand};
 pub use discovery::{CameraEnableFlags, DiscoveryPublisher};
 pub use error::MqttError;
-pub use status::StatusPublisher;
+pub use status::{MotionClass, StatusPublisher};
 pub use system_ca::system_ca_bundle;
 
 // Re-export rumqttc types needed by the event loop consumer + tests.

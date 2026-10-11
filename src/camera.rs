@@ -213,7 +213,8 @@ pub struct CameraHandle {
 	preview_state_tx: Arc<watch::Sender<PreviewState>>,
 	preview_state_rx: watch::Receiver<PreviewState>,
 	/// Per-camera cache of the most recently published MQTT status
-	/// values (battery, motion, floodlight, floodlight_tasks, pir).
+	/// values (battery, motion, motion classes, floodlight,
+	/// floodlight_tasks, pir).
 	/// Threaded into every status-publishing task so each successful
 	/// publish updates the cache; read by `republish_cached_status`
 	/// on every broker ConnAck so HA recovers full state even when
@@ -513,6 +514,9 @@ impl CameraHandle {
 		}
 		if let Some(motion) = self.status_cache.motion() {
 			publisher.publish_motion(motion).await?;
+		}
+		if let Some(detections) = self.status_cache.motion_classes() {
+			camera_tasks::publish_motion_classes(&publisher, detections).await?;
 		}
 		if let Some(on) = self.status_cache.floodlight() {
 			publisher.publish_floodlight(on).await?;

@@ -212,6 +212,11 @@ Floodlight has two aspects on separate topics:
 
 These are distinct topics. Don't conflate them.
 
+Motion likewise has an aggregate topic and four refinements:
+
+- `status/motion` — any alarm active, from `MotionStatus::Start` / `Stop` (or the push listener).
+- `status/motion/{person,vehicle,animal,other}` — the `AiDetections` carried on each `Start`, parsed from the alarm's comma-separated `AItype` (`people`, `vehicle`, `dog_cat`, `other`). `other` also covers an alarm with no recognised class, so an active alarm always lights at least one class. Every `Start` republishes all four (the camera re-sends the alarm as its classification changes); `Stop` turns all four off.
+
 Update intervals (`battery_update`, `preview_update`, `floodlight_update`) must be ≥ 500 ms. Validation rejects shorter.
 
 ---

@@ -20,6 +20,12 @@
 //! We publish a fallback `motion=off` after `motion_wake_hold_secs` so
 //! HA never gets stuck on "motion=on" if reconnect failed.
 //!
+//! The push itself is class-blind: person / vehicle / animal / other
+//! lives in the TLS body we can't read. The per-class
+//! `status/motion/{class}` topics are only published once the
+//! reconnected session's `motion_listener` sees the camera's
+//! `AlarmEvent`; the fallback clears them alongside `motion`.
+//!
 //! **Threat model — source-IP trust.** A peer IP that resolves through
 //! the wake-server registry is treated as authentic; we have no further
 //! authentication on the TCP-accept itself (the camera's TLS handshake
@@ -40,6 +46,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
+use bairelay_neolink_core::bc_protocol::AiDetections;
 use bairelay_wake_server::registry::CameraRegistry;
 
 use crate::camera::CameraHandle;
@@ -210,10 +217,11 @@ pub(crate) fn match_camera_by_uid<'a>(
 }
 
 /// Fire the motion event: publish `status/motion=on`, hold a wake-lock
-/// for `hold`, then publish a fallback `status/motion=off` so HA never
-/// gets stuck on `on` if the in-session `motion_listener` never picks
-/// up the live `Stop`. Idempotent w.r.t. the in-session publisher —
-/// duplicate `motion=off` is harmless (HA dedups). `seq` is this push's
+/// for `hold`, then publish a fallback `status/motion=off` (and every
+/// per-class topic off) so HA never gets stuck on `on` if the
+/// in-session `motion_listener` never picks up the live `Stop`.
+/// Idempotent w.r.t. the in-session publisher — duplicate `off` is
+/// harmless (HA dedups). `seq` is this push's
 /// [`CameraHandle::push_seq`]; a later push takes over the clear.
 async fn fire_motion(
 	handle: Arc<CameraHandle>,
@@ -244,12 +252,18 @@ async fn fire_motion(
 	// shutdown. 1 s is generous for an alive broker; on shutdown, a
 	// dead broker hits the timeout and we move on quietly.
 	const FALLBACK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
-	match tokio::time::timeout(FALLBACK_PUBLISH_TIMEOUT, publisher.publish_motion(false)).await {
+	let none = AiDetections::default();
+	let clear = async {
+		publisher.publish_motion(false).await?;
+		crate::camera_tasks::publish_motion_classes(&publisher, none).await
+	};
+	match tokio::time::timeout(FALLBACK_PUBLISH_TIMEOUT, clear).await {
 		Ok(Ok(())) => {
 			handle.status_cache().set_motion(false);
+			handle.status_cache().set_motion_classes(none);
 		}
 		Ok(Err(e)) => {
-			tracing::warn!(camera = %handle.name(), error = %e, "push motion: fallback publish_motion(false) failed");
+			tracing::warn!(camera = %handle.name(), error = %e, "push motion: fallback motion=off publish failed");
 		}
 		Err(_) => {
 			tracing::debug!(
@@ -663,6 +677,34 @@ mod tests {
 		})
 		.await;
 		assert!(saw_off, "expected fallback status/motion=off after hold");
+
+		// The push can't classify, so it never turns a class on —
+		// but the fallback clears every class so a session that died
+		// mid-alarm can't leave e.g. `person=on` behind. `other` is
+		// the last class published, so wait on it.
+		let saw_classes_off = poll_published(&mock, Duration::from_millis(500), |t, p| {
+			t == "bairelay/front/status/motion/other" && p == b"off"
+		})
+		.await;
+		assert!(saw_classes_off, "expected fallback to clear class topics");
+		for class in ["person", "vehicle", "animal", "other"] {
+			let topic = format!("bairelay/front/status/motion/{class}");
+			let payloads: Vec<Vec<u8>> = mock
+				.published()
+				.into_iter()
+				.filter(|(t, _, _)| *t == topic)
+				.map(|(_, p, _)| p)
+				.collect();
+			assert_eq!(
+				payloads,
+				[b"off".to_vec()],
+				"{topic} must only see the fallback off"
+			);
+		}
+		assert_eq!(
+			handle.status_cache().motion_classes(),
+			Some(AiDetections::default())
+		);
 
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

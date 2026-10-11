@@ -1107,7 +1107,8 @@ pub struct AlarmEvent {
 	/// Motion status. Known values are `"MD"` or `"none"`
 	#[serde(default)]
 	pub status: String,
-	/// AI status. Known values are `"people"` or `"none"`
+	/// AI status. A comma-separated list; known values are `"people"`,
+	/// `"vehicle"`, `"dog_cat"`, `"other"` or `"none"`
 	#[serde(default, rename = "AItype", skip_serializing_if = "Option::is_none")]
 	pub ai_type: Option<String>,
 	/// The recording status. Known values `0` or `1`

@@ -376,8 +376,9 @@ broker_addr = "127.0.0.1"
 
 [mqtt.discovery]
 topic = "homeassistant"        # HA's own discovery prefix (required)
-# features = ["floodlight", "camera", "motion", "led", "ir",
-#             "reboot", "pt", "battery", "siren"]   # default: all 9
+# features = ["floodlight", "camera", "motion", "motion_class", "led",
+#             "ir", "reboot", "pt", "pt_preset", "battery", "siren",
+#             "pir"]   # default: all 12
 ```
 
 Per camera, bairelay publishes a single HA device named after the camera (underscores → spaces, title-cased: `front_door` → `Front Door`). Entities per feature:
@@ -387,6 +388,7 @@ Per camera, bairelay publishes a single HA device named after the camera (unders
 | Floodlight | `light` + `switch` (tasks)        | State payload JSON `{"state":"on"}`          |
 | Camera     | `camera`                          | Base64 JPEG preview from `status/preview`    |
 | Motion     | `binary_sensor`                   | `unique_id` suffix `_md`                     |
+| Motion class | 4 × `binary_sensor`             | Person / Vehicle / Animal / Other; suffix `_md_<class>` |
 | LED        | `switch`                          | Status LED (`ledCtrl` bit 0); `status/led`   |
 | IR         | `select`                          | IR LEDs (`ledState` ability); `status/ir`    |
 | Reboot     | `button`                          |                                              |
@@ -618,3 +620,41 @@ After flipping the resolver, sleeping cameras may take up to one heartbeat cycle
 ```
 
 In-process correctness coverage lives in `crates/wake-server/tests/udp_loopback.rs`; the live-verify above is the integration check, not a CI gate.
+
+## Motion-class live-verify
+
+Checks that the per-class topics (`status/motion/{person,vehicle,animal,other}`) track what the camera actually reports. The parser's vocabulary (`people`, `vehicle`, `dog_cat`, `other` in the alarm's `AItype`) comes from third-party reverse-engineering, so the point of this run is as much to record the real `AItype` values as to check the topics. Use a camera with on-board AI detection, with person / vehicle / animal enabled in the Reolink app's detection settings; on a camera without AI only `other` ever fires.
+
+```
+1. config.toml: for the camera under test set
+     debug = true
+   and run with
+     RUST_LOG=info,bairelay=debug,bairelay_neolink_core::bc::de=trace
+   so each decrypted AlarmEventList is dumped (`Payload Txt:` lines).
+   The dumps carry credential hashes and UIDs — keep the log local.
+2. Watch the topics (`#` also matches `status/motion` itself):
+     mosquitto_sub -v -t 'bairelay/<cam>/status/motion/#'
+3. In-session pass. Keep the camera awake for 10 minutes:
+     mosquitto_pub -t bairelay/<cam>/control/wakeup -m 10
+4. Walk through the frame. Within a second or two expect:
+     log   Motion detected camera=<cam> classes=person
+     dump  <AItype>people</AItype>
+     mqtt  status/motion on, motion/person on, vehicle/animal/other off
+   When the scene clears: status/motion off and all four classes off.
+   Repeat with a vehicle and an animal if you can; a classification
+   change mid-alarm (other -> person) should flip both topics. Note
+   every distinct AItype in the dumps — anything outside people /
+   vehicle / dog_cat / other / none needs a parser mapping.
+5. HA: the camera's device gains Person / Vehicle / Animal / Other
+   Motion binary sensors, and their history matches step 4.
+6. Restart bairelay: all four read `unknown` until the first event.
+   Restart a non-persistent broker: the last state is re-emitted on
+   reconnect.
+7. Push pass (needs the push-listener rig, docs/cloud-interception.md
+   §II.5). Let the camera fall asleep, then walk past it. Expect
+   `Motion push from camera` and status/motion on immediately; the
+   class topics follow once the wake reconnects. If motion arrives but
+   no class does, look for an AlarmEventList dump after the reconnect —
+   the camera may not re-report an alarm already in progress. After
+   motion_wake_hold_secs everything ends off.
+```
