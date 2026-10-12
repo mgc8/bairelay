@@ -151,35 +151,48 @@ pub fn read_pem_source(field: &str, value: &str) -> Result<String> {
 	String::from_utf8(bytes).map_err(|_| anyhow!("{field} is not a PEM text file: {label}"))
 }
 
-/// Load and validate `[mqtt] ca` / `client_auth`. `Ok(None)` when TLS
-/// isn't configured. Runs the same checks the MQTT client's rustls
+/// Load and validate `[mqtt] tls` / `ca` / `client_auth`. `Ok(None)`
+/// when TLS isn't configured (`tls` false and no `ca`). With `tls` and
+/// no `ca`, the OS trust store is the CA bundle. Runs the same checks the MQTT client's rustls
 /// setup does — every CA certificate must load into a root store, and
 /// the client key must load and match the leaf certificate — so a
 /// wrong path, bad PEM or mismatched pair fails at startup (and in
 /// `check-config`) rather than on every broker connect.
 pub fn load_mqtt_tls(
+	tls: Option<bool>,
 	ca: Option<&str>,
 	client_auth: Option<(&str, &str)>,
 ) -> Result<Option<MqttTls>> {
-	let Some(ca) = ca else {
-		if client_auth.is_some() {
-			return Err(anyhow!(
-				"[mqtt] client_auth needs ca: TLS to the broker is enabled by setting ca"
-			));
+	load_mqtt_tls_with(tls, ca, client_auth, || {
+		bairelay_mqtt::system_ca_bundle().map_err(Into::into)
+	})
+}
+
+/// [`load_mqtt_tls`] with the OS trust store injected, so tests don't
+/// depend on the host's CA bundle.
+fn load_mqtt_tls_with(
+	tls: Option<bool>,
+	ca: Option<&str>,
+	client_auth: Option<(&str, &str)>,
+	system_bundle: impl FnOnce() -> Result<String>,
+) -> Result<Option<MqttTls>> {
+	if tls == Some(false) && ca.is_some() {
+		return Err(anyhow!(
+			"[mqtt] tls = false contradicts ca (which enables TLS); remove one of them"
+		));
+	}
+	let ca_pem = match ca {
+		Some(ca) => load_explicit_ca(ca)?,
+		None if tls == Some(true) => load_system_ca(system_bundle()?)?,
+		None => {
+			if client_auth.is_some() {
+				return Err(anyhow!(
+					"[mqtt] client_auth needs TLS: set tls = true (and ca, for a private CA)"
+				));
+			}
+			return Ok(None);
 		}
-		return Ok(None);
 	};
-	let ca_pem = read_pem_source("[mqtt] ca", ca)?;
-	let ca_certs = parse_pem(ca_pem.as_bytes(), "[mqtt] ca")?.certs;
-	if ca_certs.is_empty() {
-		return Err(anyhow!("[mqtt] ca has no certificates: {}", pem_label(ca)));
-	}
-	let mut roots = RootCertStore::empty();
-	for der in ca_certs {
-		roots
-			.add(der)
-			.with_context(|| format!("[mqtt] ca: unusable CA certificate in {}", pem_label(ca)))?;
-	}
 	let client_auth = match client_auth {
 		None => None,
 		Some((cert, key)) => {
@@ -217,6 +230,41 @@ pub fn load_mqtt_tls(
 		ca_pem,
 		client_auth,
 	}))
+}
+
+/// `ca` file / inline PEM: strict — every certificate must load.
+fn load_explicit_ca(ca: &str) -> Result<String> {
+	let ca_pem = read_pem_source("[mqtt] ca", ca)?;
+	let ca_certs = parse_pem(ca_pem.as_bytes(), "[mqtt] ca")?.certs;
+	if ca_certs.is_empty() {
+		return Err(anyhow!("[mqtt] ca has no certificates: {}", pem_label(ca)));
+	}
+	let mut roots = RootCertStore::empty();
+	for der in ca_certs {
+		roots
+			.add(der)
+			.with_context(|| format!("[mqtt] ca: unusable CA certificate in {}", pem_label(ca)))?;
+	}
+	Ok(ca_pem)
+}
+
+/// OS trust store: lenient like rumqttc (which drops certificates it
+/// can't parse) — skip unusable entries, require at least one usable.
+fn load_system_ca(ca_pem: String) -> Result<String> {
+	let certs = parse_pem(ca_pem.as_bytes(), "system trust store")?.certs;
+	let mut roots = RootCertStore::empty();
+	let (usable, skipped) = roots.add_parsable_certificates(certs);
+	if usable == 0 {
+		return Err(anyhow!(
+			"[mqtt] tls: the system trust store has no usable CA certificates"
+		));
+	}
+	tracing::info!(
+		usable,
+		skipped,
+		"MQTT TLS verifies the broker against the system trust store"
+	);
+	Ok(ca_pem)
 }
 
 /// How a PEM source appears in errors: its path, or a description for
@@ -278,7 +326,7 @@ mod mqtt_tls_tests {
 
 	#[test]
 	fn no_ca_and_no_client_auth_is_plain_mqtt() {
-		assert_eq!(load_mqtt_tls(None, None).unwrap(), None);
+		assert_eq!(load_mqtt_tls(None, None, None).unwrap(), None);
 	}
 
 	/// Neolink form: file paths.
@@ -289,7 +337,7 @@ mod mqtt_tls_tests {
 		let ca = file(&dir, "ca.pem", &pki.ca_pem);
 		let cert = file(&dir, "c.pem", &pki.client_cert_pem);
 		let key = file(&dir, "c.key", &pki.client_key_pem);
-		let tls = load_mqtt_tls(Some(&ca), Some((&cert, &key)))
+		let tls = load_mqtt_tls(None, Some(&ca), Some((&cert, &key)))
 			.unwrap()
 			.unwrap();
 		assert_eq!(tls.ca_pem, pki.ca_pem);
@@ -303,7 +351,9 @@ mod mqtt_tls_tests {
 	#[test]
 	fn inline_pem_is_accepted() {
 		let pki = Pki::generate();
-		let tls = load_mqtt_tls(Some(&pki.ca_pem), None).unwrap().unwrap();
+		let tls = load_mqtt_tls(None, Some(&pki.ca_pem), None)
+			.unwrap()
+			.unwrap();
 		assert_eq!(tls.ca_pem, pki.ca_pem);
 		assert_eq!(tls.client_auth, None);
 	}
@@ -312,10 +362,10 @@ mod mqtt_tls_tests {
 	fn client_auth_without_ca_is_rejected() {
 		let pki = Pki::generate();
 		let auth = Some((pki.client_cert_pem.as_str(), pki.client_key_pem.as_str()));
-		let err = load_mqtt_tls(None, auth)
+		let err = load_mqtt_tls(None, None, auth)
 			.expect_err("must fail")
 			.to_string();
-		assert!(err.contains("client_auth needs ca"), "got: {err}");
+		assert!(err.contains("client_auth needs TLS"), "got: {err}");
 	}
 
 	#[test]
@@ -323,7 +373,7 @@ mod mqtt_tls_tests {
 		let pki = Pki::generate();
 		let dir = tempfile::tempdir().unwrap();
 		let ca = file(&dir, "ca.pem", &pki.client_key_pem); // a key, no cert
-		let err = load_mqtt_tls(Some(&ca), None)
+		let err = load_mqtt_tls(None, Some(&ca), None)
 			.expect_err("must fail")
 			.to_string();
 		assert!(err.contains("ca has no certificates"), "got: {err}");
@@ -335,7 +385,7 @@ mod mqtt_tls_tests {
 	fn swapped_client_cert_and_key_are_rejected() {
 		let pki = Pki::generate();
 		let auth = Some((pki.client_key_pem.as_str(), pki.client_cert_pem.as_str()));
-		let err = load_mqtt_tls(Some(&pki.ca_pem), auth)
+		let err = load_mqtt_tls(None, Some(&pki.ca_pem), auth)
 			.expect_err("must fail")
 			.to_string();
 		assert!(err.contains("has no certificate"), "got: {err}");
@@ -345,11 +395,67 @@ mod mqtt_tls_tests {
 	#[test]
 	fn inline_pem_errors_do_not_echo_the_pem() {
 		let pki = Pki::generate();
-		let err = load_mqtt_tls(Some(&pki.client_key_pem), None)
+		let err = load_mqtt_tls(None, Some(&pki.client_key_pem), None)
 			.expect_err("must fail")
 			.to_string();
 		assert!(err.contains("inline PEM"), "got: {err}");
 		assert!(!err.contains("PRIVATE KEY"), "PEM leaked into error: {err}");
+	}
+
+	/// `tls = true` without `ca`: the OS trust store becomes the bundle.
+	/// The store is injected (test CA) so the test doesn't depend on the
+	/// host's CA bundle.
+	#[test]
+	fn tls_without_ca_uses_system_trust_store() {
+		let pki = Pki::generate();
+		let store = pki.ca_pem.clone();
+		let tls = load_mqtt_tls_with(Some(true), None, None, || Ok(store))
+			.unwrap()
+			.expect("TLS on");
+		assert_eq!(tls.ca_pem, pki.ca_pem);
+		assert_eq!(tls.client_auth, None);
+	}
+
+	/// A system store with no usable certificate is a startup error.
+	#[test]
+	fn empty_system_trust_store_is_rejected() {
+		let err = load_mqtt_tls_with(Some(true), None, None, || Ok(String::new()))
+			.expect_err("must fail")
+			.to_string();
+		assert!(err.contains("no usable CA certificates"), "got: {err}");
+	}
+
+	/// Explicit `tls = false` next to `ca` is a contradiction, not a
+	/// silent TLS-on.
+	#[test]
+	fn tls_false_with_ca_is_rejected() {
+		let pki = Pki::generate();
+		let err = load_mqtt_tls(Some(false), Some(&pki.ca_pem), None)
+			.expect_err("must fail")
+			.to_string();
+		assert!(err.contains("tls = false contradicts ca"), "got: {err}");
+	}
+
+	/// An explicit `ca` wins over the system store when both apply.
+	#[test]
+	fn tls_with_ca_uses_the_ca() {
+		let pki = Pki::generate();
+		let tls = load_mqtt_tls(Some(true), Some(&pki.ca_pem), None)
+			.unwrap()
+			.unwrap();
+		assert_eq!(tls.ca_pem, pki.ca_pem);
+	}
+
+	/// mTLS with a publicly-signed broker: system roots + client cert.
+	#[test]
+	fn tls_without_ca_accepts_client_auth() {
+		let pki = Pki::generate();
+		let auth = Some((pki.client_cert_pem.as_str(), pki.client_key_pem.as_str()));
+		let store = pki.ca_pem.clone();
+		let tls = load_mqtt_tls_with(Some(true), None, auth, || Ok(store))
+			.unwrap()
+			.unwrap();
+		assert!(tls.client_auth.is_some());
 	}
 
 	/// A client cert and a key from different pairs fail at load time,
@@ -359,7 +465,7 @@ mod mqtt_tls_tests {
 		let a = Pki::generate();
 		let b = Pki::generate();
 		let auth = Some((a.client_cert_pem.as_str(), b.client_key_pem.as_str()));
-		let err = load_mqtt_tls(Some(&a.ca_pem), auth)
+		let err = load_mqtt_tls(None, Some(&a.ca_pem), auth)
 			.expect_err("must fail")
 			.to_string();
 		assert!(err.contains("don't form a usable pair"), "got: {err}");
@@ -376,7 +482,7 @@ mod mqtt_tls_tests {
 			.filter(|l| !l.starts_with("-----"))
 			.collect::<Vec<_>>()
 			.join("\n");
-		let err = load_mqtt_tls(Some(&body), None)
+		let err = load_mqtt_tls(None, Some(&body), None)
 			.expect_err("must fail")
 			.to_string();
 		assert!(err.contains("without a -----BEGIN line"), "got: {err}");

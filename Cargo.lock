@@ -225,6 +225,7 @@ version = "1.1.2"
 dependencies = [
  "base64",
  "rumqttc",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

@@ -443,9 +443,9 @@ When `certificate` is set, `main.rs` spawns two `RtspServer::serve` tasks — on
 
 `install_default()` returns `Err(CryptoProvider)` if a provider is already installed; the helper ignores that behind a `OnceLock`, so repeated calls (tests sharing a process) are idempotent.
 
-### MQTT broker TLS (`[mqtt] ca`, `client_auth`)
+### MQTT broker TLS (`[mqtt] tls`, `ca`, `client_auth`)
 
-`ca` enables TLS to the broker; `client_auth = [cert, key]` adds mutual TLS and requires `ca`. Each value is a file path (Neolink form) or inline PEM, recognised by a `-----BEGIN` marker (`tls_load::read_pem_source`). `tls_load::load_mqtt_tls` reads everything and runs the checks rumqttc's rustls setup would — each `ca` certificate loads into a root store; the `client_auth` key loads and matches the leaf certificate (`CertifiedKey::from_der`, explicit aws-lc-rs provider) — from `mqtt_loop::build_broker_config`, so bad material fails at startup (when the mode runs MQTT) and in `check-config`. Errors name the path, or `inline PEM` (never the PEM text).
+`tls = true` enables TLS to the broker, verified against the OS trust store (`bairelay_mqtt::system_ca_bundle`: rustls-native-certs, PEM-encoded so it travels the same path as a `ca` file; honours `SSL_CERT_FILE` / `SSL_CERT_DIR`; unparseable entries skipped like rumqttc does, empty store is an error). `ca` replaces the system store with a private CA and on its own also enables TLS; an explicit `tls = false` next to `ca` is rejected as contradictory. On Windows rustls-native-certs reads the current-user ROOT store, which Windows fills lazily — a public root never used on that machine may be missing (set `ca` there). `client_auth = [cert, key]` adds mutual TLS and requires TLS on. Each value is a file path (Neolink form) or inline PEM, recognised by a `-----BEGIN` marker (`tls_load::read_pem_source`). `tls_load::load_mqtt_tls` reads everything and runs the checks rumqttc's rustls setup would — each `ca` certificate loads into a root store; the `client_auth` key loads and matches the leaf certificate (`CertifiedKey::from_der`, explicit aws-lc-rs provider) — from `mqtt_loop::build_broker_config`, so bad material fails at startup (when the mode runs MQTT) and in `check-config`. Errors name the path, or `inline PEM` (never the PEM text).
 
 ### `TlsConfig::build` runs at startup, not on first connection
 

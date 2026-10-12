@@ -244,7 +244,7 @@ Set `certificate = "/path/to/fullchain-and-key.pem"` at the top level to enable 
 
 ### TLS to the MQTT broker
 
-Set `ca` in `[mqtt]` to connect over TLS (port is usually 8883); the broker's certificate is verified against that CA. For mutual TLS add `client_auth = ["client.pem", "client.key"]`. Each value is a file path (as in Neolink) or the PEM text itself inline. All of it is loaded and checked at startup and by `bairelay check-config`, so a wrong path, a bad certificate or a certificate/key mismatch fails immediately rather than at every broker connect.
+Set `tls = true` in `[mqtt]` to connect over TLS (port is usually 8883). By default the broker's certificate is verified against the operating system's CA store, which suits a broker with a publicly-signed certificate. For a private CA, set `ca` to its certificate instead (`ca` on its own also turns TLS on; `tls = false` next to `ca` is rejected). For mutual TLS add `client_auth = ["client.pem", "client.key"]`. `ca` and `client_auth` each take a file path (as in Neolink) or the PEM text itself inline. All of it is loaded and checked at startup and by `bairelay check-config`, so a wrong path, a bad certificate or a certificate/key mismatch fails immediately rather than at every broker connect.
 
 ### Security defaults you should know about
 

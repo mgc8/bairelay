@@ -33,7 +33,9 @@ bind = "0.0.0.0"
 # broker_addr = "192.168.1.50"
 # port = 1883
 # credentials = ["user", "password"]
-# TLS to the broker (port usually 8883). Paths or inline PEM.
+# TLS to the broker (port usually 8883). tls = true alone trusts the
+# system CA store; ca (path or inline PEM) is for a private CA.
+# tls = true
 # ca = "/path/to/broker-ca.pem"
 # client_auth = ["/path/to/client.pem", "/path/to/client.key"]
 

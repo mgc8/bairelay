@@ -54,7 +54,8 @@ pub fn build_broker_config(config: &Config) -> anyhow::Result<Option<bairelay_mq
 		.client_auth
 		.as_ref()
 		.map(|(cert, key)| (cert.as_str(), key.as_str()));
-	let tls = crate::tls_load::load_mqtt_tls(mqtt_config.ca.as_deref(), client_auth)?;
+	let tls =
+		crate::tls_load::load_mqtt_tls(mqtt_config.tls, mqtt_config.ca.as_deref(), client_auth)?;
 	let (ca, client_auth) = match tls {
 		Some(tls) => (Some(tls.ca_pem), tls.client_auth),
 		None => (None, None),
@@ -448,6 +449,7 @@ mod tests {
 				broker_addr: "localhost".into(),
 				port: 1883,
 				credentials: None,
+				tls: None,
 				ca: None,
 				client_auth: None,
 				topic_prefix: "neolink".into(),
@@ -498,6 +500,7 @@ mod tests {
 				broker_addr: "mqtt.example.com".into(),
 				port: 8883,
 				credentials: Some(("u".into(), "p".into())),
+				tls: None,
 				ca,
 				client_auth,
 				topic_prefix: "bairelay".into(),

@@ -225,6 +225,7 @@ mod tests {
 			broker_addr: "127.0.0.1".to_string(),
 			port: 1883,
 			credentials: None,
+			tls: None,
 			ca: None,
 			client_auth: None,
 			topic_prefix: "myprefix".to_string(),

@@ -16,6 +16,9 @@ rumqttc = "0.25"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+# OS trust store for `[mqtt] tls = true` without `ca`. Same version
+# rumqttc already pulls in.
+rustls-native-certs = "0.8"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "sync"] }
 tracing = "0.1"

@@ -253,6 +253,13 @@ pub struct MqttServerConfig {
 	#[serde(default)]
 	pub credentials: Option<(String, String)>,
 
+	/// TLS to the broker. `Some(true)` with `ca` unset verifies the
+	/// broker against the OS trust store; `ca` alone also enables TLS.
+	/// `Option` so an explicit `tls = false` next to `ca` can be
+	/// rejected rather than silently overridden.
+	#[serde(default)]
+	pub tls: Option<bool>,
+
 	#[serde(default)]
 	pub ca: Option<String>,
 
@@ -282,6 +289,7 @@ impl Default for MqttServerConfig {
 			broker_addr: String::new(),
 			port: default_mqtt_port(),
 			credentials: None,
+			tls: None,
 			ca: None,
 			client_auth: None,
 			topic_prefix: default_topic_prefix(),

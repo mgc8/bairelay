@@ -135,6 +135,7 @@ fn merge_mqtt(
 			let defs = MqttServerConfig::default();
 			overlay_field!(b, o, defs, broker_addr);
 			overlay_field!(b, o, defs, port);
+			overlay_field!(b, o, tls @opt);
 			overlay_field!(b, o, defs, topic_prefix);
 			overlay_field!(b, o, credentials @opt);
 			overlay_field!(b, o, ca @opt);
@@ -388,6 +389,7 @@ mod tests {
 				broker_addr: "broker.example".into(),
 				port: 1883,
 				credentials: None,
+				tls: None,
 				ca: None,
 				client_auth: None,
 				topic_prefix: "neolink".into(),

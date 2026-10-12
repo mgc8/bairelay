@@ -65,9 +65,11 @@ fn default_log_level() -> String {
 /// - `mqtt.host == None` leaves `cfg.mqtt = None` so the overlay can supply
 ///   it. Set both `username` and `password` together to populate
 ///   `credentials`; missing either leaves the broker unauthenticated.
-/// - `mqtt.ssl` is intentionally ignored here — TLS to MQTT requires a CA
-///   path that Supervisor's `bashio::services 'mqtt'` doesn't surface. The
-///   field stays on [`MqttServiceFlags`] for forward-compat.
+/// - `mqtt.ssl` is intentionally ignored here — the Supervisor-provided
+///   broker host (`core-mosquitto`) wouldn't match a public certificate,
+///   and its CA isn't surfaced by `bashio::services 'mqtt'`; MQTT TLS is
+///   configured in the overlay (`tls` / `ca` / `client_auth`). The field
+///   stays on [`MqttServiceFlags`] for forward-compat.
 /// - Each camera carries `address` + `uid` as separate optional fields,
 ///   mirroring [`CameraConfig`]. Empty strings collapse to `None` so a
 ///   blank form field doesn't masquerade as a configured value.
@@ -85,6 +87,7 @@ pub fn build_base_config(opts: &HassioOptions, mqtt: &MqttServiceFlags) -> Confi
 			broker_addr: host.clone(),
 			port: mqtt.port.unwrap_or(1883),
 			credentials,
+			tls: None,
 			ca: None,
 			client_auth: None,
 			topic_prefix: opts.topic_prefix.clone(),
