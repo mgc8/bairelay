@@ -81,12 +81,18 @@ impl StatusCache {
 	pub fn ir(&self) -> Option<IrMode> {
 		*self.ir.read_recover()
 	}
+	pub fn clear_ir(&self) {
+		*self.ir.write_recover() = None;
+	}
 
 	pub fn set_led(&self, on: bool) {
 		*self.led.write_recover() = Some(on);
 	}
 	pub fn led(&self) -> Option<bool> {
 		*self.led.read_recover()
+	}
+	pub fn clear_led(&self) {
+		*self.led.write_recover() = None;
 	}
 }
 

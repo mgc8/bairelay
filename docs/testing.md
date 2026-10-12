@@ -387,8 +387,8 @@ Per camera, bairelay publishes a single HA device named after the camera (unders
 | Floodlight | `light` + `switch` (tasks)        | State payload JSON `{"state":"on"}`          |
 | Camera     | `camera`                          | Base64 JPEG preview from `status/preview`    |
 | Motion     | `binary_sensor`                   | `unique_id` suffix `_md`                     |
-| LED        | `switch`                          | State from `status/led`                      |
-| IR         | `select`                          | Options: on / off / auto; state `status/ir`  |
+| LED        | `switch`                          | Status LED (`ledCtrl` bit 0); `status/led`   |
+| IR         | `select`                          | IR LEDs (`ledState` ability); `status/ir`    |
 | Reboot     | `button`                          |                                              |
 | PT         | 4 × `button`                      | Only when camera reports PTZ support         |
 | Battery    | `sensor`                          | HA long-term-statistics fields               |

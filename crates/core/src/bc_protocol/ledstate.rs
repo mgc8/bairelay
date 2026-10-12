@@ -7,9 +7,13 @@ use crate::bc_protocol::connection::mock::{
 };
 
 impl BcCamera {
-	/// Get the [LedState] xml which contains the LED status of the camera
+	/// Get the [LedState] xml. One reply carries two unrelated features:
+	/// `state` (IR night-vision LEDs) and `lightState` (status LED). A
+	/// camera answers with a placeholder for whichever it lacks, so the
+	/// reply says nothing about presence — callers decide that per
+	/// feature. No ability gate: Argus models with a status LED don't
+	/// advertise `ledState` yet answer this message correctly.
 	pub async fn get_ledstate(&self) -> Result<LedState> {
-		self.has_ability_ro("ledState").await?;
 		let connection = self.get_connection();
 		let msg_num = self.new_message_num();
 		let mut sub_get = connection.subscribe(MSG_ID_GET_LED_STATUS, msg_num).await?;
@@ -59,7 +63,6 @@ impl BcCamera {
 
 	/// Set the led lights using the [LedState] xml
 	pub async fn set_ledstate(&self, mut led_state: LedState) -> Result<()> {
-		self.has_ability_rw("ledState").await?;
 		let connection = self.get_connection();
 
 		let msg_num = self.new_message_num();
@@ -170,14 +173,26 @@ mod tests {
 		assert_eq!(ls.light_state, "open");
 	}
 
+	/// No `ledState` ability advertised: the request is still sent and
+	/// the reply parsed (status-LED-only cameras omit the ability).
 	#[tokio::test]
-	async fn get_ledstate_missing_ability_returns_err() {
-		// No ability installed -> MissingAbility fires before any
-		// request is sent.
-		let mock = MockConnection::new().build().await;
+	async fn get_ledstate_sends_without_ledstate_ability() {
+		let mock = MockConnection::new()
+			.expect_msg(MSG_ID_GET_LED_STATUS)
+			.reply_with(|req| {
+				reply_200_xml(
+					req,
+					BcXml {
+						led_state: Some(sample_led_state()),
+						..Default::default()
+					},
+				)
+			})
+			.build()
+			.await;
 		let cam = BcCamera::from_mock_connection(mock).await;
-		let err = cam.get_ledstate().await.expect_err("should fail");
-		assert!(matches!(err, Error::MissingAbility { .. }));
+		let ls = cam.get_ledstate().await.expect("sent despite no ability");
+		assert_eq!(ls.light_state, sample_led_state().light_state);
 	}
 
 	fn sample_led_state() -> LedState {
@@ -275,12 +290,18 @@ mod tests {
 		));
 	}
 
+	/// No `ledState` ability advertised: the write still reaches the camera.
 	#[tokio::test]
-	async fn set_ledstate_missing_ability_returns_err() {
-		let mock = MockConnection::new().build().await;
+	async fn set_ledstate_sends_without_ledstate_ability() {
+		let mock = MockConnection::new()
+			.expect_msg(MSG_ID_SET_LED_STATUS)
+			.reply_with(reply_200_empty)
+			.build()
+			.await;
 		let cam = BcCamera::from_mock_connection(mock).await;
-		let err = cam.set_ledstate(sample_led_state()).await.expect_err("err");
-		assert!(matches!(err, Error::MissingAbility { .. }));
+		cam.set_ledstate(sample_led_state())
+			.await
+			.expect("sent despite no ability");
 	}
 
 	#[tokio::test]

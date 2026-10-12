@@ -82,6 +82,39 @@ impl Feature {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CameraCapabilitiesView {
 	pub has_ptz: bool,
+	/// Status LED — gates the LED switch.
+	pub status_led: Presence,
+	/// IR night-vision LEDs — gates the IR select.
+	pub ir_leds: Presence,
+}
+
+/// Whether a camera has a piece of optional hardware. `Unknown` when
+/// the signal wasn't available (probe failed, field absent) — never
+/// treated as absent, so a failed probe can't hide or retract an
+/// entity.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+	#[default]
+	Unknown,
+	Present,
+	Absent,
+}
+
+impl Presence {
+	/// `Some(true)` → Present, `Some(false)` → Absent, `None` → Unknown.
+	pub fn from_signal(signal: Option<bool>) -> Self {
+		match signal {
+			Some(true) => Presence::Present,
+			Some(false) => Presence::Absent,
+			None => Presence::Unknown,
+		}
+	}
+	pub fn is_present(self) -> bool {
+		self == Presence::Present
+	}
+	pub fn is_absent(self) -> bool {
+		self == Presence::Absent
+	}
 }
 
 // ── Payload type definitions ─────────────────────────────────────────
@@ -430,12 +463,49 @@ pub fn build_motion(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	))
 }
 
+/// `(unique_id, config topic)` of the status-LED switch.
+fn led_ids(ctx: &DiscoveryContext) -> (String, String) {
+	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "led");
+	let topic = config_topic(ctx, "switch", &unique_id);
+	(unique_id, topic)
+}
+
+/// `(unique_id, config topic)` of the IR-mode select.
+fn ir_ids(ctx: &DiscoveryContext) -> (String, String) {
+	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "ir");
+	let topic = config_topic(ctx, "select", &unique_id);
+	(unique_id, topic)
+}
+
+/// Retained topics to clear for hardware the camera is confirmed to lack
+/// (`Presence::Absent`; `Unknown` never retracts):
+/// each entity's discovery config plus its `status/...` topic. Clears
+/// leftovers from earlier versions (which published both entities
+/// unconditionally) or from an unclean shutdown. Status LED and IR
+/// LEDs are judged independently.
+pub fn absent_hardware_retractions(ctx: &DiscoveryContext) -> Vec<String> {
+	let mut out = Vec::new();
+	if ctx.capabilities.status_led.is_absent() {
+		out.push(led_ids(ctx).1);
+		out.push(cam_topic(ctx, "status", "led"));
+	}
+	if ctx.capabilities.ir_leds.is_absent() {
+		out.push(ir_ids(ctx).1);
+		out.push(cam_topic(ctx, "status", "ir"));
+	}
+	out
+}
+
 /// `switch` entity driving the status LED. State mirrors the
 /// `lightState` bairelay reads via `get_ledstate()` on connect and
 /// republishes after every `control/led`.
 pub fn build_led(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
+	let presence = ctx.capabilities.status_led;
+	if presence.is_absent() {
+		return None;
+	}
 	let friendly = title_case(ctx.camera_name);
-	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "led");
+	let (unique_id, topic) = led_ids(ctx);
 	let payload = DiscoverySwitch {
 		name: format!("{friendly} LED"),
 		unique_id: unique_id.clone(),
@@ -445,19 +515,27 @@ pub fn build_led(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 		command_topic: cam_topic(ctx, "control", "led"),
 		payload_off: "off".to_string(),
 		payload_on: "on".to_string(),
-		state_topic: Some(cam_topic(ctx, "status", "led")),
-		state_off: Some("off".to_string()),
-		state_on: Some("on".to_string()),
+		// State only for confirmed hardware: with presence unknown the
+		// reply may be a placeholder, so no `status/led` is published.
+		state_topic: presence
+			.is_present()
+			.then(|| cam_topic(ctx, "status", "led")),
+		state_off: presence.is_present().then(|| "off".to_string()),
+		state_on: presence.is_present().then(|| "on".to_string()),
 	};
-	Some((config_topic(ctx, "switch", &unique_id), to_json(&payload)))
+	Some((topic, to_json(&payload)))
 }
 
 /// `select` entity driving the IR night-vision mode. State mirrors the
 /// LED-status `state` field (configured mode, not the live day/night
 /// switch), read on connect and republished after every `control/ir`.
 pub fn build_ir(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
+	let presence = ctx.capabilities.ir_leds;
+	if presence.is_absent() {
+		return None;
+	}
 	let friendly = title_case(ctx.camera_name);
-	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "ir");
+	let (unique_id, topic) = ir_ids(ctx);
 	let payload = DiscoverySelect {
 		name: format!("{friendly} IR"),
 		unique_id: unique_id.clone(),
@@ -466,9 +544,11 @@ pub fn build_ir(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 		availability: availability_block(ctx),
 		command_topic: cam_topic(ctx, "control", "ir"),
 		options: vec!["on".to_string(), "off".to_string(), "auto".to_string()],
-		state_topic: Some(cam_topic(ctx, "status", "ir")),
+		state_topic: presence
+			.is_present()
+			.then(|| cam_topic(ctx, "status", "ir")),
 	};
-	Some((config_topic(ctx, "select", &unique_id), to_json(&payload)))
+	Some((topic, to_json(&payload)))
 }
 
 /// `switch` entity driving the PIR (passive infrared) motion
@@ -718,7 +798,11 @@ mod tests {
 	#[test]
 	fn pt_emits_four_buttons_when_ptz_supported() {
 		let f = Fixture::new("bairelay");
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: Presence::Present,
+			ir_leds: Presence::Present,
+		};
 		let ctx = f.ctx(&caps);
 		let emitted = build_pt_buttons(&ctx);
 		assert_eq!(emitted.len(), 4);
@@ -741,7 +825,11 @@ mod tests {
 	#[test]
 	fn pt_suppressed_when_ptz_absent() {
 		let f = Fixture::new("bairelay");
-		let caps = CameraCapabilitiesView { has_ptz: false };
+		let caps = CameraCapabilitiesView {
+			has_ptz: false,
+			status_led: Presence::Present,
+			ir_leds: Presence::Present,
+		};
 		let ctx = f.ctx(&caps);
 		assert!(build_pt_buttons(&ctx).is_empty());
 	}
@@ -795,7 +883,11 @@ mod tests {
 		// was never published to and the preset select silently never
 		// updated. Pin cross-module agreement.
 		let f = Fixture::new("bairelay");
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: Presence::Present,
+			ir_leds: Presence::Present,
+		};
 		let presets: Vec<(u8, String)> = vec![(1, "Home".to_string()), (2, "Sky".to_string())];
 		let ctx = DiscoveryContext {
 			topic_prefix: &f.prefix,
@@ -833,10 +925,67 @@ mod tests {
 		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/motion");
 	}
 
+	fn caps(status_led: Presence, ir_leds: Presence) -> CameraCapabilitiesView {
+		CameraCapabilitiesView {
+			status_led,
+			ir_leds,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn led_and_ir_gated_independently() {
+		use Presence::*;
+		let f = Fixture::new("bairelay");
+		let led_only = caps(Present, Absent);
+		assert!(build_led(&f.ctx(&led_only)).is_some());
+		assert!(build_ir(&f.ctx(&led_only)).is_none());
+		let ir_only = caps(Absent, Present);
+		assert!(build_led(&f.ctx(&ir_only)).is_none());
+		assert!(build_ir(&f.ctx(&ir_only)).is_some());
+	}
+
+	/// Unknown presence keeps the entity (as before capability
+	/// detection) but without a state topic — the camera's value may be
+	/// a placeholder.
+	#[test]
+	fn unknown_presence_emits_entity_without_state() {
+		let f = Fixture::new("bairelay");
+		let unknown = CameraCapabilitiesView::default();
+		let (_, led) = build_led(&f.ctx(&unknown)).expect("emitted");
+		let (_, ir) = build_ir(&f.ctx(&unknown)).expect("emitted");
+		assert!(parse(&led).get("state_topic").is_none());
+		assert!(parse(&ir).get("state_topic").is_none());
+	}
+
+	#[test]
+	fn absent_hardware_retractions_cover_config_and_status() {
+		use Presence::*;
+		let f = Fixture::new("bairelay");
+		assert_eq!(
+			absent_hardware_retractions(&f.ctx(&caps(Present, Absent))),
+			vec![
+				"homeassistant/select/bairelay_frontdoor_ir/config".to_string(),
+				"bairelay/frontdoor/status/ir".to_string(),
+			]
+		);
+		assert!(absent_hardware_retractions(&f.ctx(&caps(Present, Present))).is_empty());
+		assert_eq!(
+			absent_hardware_retractions(&f.ctx(&caps(Absent, Absent))).len(),
+			4
+		);
+		// Unknown never retracts: a failed probe must not delete entities.
+		assert!(absent_hardware_retractions(&f.ctx(&caps(Unknown, Unknown))).is_empty());
+	}
+
 	#[test]
 	fn led_and_ir_carry_state_topics() {
 		let f = Fixture::new("bairelay");
-		let caps = CameraCapabilitiesView::default();
+		let caps = CameraCapabilitiesView {
+			status_led: Presence::Present,
+			ir_leds: Presence::Present,
+			..Default::default()
+		};
 		let ctx = f.ctx(&caps);
 		let (_, led) = build_led(&ctx).expect("emitted");
 		let v = parse(&led);

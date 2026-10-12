@@ -112,11 +112,16 @@ pub async fn dispatch_control(
 		} => {
 			let _led = cam.led_write_lock().lock().await;
 			let result = timeout_to_result(timeout(CMD_TIMEOUT, bc.led_light_set(state)).await);
-			if result.is_ok() {
+			// The command always goes out; state is published only for
+			// confirmed hardware — otherwise the re-read may be a placeholder.
+			let present = cam
+				.capabilities()
+				.is_some_and(|c| c.status_led.is_present());
+			if result.is_ok() && present {
 				let publisher = StatusPublisher::new(mqtt, topic_prefix, cam_name);
 				let cache = cam.status_cache();
 				let written = LedWrite::Led(state);
-				publish_after_led_write(cam_name, &*bc, &publisher, &cache, written).await;
+				publish_after_led_write(&*bc, &publisher, &cache, written).await;
 			}
 			result
 		}
@@ -131,11 +136,12 @@ pub async fn dispatch_control(
 			};
 			let _led = cam.led_write_lock().lock().await;
 			let result = timeout_to_result(timeout(CMD_TIMEOUT, bc.irled_light_set(ls)).await);
-			if result.is_ok() {
+			let present = cam.capabilities().is_some_and(|c| c.ir_leds.is_present());
+			if result.is_ok() && present {
 				let publisher = StatusPublisher::new(mqtt, topic_prefix, cam_name);
 				let cache = cam.status_cache();
 				let written = LedWrite::Ir(mode);
-				publish_after_led_write(cam_name, &*bc, &publisher, &cache, written).await;
+				publish_after_led_write(&*bc, &publisher, &cache, written).await;
 			}
 			result
 		}
@@ -777,6 +783,7 @@ mod tests {
 			.with_ledstate(|| Ok(led_state("auto", "open")))
 			.build();
 		let (cameras, fake) = test_cameras_with_fake("cam-led", fake);
+		with_led_hardware(&cameras["cam-led"]);
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 
 		dispatch_control(
@@ -824,6 +831,7 @@ mod tests {
 				.with_ledstate(move || Ok(led_state(cam_state, "close")))
 				.build();
 			let (cameras, fake) = test_cameras_with_fake("cam-ir", fake);
+			with_led_hardware(&cameras["cam-ir"]);
 			let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 			dispatch_control(
 				ControlCommand::Ir {
@@ -847,6 +855,68 @@ mod tests {
 					&& *r));
 			assert_eq!(cameras["cam-ir"].status_cache().ir(), Some(mode));
 		}
+	}
+
+	use crate::capabilities::Presence;
+
+	/// Mark both status LED and IR LEDs as confirmed hardware.
+	fn with_led_hardware(cam: &CameraHandle) {
+		cam.set_capabilities_for_test(crate::capabilities::CameraCapabilities {
+			status_led: Presence::Present,
+			ir_leds: Presence::Present,
+			..Default::default()
+		});
+	}
+
+	/// Presence unknown (capabilities never probed, or the probe gave
+	/// no signal): commands still reach the camera, but the re-read
+	/// may be a placeholder, so no state is published or cached.
+	#[tokio::test]
+	async fn dispatch_led_and_ir_with_unknown_presence_publish_no_state() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| Ok(led_state("close", "open")))
+			.build();
+		let (cameras, fake) = test_cameras_with_fake("cam-unk", fake);
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let led = ControlCommand::Led {
+			camera: "cam-unk".to_string(),
+			state: true,
+		};
+		let ir = ControlCommand::Ir {
+			camera: "cam-unk".to_string(),
+			mode: IrMode::Auto,
+		};
+		dispatch_control(led, &cameras, &mqtt, "bairelay").await;
+		dispatch_control(ir, &cameras, &mqtt, "bairelay").await;
+		assert_eq!(fake.calls().led_light_set.lock().unwrap().len(), 1);
+		assert_eq!(fake.calls().irled_light_set.lock().unwrap().len(), 1);
+		assert!(status_rows(&mock, "bairelay/cam-unk/status/led").is_empty());
+		assert!(status_rows(&mock, "bairelay/cam-unk/status/ir").is_empty());
+		let cache = cameras["cam-unk"].status_cache();
+		assert_eq!((cache.led(), cache.ir()), (None, None));
+	}
+
+	/// Camera confirmed to lack a status LED: `control/led` still goes
+	/// out, but no `status/led` is published.
+	#[tokio::test]
+	async fn dispatch_led_on_camera_without_status_led_publishes_no_state() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| Ok(led_state("auto", "open")))
+			.build();
+		let (cameras, fake) = test_cameras_with_fake("cam-noled", fake);
+		cameras["cam-noled"].set_capabilities_for_test(crate::capabilities::CameraCapabilities {
+			status_led: Presence::Absent,
+			ir_leds: Presence::Present,
+			..Default::default()
+		});
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cmd = ControlCommand::Led {
+			camera: "cam-noled".to_string(),
+			state: false,
+		};
+		dispatch_control(cmd, &cameras, &mqtt, "bairelay").await;
+		assert_eq!(fake.calls().led_light_set.lock().unwrap().len(), 1);
+		assert!(status_rows(&mock, "bairelay/cam-noled/status/led").is_empty());
 	}
 
 	fn led_state(ir: &str, light: &str) -> bairelay_neolink_core::bc::xml::LedState {
@@ -873,6 +943,7 @@ mod tests {
 			.with_ledstate(|| Ok(led_state("auto", "close")))
 			.build();
 		let (cameras, _fake) = test_cameras_with_fake("cam-ir", fake);
+		with_led_hardware(&cameras["cam-ir"]);
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		let cmd = ControlCommand::Ir {
 			camera: "cam-ir".to_string(),
@@ -898,6 +969,7 @@ mod tests {
 			})
 			.build();
 		let (cameras, _fake) = test_cameras_with_fake("cam-led", fake);
+		with_led_hardware(&cameras["cam-led"]);
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		let cmd = ControlCommand::Led {
 			camera: "cam-led".to_string(),
@@ -909,6 +981,30 @@ mod tests {
 			vec![b"off".to_vec()]
 		);
 		assert_eq!(cameras["cam-led"].status_cache().led(), Some(false));
+	}
+
+	/// Camera known to lack IR LEDs: `control/ir` still goes to the
+	/// camera, but the placeholder `state` it reads back isn't published.
+	#[tokio::test]
+	async fn dispatch_ir_on_camera_without_ir_leds_publishes_no_state() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| Ok(led_state("close", "close")))
+			.build();
+		let (cameras, fake) = test_cameras_with_fake("cam-noir", fake);
+		cameras["cam-noir"].set_capabilities_for_test(crate::capabilities::CameraCapabilities {
+			status_led: Presence::Present,
+			ir_leds: Presence::Absent,
+			..Default::default()
+		});
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cmd = ControlCommand::Ir {
+			camera: "cam-noir".to_string(),
+			mode: IrMode::Off,
+		};
+		dispatch_control(cmd, &cameras, &mqtt, "bairelay").await;
+		assert_eq!(fake.calls().irled_light_set.lock().unwrap().len(), 1);
+		assert!(status_rows(&mock, "bairelay/cam-noir/status/ir").is_empty());
+		assert_eq!(cameras["cam-noir"].status_cache().ir(), None);
 	}
 
 	/// A failed write publishes no state, leaves the cache alone, and

@@ -979,7 +979,23 @@ impl CameraHandle {
 					support.ptz_mode.as_deref(),
 					support.ptz_cfg,
 				);
-				*self.capabilities.write_recover() = Some(CameraCapabilities { has_ptz });
+				let (status_led, ir_leds) =
+					crate::capabilities::led_presence(&*driver, &support, self.config.channel_id)
+						.await;
+				// Hardware confirmed absent: drop any cached value so a
+				// broker reconnect can't replay it after discovery
+				// retracts the entity.
+				if status_led.is_absent() {
+					self.status_cache.clear_led();
+				}
+				if ir_leds.is_absent() {
+					self.status_cache.clear_ir();
+				}
+				*self.capabilities.write_recover() = Some(CameraCapabilities {
+					has_ptz,
+					status_led,
+					ir_leds,
+				});
 
 				// Populate the preset cache for HA discovery's
 				// `PtPreset` select. Only meaningful when has_ptz
@@ -1126,15 +1142,23 @@ impl CameraHandle {
 				)
 				.await;
 			}
+			// Status LED and IR LEDs are separate features gated on their
+			// own capability; the read only runs if either is present.
 			// Spawned, not awaited: an unresponsive camera must not hold
 			// up the grace-period watcher or ignore session cancel.
-			tasks.spawn(camera_tasks::publish_led_state(
-				self.config.name.clone(),
-				Arc::clone(driver),
-				mqtt.clone(),
-				self.topic_prefix.clone(),
-				self.status_cache(),
-			));
+			let caps = self.capabilities().unwrap_or_default();
+			// Only confirmed hardware is read: with presence unknown the
+			// reply value may be a placeholder.
+			if caps.status_led.is_present() || caps.ir_leds.is_present() {
+				tasks.spawn(camera_tasks::publish_led_state(
+					self.config.name.clone(),
+					Arc::clone(driver),
+					mqtt.clone(),
+					self.topic_prefix.clone(),
+					self.status_cache(),
+					caps,
+				));
+			}
 		}
 
 		// Grace-period watcher for battery cameras: when the wake-lock
@@ -1619,7 +1643,11 @@ mod tests {
 		let config = minimal_camera_config("cam");
 		let cancel = CancellationToken::new();
 		let handle = CameraHandle::new(config, cancel, None);
-		handle.set_capabilities_for_test(CameraCapabilities { has_ptz: true });
+		handle.set_capabilities_for_test(CameraCapabilities {
+			has_ptz: true,
+			status_led: bairelay_mqtt::discovery::Presence::Present,
+			ir_leds: bairelay_mqtt::discovery::Presence::Present,
+		});
 		let caps = handle.capabilities().expect("caps populated");
 		assert!(caps.has_ptz);
 	}
@@ -2539,7 +2567,11 @@ mod tests {
 		let cancel = CancellationToken::new();
 		let handle = CameraHandle::new(minimal_camera_config("cam-dp"), cancel, None)
 			.with_discovery_publisher(publisher);
-		handle.set_capabilities_for_test(CameraCapabilities { has_ptz: true });
+		handle.set_capabilities_for_test(CameraCapabilities {
+			has_ptz: true,
+			status_led: bairelay_mqtt::discovery::Presence::Present,
+			ir_leds: bairelay_mqtt::discovery::Presence::Present,
+		});
 
 		let before = mock.published().len();
 		handle.publish_discovery().await.expect("publish ok");
@@ -2759,9 +2791,11 @@ mod tests {
 					..Default::default()
 				})
 			})
+			// Argus shape: status LED (`ledCtrl` bit 0), no IR LEDs (no
+			// `ledState` ability) — the reply's IR `state` is a placeholder.
 			.with_ledstate(|| {
 				Ok(bairelay_neolink_core::bc::xml::LedState {
-					state: "auto".into(),
+					state: "close".into(),
 					light_state: "close".into(),
 					..Default::default()
 				})
@@ -2769,6 +2803,11 @@ mod tests {
 			.with_support(|| {
 				Ok(Support {
 					ptz_mode: Some("pt".to_string()),
+					items: vec![bairelay_neolink_core::bc::xml::SupportItem {
+						chn_id: 0,
+						led_ctrl: Some(0x4047),
+						..Default::default()
+					}],
 					..Default::default()
 				})
 			})
@@ -2837,18 +2876,20 @@ mod tests {
 			"enable_pir = true must trigger a status/pir publish"
 		);
 
-		// publish_led_state ran unconditionally: IR mode + LED state.
+		// publish_led_state: status LED published, IR placeholder not.
 		let has = |topic: &str, payload: &[u8]| {
 			pubs.iter()
 				.any(|(t, p, r)| t == topic && p == payload && *r)
 		};
 		assert!(
-			has("bairelay/cam-sess/status/ir", b"auto"),
-			"status/ir=auto"
-		);
-		assert!(
 			has("bairelay/cam-sess/status/led", b"off"),
 			"status/led=off"
+		);
+		assert!(
+			!pubs
+				.iter()
+				.any(|(t, _, _)| t == "bairelay/cam-sess/status/ir"),
+			"no IR LEDs → no status/ir"
 		);
 	}
 

@@ -56,9 +56,9 @@ pub trait CameraDriver: Send + Sync {
 	/// Request a JPEG snapshot from the camera.
 	async fn get_snapshot(&self) -> Result<Vec<u8>>;
 
-	/// Turn the visible-light LED ring on or off.
+	/// Turn the status LED (small indicator light) on or off.
 	async fn led_light_set(&self, state: bool) -> Result<()>;
-	/// Set the IR illuminator mode.
+	/// Set the IR night-vision LED mode.
 	async fn irled_light_set(&self, state: LightState) -> Result<()>;
 
 	/// Reboot the camera.
@@ -66,8 +66,15 @@ pub trait CameraDriver: Send + Sync {
 	/// Trigger the built-in siren.
 	async fn siren(&self) -> Result<()>;
 
-	/// Read the camera's LED + status-light state.
+	/// Read `<LedState>`: IR night-vision mode (`state`) and status LED
+	/// (`lightState`) — two unrelated features in one reply. Values for
+	/// hardware the camera lacks are placeholders.
 	async fn get_ledstate(&self) -> Result<LedState>;
+
+	/// Whether the login-time `abilityInfo` lists `name` (any
+	/// permission); `None` when that report was never received. Cached;
+	/// no camera round trip.
+	async fn ability_advertised(&self, name: &str) -> Option<bool>;
 
 	/// Read the camera's PTZ preset list.
 	async fn get_ptz_preset(&self) -> Result<PtzPreset>;
@@ -213,6 +220,10 @@ impl CameraDriver for BcCamera {
 
 	async fn get_ledstate(&self) -> Result<LedState> {
 		BcCamera::get_ledstate(self).await
+	}
+
+	async fn ability_advertised(&self, name: &str) -> Option<bool> {
+		BcCamera::ability_advertised(self, name).await
 	}
 
 	async fn get_ptz_preset(&self) -> Result<PtzPreset> {
@@ -438,7 +449,7 @@ mod tests {
 			let dr: &dyn CameraDriver = &cam;
 			let _ = run(dr.led_light_set(true)).await;
 		}
-		// irled_light_set: ability fail.
+		// irled_light_set: no reply → timeout.
 		{
 			let cam = err_camera().await;
 			let dr: &dyn CameraDriver = &cam;
@@ -456,11 +467,20 @@ mod tests {
 			let dr: &dyn CameraDriver = &cam;
 			let _ = run(dr.siren()).await;
 		}
-		// get_ledstate: ability fail.
+		// get_ledstate: no reply → timeout.
 		{
 			let cam = err_camera().await;
 			let dr: &dyn CameraDriver = &cam;
 			let _ = run(dr.get_ledstate()).await;
+		}
+		// ability_advertised: empty cache → unknown; populated → yes/no.
+		{
+			let cam = err_camera().await;
+			let dr: &dyn CameraDriver = &cam;
+			assert_eq!(dr.ability_advertised("ledState").await, None);
+			cam.test_set_ability("ledState", false).await;
+			assert_eq!(dr.ability_advertised("ledState").await, Some(true));
+			assert_eq!(dr.ability_advertised("floodlight").await, Some(false));
 		}
 		// get_ptz_preset: ability fail.
 		{

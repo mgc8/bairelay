@@ -78,9 +78,24 @@ Inbound deserialisation tolerates absent fields; outbound serialisation still wr
 
 Reolink fixed-mount cameras (e.g. Argus Altas) report `<ptzMode>none</ptzMode>` in the support XML — non-empty but explicitly NOT a motorised mount. A naive `is_empty()` check classifies them as PTZ-capable and HA discovery emits four phantom Pan buttons. The single point of truth is `crate::capabilities::ptz_mode_indicates_ptz`: `none` / `0` / `false` (case-insensitive) and empty all return `false`. Real motorised cameras advertise `pt`, `ptz`, `3d`. Note this only stops *new* publications — leaked retained discovery topics for cameras previously misclassified must be cleaned up manually with `mosquitto_pub -r -m ""`.
 
-### IR + status LED state
+### Status LED and IR LEDs are separate features
 
-One `get_ledstate()` reply (`<LedState>`) carries both the IR night-vision mode (`state`: `auto` / `open` / `close`) and the status LED (`lightState`: `open` / `close`). `camera_tasks::publish_led_state` reads it once on connect and publishes `status/ir` (`auto` / `on` / `off`) + `status/led` (`on` / `off`), retained and cached for broker-reconnect replay; `control/ir` and `control/led` republish on success. Like PIR, it's a configuration value, not a live sensor — no polling. Unrecognised camera spellings publish nothing for that field. `status/ir` is the configured mode; the camera's actual day/night switch arrives separately on the cmd 33 alarm push. Don't confuse IR with PIR (passive IR motion sensor), which has its own `get_pirstate` reader.
+The **status LED** (small indicator light; `status/led`, `control/led`) and the **IR night-vision LEDs** (`status/ir`, `control/ir`) are unrelated hardware. A camera can have either, both, or neither. They only share a wire message: one `get_ledstate()` reply (`<LedState>`) carries `lightState` (status LED: `open` / `close`) and `state` (IR mode: `auto` / `open` / `close`).
+
+The reply says nothing about presence — a camera answers with a placeholder for hardware it lacks (an Argus with no IR LEDs reports `state=close`; an IR camera with no status LED reports `lightState=open`). Presence comes from two independent signals, resolved at connect by `capabilities::led_presence` into a three-state `Presence` (`Present` / `Absent` / `Unknown`) per feature:
+
+- `status_led` — `<Support>` item `ledCtrl` bit 0 (`capabilities::LED_CTRL_STATUS_LED`). Captures: Argus `0x4047` (has one), IR camera without one `0x40`, E1 Zoom `0x1`. No item for the channel, or no `ledCtrl` → `Unknown`.
+- `ir_leds` — the `ledState` ability (`capabilities::IR_LEDS_ABILITY`) via `CameraDriver::ability_advertised`, a cached lookup returning `None` when the login-time `abilityInfo` was never received (account / cloud cameras answer msg 151 with 421) → `Unknown`. Confirmed on two IR cameras (listed) and two Argus without IR (absent); an IR-equipped model whose firmware omits `ledState` would be classed `Absent` — revisit if one turns up.
+
+Behaviour per state:
+
+| | Present | Unknown | Absent |
+|---|---|---|---|
+| HA entity (LED switch / IR select) | with `state_topic` | without `state_topic` (pre-detection behaviour) | not emitted |
+| `status/led` / `status/ir` published | yes | no (value may be a placeholder) | no |
+| Retained config + status cleared on discovery publish | no | no | yes (`absent_hardware_retractions`) |
+
+`Unknown` never hides or retracts anything, so a failed or missing probe can't delete an entity. `get_ledstate` / `set_ledstate` carry no ability gate (the old `ledState` gate blocked the status LED on Argus). `camera_tasks::publish_led_state` reads once on connect, only when a feature is `Present`, and publishes only `Present` fields (retained, cached for broker-reconnect replay; the cache field is dropped when the feature turns out `Absent`). `control/led` / `control/ir` always reach the camera; on success the binary re-reads and publishes only the written field, only when `Present`. A per-camera lock serialises these read-modify-write commands. Like PIR, both are configuration values, not live sensors — no polling. `status/ir` is the configured mode; the live day/night switch arrives separately on the cmd 33 alarm push. Don't confuse IR with PIR (passive IR motion sensor), which has its own `get_pirstate` reader.
 
 ### Time + DST split across two Bc messages
 

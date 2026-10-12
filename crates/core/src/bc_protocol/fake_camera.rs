@@ -93,6 +93,7 @@ struct FakeState {
 	get_pirstate_pending: bool,
 	get_ledstate_pending: bool,
 	led_writes_fail: bool,
+	abilities: Option<Vec<String>>,
 	is_floodlight_tasks_enabled: Option<BoxFn<bool>>,
 	get_snapshot: Option<BoxFn<Vec<u8>>>,
 	get_snapshot_pending: bool,
@@ -375,6 +376,13 @@ impl FakeCameraBuilder {
 		self
 	}
 
+	/// Abilities [`CameraDriver::ability_advertised`] reports. Default:
+	/// no report received (every lookup is `None`).
+	pub fn with_abilities(mut self, names: &[&str]) -> Self {
+		self.state.abilities = Some(names.iter().map(|n| n.to_string()).collect());
+		self
+	}
+
 	/// Make `led_light_set` / `irled_light_set` record the call, then
 	/// return an error (both are infallible by default).
 	pub fn with_led_writes_failing(mut self) -> Self {
@@ -584,6 +592,11 @@ impl CameraDriver for FakeCamera {
 			unreachable!()
 		}
 		Ok(())
+	}
+
+	async fn ability_advertised(&self, name: &str) -> Option<bool> {
+		let names = self.inner.abilities.as_ref()?;
+		Some(names.iter().any(|a| a == name))
 	}
 
 	async fn get_ledstate(&self) -> Result<LedState> {

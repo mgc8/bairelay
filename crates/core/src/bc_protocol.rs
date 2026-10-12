@@ -571,6 +571,18 @@ impl BcCamera {
 			ReadKind::None
 		}
 	}
+	/// Whether the login-time `abilityInfo` lists `name` (any
+	/// permission): `Some(true/false)` once the report was received,
+	/// `None` when it wasn't — account (cloud) cameras answer msg 151
+	/// with 421, leaving the map empty, which says nothing about the
+	/// camera. Reads the cached map — no camera round trip.
+	pub async fn ability_advertised(&self, name: &str) -> Option<bool> {
+		if self.abilities.read().await.is_empty() {
+			return None;
+		}
+		Some(!matches!(self.has_ability(name).await, ReadKind::None))
+	}
+
 	async fn has_ability_ro<T: Into<String>>(&self, name: T) -> Result<()> {
 		let s: String = name.into();
 		match self.has_ability(&s).await {

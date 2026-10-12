@@ -10,7 +10,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use bairelay_neolink_core::bc::xml::LedState;
 use bairelay_neolink_core::bc_protocol::{CameraDriver, Error as CoreError, MotionStatus};
 
 use bairelay_mqtt::control::IrMode;
@@ -18,6 +17,9 @@ use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
 use bairelay_rtsp::buffer::LastFrameBuffer;
 
 use crate::camera::ReconnectBackoff;
+use crate::capabilities::CameraCapabilities;
+#[cfg(test)]
+use crate::capabilities::Presence;
 use crate::preview_overlay::OverlayCache;
 use crate::preview_state::PreviewState;
 use crate::status_cache::StatusCache;
@@ -520,23 +522,14 @@ pub(crate) fn led_on_from_camera(light_state: &str) -> Option<bool> {
 	}
 }
 
-/// Publish (retained) + cache the IR mode and LED state one
-/// `<LedState>` reply carries; unrecognised fields are skipped.
-async fn publish_led_reply(
-	camera_name: &str,
-	publisher: &StatusPublisher<'_>,
-	status_cache: &StatusCache,
-	led: &LedState,
-) {
-	tracing::debug!(camera = %camera_name, ir = %led.state, led = %led.light_state, "LED state");
-	if let Some(mode) = ir_mode_from_camera(&led.state) {
-		let _ = publisher.publish_ir(mode).await;
-		status_cache.set_ir(mode);
-	}
-	if let Some(on) = led_on_from_camera(&led.light_state) {
-		let _ = publisher.publish_led(on).await;
-		status_cache.set_led(on);
-	}
+async fn publish_ir(publisher: &StatusPublisher<'_>, cache: &StatusCache, mode: IrMode) {
+	let _ = publisher.publish_ir(mode).await;
+	cache.set_ir(mode);
+}
+
+async fn publish_status_led(publisher: &StatusPublisher<'_>, cache: &StatusCache, on: bool) {
+	let _ = publisher.publish_led(on).await;
+	cache.set_led(on);
 }
 
 /// The IR / LED value a `control/ir` or `control/led` just wrote.
@@ -546,46 +539,73 @@ pub(crate) enum LedWrite {
 	Led(bool),
 }
 
-/// After a successful IR / LED write, publish what the camera now
-/// reports rather than what was requested: the camera may ignore a
-/// write and still answer OK. If the re-read fails, fall back to the
-/// requested value. Callers hold the camera's LED write lock.
+/// After a successful IR / status-LED write, publish what the camera
+/// now reports for the field that was written — the camera may ignore
+/// a write and still answer OK. Only that field is published: the
+/// other half of `<LedState>` is a separate feature. If the re-read
+/// fails, fall back to the requested value. Callers hold the camera's
+/// LED write lock.
 pub(crate) async fn publish_after_led_write(
-	camera_name: &str,
 	bc_camera: &dyn CameraDriver,
 	publisher: &StatusPublisher<'_>,
 	status_cache: &StatusCache,
 	written: LedWrite,
 ) {
-	match tokio::time::timeout(Duration::from_secs(10), bc_camera.get_ledstate()).await {
-		Ok(Ok(led)) => publish_led_reply(camera_name, publisher, status_cache, &led).await,
-		_ => match written {
-			LedWrite::Ir(mode) => {
-				let _ = publisher.publish_ir(mode).await;
-				status_cache.set_ir(mode);
-			}
-			LedWrite::Led(on) => {
-				let _ = publisher.publish_led(on).await;
-				status_cache.set_led(on);
-			}
-		},
+	let reread = tokio::time::timeout(Duration::from_secs(10), bc_camera.get_ledstate())
+		.await
+		.ok()
+		.and_then(Result::ok);
+	match written {
+		LedWrite::Ir(requested) => {
+			let mode = reread
+				.as_ref()
+				.and_then(|led| ir_mode_from_camera(&led.state))
+				.unwrap_or(requested);
+			publish_ir(publisher, status_cache, mode).await;
+		}
+		LedWrite::Led(requested) => {
+			let on = reread
+				.as_ref()
+				.and_then(|led| led_on_from_camera(&led.light_state))
+				.unwrap_or(requested);
+			publish_status_led(publisher, status_cache, on).await;
+		}
 	}
 }
 
-/// Query and publish IR mode + status LED once on connect — one
-/// `get_ledstate()` reply carries both. After that they change only via
-/// `control/ir` / `control/led` (handled in mqtt_dispatch). Cameras
-/// without the LED ability fail the query and publish nothing.
+/// Query once on connect and publish the IR mode and/or status LED —
+/// each only if the camera has that hardware (`caps`). One
+/// `get_ledstate()` reply carries both fields, but the value for absent
+/// hardware is a placeholder, so presence comes from `caps`, never from
+/// the reply. After this they change only via `control/ir` /
+/// `control/led` (handled in mqtt_dispatch).
 pub async fn publish_led_state(
 	camera_name: String,
 	bc_camera: Arc<dyn CameraDriver>,
 	mqtt: SharedMqttClient,
 	topic_prefix: String,
 	status_cache: Arc<StatusCache>,
+	caps: CameraCapabilities,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	match tokio::time::timeout(Duration::from_secs(10), bc_camera.get_ledstate()).await {
-		Ok(Ok(led)) => publish_led_reply(&camera_name, &publisher, &status_cache, &led).await,
+		Ok(Ok(led)) => {
+			tracing::debug!(
+				camera = %camera_name, ir = %led.state, status_led = %led.light_state,
+				ir_leds = ?caps.ir_leds, status_led_hw = ?caps.status_led,
+				"LED state"
+			);
+			if let Some(mode) =
+				ir_mode_from_camera(&led.state).filter(|_| caps.ir_leds.is_present())
+			{
+				publish_ir(&publisher, &status_cache, mode).await;
+			}
+			if let Some(on) =
+				led_on_from_camera(&led.light_state).filter(|_| caps.status_led.is_present())
+			{
+				publish_status_led(&publisher, &status_cache, on).await;
+			}
+		}
 		Ok(Err(e)) => {
 			tracing::debug!(camera = %camera_name, error = %e, "LED state query failed");
 		}
@@ -2025,12 +2045,20 @@ mod tests {
 		assert_eq!(led_on_from_camera("blink"), None);
 	}
 
-	/// One `get_ledstate()` reply publishes both IR mode and LED state
-	/// (retained) and records them for broker-reconnect replay.
-	#[tokio::test]
-	async fn publish_led_state_publishes_ir_and_led() {
+	fn caps(status_led: bool, ir_leds: bool) -> CameraCapabilities {
+		CameraCapabilities {
+			status_led: Presence::from_signal(Some(status_led)),
+			ir_leds: Presence::from_signal(Some(ir_leds)),
+			..Default::default()
+		}
+	}
+
+	async fn run_led_state(
+		reply: (&'static str, &'static str),
+		caps: CameraCapabilities,
+	) -> (bairelay_mqtt::test_support::MockHandle, Arc<StatusCache>) {
 		let fake = FakeCameraBuilder::new()
-			.with_ledstate(|| Ok(led_state("open", "close")))
+			.with_ledstate(move || Ok(led_state(reply.0, reply.1)))
 			.build();
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		let cache = empty_cache();
@@ -2040,43 +2068,77 @@ mod tests {
 			mqtt,
 			"bairelay".into(),
 			Arc::clone(&cache),
+			caps,
 		)
 		.await;
-		let rows = mock.published();
-		let has = |t: &str, p: &[u8]| rows.iter().any(|(rt, rp, r)| rt == t && rp == p && *r);
-		assert!(has("bairelay/cam1/status/ir", b"on"), "observed: {rows:?}");
-		assert!(
-			has("bairelay/cam1/status/led", b"off"),
-			"observed: {rows:?}"
+		(mock, cache)
+	}
+
+	fn retained(mock: &bairelay_mqtt::test_support::MockHandle, topic: &str) -> Vec<Vec<u8>> {
+		mock.published()
+			.into_iter()
+			.filter(|(t, _, r)| t == topic && *r)
+			.map(|(_, p, _)| p)
+			.collect()
+	}
+
+	/// Camera with both: one reply publishes IR mode and status LED
+	/// (retained) and records them for broker-reconnect replay.
+	#[tokio::test]
+	async fn publish_led_state_publishes_both_when_both_present() {
+		let (mock, cache) = run_led_state(("open", "close"), caps(true, true)).await;
+		assert_eq!(
+			retained(&mock, "bairelay/cam1/status/ir"),
+			vec![b"on".to_vec()]
+		);
+		assert_eq!(
+			retained(&mock, "bairelay/cam1/status/led"),
+			vec![b"off".to_vec()]
 		);
 		assert_eq!(cache.ir(), Some(IrMode::On));
 		assert_eq!(cache.led(), Some(false));
+	}
+
+	/// Status LED, no IR LEDs (Argus): the reply's IR `state` is a
+	/// placeholder and must not be published.
+	#[tokio::test]
+	async fn publish_led_state_status_led_only_ignores_ir_placeholder() {
+		let (mock, cache) = run_led_state(("close", "close"), caps(true, false)).await;
+		assert!(retained(&mock, "bairelay/cam1/status/ir").is_empty());
+		assert_eq!(
+			retained(&mock, "bairelay/cam1/status/led"),
+			vec![b"off".to_vec()]
+		);
+		assert_eq!((cache.ir(), cache.led()), (None, Some(false)));
+	}
+
+	/// IR LEDs, no status LED: the reply's `lightState` is a placeholder
+	/// (observed `open` on a camera with no visible light).
+	#[tokio::test]
+	async fn publish_led_state_ir_only_ignores_status_led_placeholder() {
+		let (mock, cache) = run_led_state(("auto", "open"), caps(false, true)).await;
+		assert_eq!(
+			retained(&mock, "bairelay/cam1/status/ir"),
+			vec![b"auto".to_vec()]
+		);
+		assert!(retained(&mock, "bairelay/cam1/status/led").is_empty());
+		assert_eq!((cache.ir(), cache.led()), (Some(IrMode::Auto), None));
 	}
 
 	/// Unrecognised camera values publish nothing for that field — the
 	/// other field still lands.
 	#[tokio::test]
 	async fn publish_led_state_skips_unknown_values() {
-		let fake = FakeCameraBuilder::new()
-			.with_ledstate(|| Ok(led_state("dusk", "open")))
-			.build();
-		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
-		let cache = empty_cache();
-		publish_led_state(
-			"cam1".into(),
-			fake,
-			mqtt,
-			"bairelay".into(),
-			Arc::clone(&cache),
-		)
-		.await;
-		let topics = mock.published_topics();
-		assert!(!topics.iter().any(|t| t == "bairelay/cam1/status/ir"));
-		assert!(topics.iter().any(|t| t == "bairelay/cam1/status/led"));
+		let (mock, cache) = run_led_state(("dusk", "open"), caps(true, true)).await;
+		assert!(retained(&mock, "bairelay/cam1/status/ir").is_empty());
+		assert_eq!(
+			retained(&mock, "bairelay/cam1/status/led"),
+			vec![b"on".to_vec()]
+		);
 		assert_eq!(cache.ir(), None);
 	}
 
-	/// Driver error (e.g. camera lacks the LED ability) publishes nothing.
+	/// Driver error publishes nothing.
 	#[tokio::test]
 	async fn publish_led_state_handles_driver_error() {
 		let fake = FakeCameraBuilder::new()
@@ -2087,7 +2149,16 @@ mod tests {
 			})
 			.build();
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
-		publish_led_state("cam1".into(), fake, mqtt, "bairelay".into(), empty_cache()).await;
+		let all = caps(true, true);
+		publish_led_state(
+			"cam1".into(),
+			fake,
+			mqtt,
+			"bairelay".into(),
+			empty_cache(),
+			all,
+		)
+		.await;
 		assert!(mock.published().is_empty());
 	}
 
@@ -2102,6 +2173,7 @@ mod tests {
 			mqtt,
 			"bairelay".into(),
 			empty_cache(),
+			caps(true, true),
 		));
 		tokio::time::advance(Duration::from_secs(11)).await;
 		let _ = task.await;

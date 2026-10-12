@@ -15,9 +15,10 @@ use crate::client::SharedMqttClient;
 use crate::error::MqttError;
 
 use super::{
-	build_battery, build_camera, build_floodlight_light, build_floodlight_tasks_switch, build_ir,
-	build_led, build_motion, build_pir, build_pt_buttons, build_ptz_presets, build_reboot,
-	build_siren, CameraCapabilitiesView, DiscoveryContext, Feature,
+	absent_hardware_retractions, build_battery, build_camera, build_floodlight_light,
+	build_floodlight_tasks_switch, build_ir, build_led, build_motion, build_pir, build_pt_buttons,
+	build_ptz_presets, build_reboot, build_siren, CameraCapabilitiesView, DiscoveryContext,
+	Feature,
 };
 
 /// Per-camera enable toggles. Mirrors the binary's per-camera
@@ -217,6 +218,26 @@ impl DiscoveryPublisher {
 		out
 	}
 
+	/// Retained topics [`Self::publish`] clears for hardware the camera
+	/// is confirmed to lack (see [`absent_hardware_retractions`]). Pure.
+	pub fn compute_retractions(
+		&self,
+		camera_name: &str,
+		capabilities: CameraCapabilitiesView,
+	) -> Vec<String> {
+		let ctx = DiscoveryContext {
+			topic_prefix: &self.topic_prefix,
+			ha_topic: &self.ha_topic,
+			camera_name,
+			camera_addr: None,
+			camera_uid: None,
+			sw_version: &self.sw_version,
+			capabilities: &capabilities,
+			presets: &[],
+		};
+		absent_hardware_retractions(&ctx)
+	}
+
 	/// Publish retained HA discovery config payloads for the
 	/// camera. Safe to call repeatedly: retained publishes are
 	/// idempotent and HA deduplicates by `unique_id`.
@@ -238,6 +259,9 @@ impl DiscoveryPublisher {
 	/// list) bairelay genuinely doesn't know — better to show
 	/// "Unknown" than to lie with a retained name that may not even
 	/// be in the current preset list.
+	///
+	/// Finally clears the config and `status/...` topics of hardware the
+	/// camera is confirmed to lack ([`Self::compute_retractions`]).
 	pub async fn publish(
 		&self,
 		camera_name: &str,
@@ -266,6 +290,9 @@ impl DiscoveryPublisher {
 		}
 		for topic in &removed {
 			self.client.publish_retained(topic, b"").await?;
+		}
+		for topic in self.compute_retractions(camera_name, capabilities) {
+			self.client.publish_retained(&topic, b"").await?;
 		}
 		let preset_state = crate::topics::status_ptz_preset(&self.topic_prefix, camera_name);
 		self.client.publish_retained(&preset_state, b"").await?;
@@ -371,7 +398,11 @@ mod tests {
 	#[test]
 	fn compute_full_set_with_ptz_emits_14_topics() {
 		let publisher = publisher_with_features(&Feature::ALL);
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let out =
 			publisher.compute_payloads("frontdoor", Some("10.0.0.1:9000"), None, caps, &flags, &[]);
@@ -406,7 +437,11 @@ mod tests {
 	#[test]
 	fn compute_without_ptz_drops_four_pt_buttons() {
 		let publisher = publisher_with_features(&Feature::ALL);
-		let caps = CameraCapabilitiesView { has_ptz: false };
+		let caps = CameraCapabilitiesView {
+			has_ptz: false,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let out =
 			publisher.compute_payloads("frontdoor", Some("10.0.0.1:9000"), None, caps, &flags, &[]);
@@ -419,7 +454,11 @@ mod tests {
 	#[test]
 	fn compute_suppresses_battery_when_flag_off() {
 		let publisher = publisher_with_features(&Feature::ALL);
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = CameraEnableFlags {
 			battery: false,
 			..all_flags_on()
@@ -440,7 +479,11 @@ mod tests {
 	fn compute_honours_narrowed_feature_set() {
 		// Subset: only Camera + Battery. Expect 2 topics.
 		let publisher = publisher_with_features(&[Feature::Camera, Feature::Battery]);
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let out =
 			publisher.compute_payloads("frontdoor", Some("10.0.0.1:9000"), None, caps, &flags, &[]);
@@ -459,7 +502,11 @@ mod tests {
 		// publish/unpublish; verify by constructing both forms
 		// directly and comparing the topic sets.
 		let publisher = publisher_with_features(&Feature::ALL);
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let published =
 			publisher.compute_payloads("frontdoor", Some("10.0.0.1:9000"), None, caps, &flags, &[]);
@@ -503,6 +550,39 @@ mod tests {
 		assert_eq!(publisher.ha_topic(), "homeassistant");
 	}
 
+	/// Status LED present, no IR LEDs: publish emits the LED switch,
+	/// and clears (empty retained) any leftover IR select config and
+	/// `status/ir` — while never clearing the LED ones.
+	#[tokio::test]
+	async fn publish_retracts_absent_ir_but_not_present_status_led() {
+		let (client, mock) = crate::test_support::mock_client();
+		let features: HashSet<Feature> = Feature::ALL.iter().copied().collect();
+		let publisher = DiscoveryPublisher::new(
+			client,
+			"bairelay".to_string(),
+			"homeassistant".to_string(),
+			features,
+			"test".to_string(),
+		);
+		let caps = CameraCapabilitiesView {
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Absent,
+			..Default::default()
+		};
+		publisher
+			.publish("cam1", None, None, caps, &all_flags_on(), &[])
+			.await
+			.expect("publish ok");
+		let rows = mock.published();
+		let cleared = |t: &str| rows.iter().any(|(rt, p, r)| rt == t && p.is_empty() && *r);
+		let set = |t: &str| rows.iter().any(|(rt, p, r)| rt == t && !p.is_empty() && *r);
+		assert!(cleared("homeassistant/select/bairelay_cam1_ir/config"));
+		assert!(cleared("bairelay/cam1/status/ir"));
+		assert!(set("homeassistant/switch/bairelay_cam1_led/config"));
+		assert!(!cleared("homeassistant/switch/bairelay_cam1_led/config"));
+		assert!(!cleared("bairelay/cam1/status/led"));
+	}
+
 	/// `publish` must clear the retained `status/ptz/preset` state
 	/// topic. Bairelay never knows the camera's actual current
 	/// preset (the Reolink protocol doesn't expose it), so a stale
@@ -520,7 +600,11 @@ mod tests {
 			features,
 			"test".to_string(),
 		);
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let presets = vec![(1u8, "Home".to_string()), (2u8, "Sky".to_string())];
 		publisher
@@ -566,7 +650,11 @@ mod tests {
 			features,
 			"test".to_string(),
 		);
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let presets = vec![(1u8, "Home".to_string())];
 
@@ -629,7 +717,11 @@ mod tests {
 			features,
 			"test".to_string(),
 		);
-		let caps = CameraCapabilitiesView { has_ptz: true };
+		let caps = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let presets = vec![(1u8, "Home".to_string())];
 
@@ -690,8 +782,16 @@ mod tests {
 			features,
 			"test".to_string(),
 		);
-		let caps_with = CameraCapabilitiesView { has_ptz: true };
-		let caps_without = CameraCapabilitiesView { has_ptz: false };
+		let caps_with = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
+		let caps_without = CameraCapabilitiesView {
+			has_ptz: false,
+			status_led: crate::discovery::Presence::Present,
+			ir_leds: crate::discovery::Presence::Present,
+		};
 		let flags = all_flags_on();
 		let presets = vec![(1u8, "Home".to_string())];
 

@@ -222,7 +222,11 @@ async fn publish_discovery_with_capabilities_emits_ok() {
 	let cancel = CancellationToken::new();
 	let cam = bairelay::camera::CameraHandle::new(config, cancel.clone(), None)
 		.with_discovery_publisher(dummy_discovery_publisher());
-	cam.set_capabilities_for_test(CameraCapabilities { has_ptz: true });
+	cam.set_capabilities_for_test(CameraCapabilities {
+		has_ptz: true,
+		status_led: bairelay_mqtt::discovery::Presence::Present,
+		ir_leds: bairelay_mqtt::discovery::Presence::Present,
+	});
 	assert!(cam.capabilities().is_some());
 	if let Err(e) = cam.publish_discovery().await {
 		panic!("publish_discovery failed: {e}");
@@ -247,7 +251,11 @@ async fn unpublish_discovery_without_prior_publish_is_ok() {
 	let cancel = CancellationToken::new();
 	let cam = bairelay::camera::CameraHandle::new(config, cancel.clone(), None)
 		.with_discovery_publisher(dummy_discovery_publisher());
-	cam.set_capabilities_for_test(CameraCapabilities { has_ptz: false });
+	cam.set_capabilities_for_test(CameraCapabilities {
+		has_ptz: false,
+		status_led: bairelay_mqtt::discovery::Presence::Present,
+		ir_leds: bairelay_mqtt::discovery::Presence::Present,
+	});
 	if let Err(e) = cam.unpublish_discovery().await {
 		panic!("unpublish_discovery failed: {e}");
 	}
