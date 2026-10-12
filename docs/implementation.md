@@ -439,13 +439,13 @@ When `certificate` is set, `main.rs` spawns two `RtspServer::serve` tasks — on
 
 ### `rustls 0.23` crypto provider install
 
-`rustls 0.23` requires a default `CryptoProvider` to be installed once per process before any cert is loaded or any handshake fires. `main.rs` does:
+`rustls 0.23` requires a default `CryptoProvider` to be installed once per process before any TLS config is built. Two providers are compiled in (aws-lc-rs, plus ring via a dependency), so rustls can't choose one itself and panics on first use. `main.rs` calls `bairelay_rtsp::server::install_crypto_provider()` (aws-lc-rs) unconditionally at startup, before the MQTT client is created — rumqttc's MQTT-over-TLS connect needs it as much as the RTSPS listener does.
 
-```rust
-let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-```
+`install_default()` returns `Err(CryptoProvider)` if a provider is already installed; the helper ignores that behind a `OnceLock`, so repeated calls (tests sharing a process) are idempotent.
 
-`install_default()` returns `Err(CryptoProvider)` if a provider is already installed; the binding ignores that — second install is idempotent for our purposes. Tests share a process and call the same function via a `OnceLock` to avoid the `Err` on repeated `#[test]` setup.
+### MQTT broker TLS (`[mqtt] ca`, `client_auth`)
+
+`ca` enables TLS to the broker; `client_auth = [cert, key]` adds mutual TLS and requires `ca`. Each value is a file path (Neolink form) or inline PEM, recognised by a `-----BEGIN` marker (`tls_load::read_pem_source`). `tls_load::load_mqtt_tls` reads everything and runs the checks rumqttc's rustls setup would — each `ca` certificate loads into a root store; the `client_auth` key loads and matches the leaf certificate (`CertifiedKey::from_der`, explicit aws-lc-rs provider) — from `mqtt_loop::build_broker_config`, so bad material fails at startup (when the mode runs MQTT) and in `check-config`. Errors name the path, or `inline PEM` (never the PEM text).
 
 ### `TlsConfig::build` runs at startup, not on first connection
 

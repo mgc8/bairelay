@@ -216,6 +216,13 @@ pub fn run_check_config_to<W1: std::io::Write, W2: std::io::Write>(
 		emit_failure_to(mode, &msg, "config", stdout, stderr);
 		return classify::EXIT_CONFIG;
 	}
+	// Load the MQTT TLS material too: a wrong path or bad PEM is a
+	// config error the daemon would otherwise only hit at startup.
+	if let Err(e) = crate::mqtt_loop::build_broker_config(&config) {
+		let msg = anyhow::anyhow!(format!("validate {}: {:#}", path.display(), e));
+		emit_failure_to(mode, &msg, "config", stdout, stderr);
+		return classify::EXIT_CONFIG;
+	}
 	// Run the same migration-warning helpers the daemon emits at
 	// startup so operators using `check-config` for pre-deploy
 	// validation see the same notes about deprecated neolink fields,

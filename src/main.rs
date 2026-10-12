@@ -144,7 +144,20 @@ async fn async_main() -> Result<()> {
 	// fight over a single id and drown the log in alternating Broken Pipe /
 	// Connection Reset reconnect storms — MQTT brokers disconnect the prior
 	// session whenever a duplicate id reconnects, and rumqttc auto-retries.
-	let mqtt_client = match (build_broker_config(&config), cli.wants_mqtt()) {
+	// Install rustls's process-wide crypto provider before anything can
+	// build a TLS config. Two providers are compiled in (aws-lc-rs, plus
+	// ring via a dependency), so rustls can't pick one itself and panics
+	// on first use — rumqttc's MQTT-over-TLS connect included.
+	bairelay_rtsp::server::install_crypto_provider();
+	// MQTT TLS material is loaded only when this mode runs MQTT: a broken
+	// `[mqtt]` section mustn't stop `rtsp`-only mode (`check-config`
+	// still validates it).
+	let broker_config = if cli.wants_mqtt() {
+		build_broker_config(&config).context("Invalid [mqtt] configuration")?
+	} else {
+		None
+	};
+	let mqtt_client = match (broker_config, cli.wants_mqtt()) {
 		(Some(broker_config), true) => {
 			let client_id = format!("bairelay-{}", std::process::id());
 			let (client, event_loop) =
@@ -168,13 +181,10 @@ async fn async_main() -> Result<()> {
 	let stream_prune_grace = Duration::from_secs(config.stream_prune_grace_secs);
 	let rtsp_users = build_rtsp_users(&config);
 
-	// parse TLS PEMs at startup so any error surfaces here,
-	// not on first connection. Install rustls's default crypto provider
-	// once per process — install_default Errs if a provider is already
-	// installed, which we ignore (idempotent across re-execs).
+	// Parse TLS PEMs at startup so any error surfaces here, not on first
+	// connection (crypto provider installed above).
 	let tls_loaded: Option<bairelay::tls_load::LoadedTls> =
 		if let Some(ref cert_path) = config.certificate {
-			bairelay_rtsp::server::install_crypto_provider();
 			Some(
 				bairelay::tls_load::load_server_tls(
 					cert_path,

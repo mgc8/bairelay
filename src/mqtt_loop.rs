@@ -42,18 +42,31 @@ pub fn build_rtsp_users(config: &Config) -> Vec<bairelay_rtsp::rtsp::auth::UserC
 		.collect()
 }
 
-/// Build the MQTT broker config struct from the parsed TOML form. Pure
-/// data transform; fails only if the caller passes a config without
-/// `[mqtt]` (callers bail before this, so we return Option).
-pub fn build_broker_config(config: &Config) -> Option<bairelay_mqtt::MqttConfig> {
-	let mqtt_config = config.mqtt.as_ref()?;
-	Some(bairelay_mqtt::MqttConfig {
+/// Build the MQTT broker config struct from the parsed TOML form.
+/// `Ok(None)` without `[mqtt]`. Loads and validates the TLS material
+/// (`ca`, `client_auth` — each a file path or inline PEM), so a bad
+/// certificate fails here rather than at the first broker connect.
+pub fn build_broker_config(config: &Config) -> anyhow::Result<Option<bairelay_mqtt::MqttConfig>> {
+	let Some(mqtt_config) = config.mqtt.as_ref() else {
+		return Ok(None);
+	};
+	let client_auth = mqtt_config
+		.client_auth
+		.as_ref()
+		.map(|(cert, key)| (cert.as_str(), key.as_str()));
+	let tls = crate::tls_load::load_mqtt_tls(mqtt_config.ca.as_deref(), client_auth)?;
+	let (ca, client_auth) = match tls {
+		Some(tls) => (Some(tls.ca_pem), tls.client_auth),
+		None => (None, None),
+	};
+	Ok(Some(bairelay_mqtt::MqttConfig {
 		broker_addr: mqtt_config.broker_addr.clone(),
 		port: mqtt_config.port,
 		credentials: mqtt_config.credentials.clone(),
-		ca: mqtt_config.ca.clone(),
-		client_auth: None,
-	})
+		ca,
+		client_auth: client_auth
+			.map(|(cert_pem, key_pem)| bairelay_mqtt::ClientAuth { cert_pem, key_pem }),
+	}))
 }
 
 /// Publish "disconnected" availability for every camera, then
@@ -476,30 +489,69 @@ mod tests {
 
 	#[test]
 	fn build_broker_config_returns_none_when_mqtt_absent() {
-		assert!(build_broker_config(&Config::default()).is_none());
+		assert!(build_broker_config(&Config::default()).unwrap().is_none());
 	}
 
-	#[test]
-	fn build_broker_config_maps_each_field() {
-		let cfg = Config {
+	fn mqtt_cfg(ca: Option<String>, client_auth: Option<(String, String)>) -> Config {
+		Config {
 			mqtt: Some(MqttServerConfig {
 				broker_addr: "mqtt.example.com".into(),
 				port: 8883,
 				credentials: Some(("u".into(), "p".into())),
-				ca: Some("/etc/ca.pem".into()),
-				client_auth: None,
+				ca,
+				client_auth,
 				topic_prefix: "bairelay".into(),
 				discovery: None,
 			}),
 			..Config::default()
-		};
-		let b = build_broker_config(&cfg).expect("Some");
+		}
+	}
+
+	#[test]
+	fn build_broker_config_maps_each_field() {
+		let b = build_broker_config(&mqtt_cfg(None, None))
+			.unwrap()
+			.expect("Some");
 		assert_eq!(b.broker_addr, "mqtt.example.com");
 		assert_eq!(b.port, 8883);
 		assert_eq!(b.credentials.as_ref().unwrap().0, "u");
 		assert_eq!(b.credentials.as_ref().unwrap().1, "p");
-		assert_eq!(b.ca.as_deref(), Some("/etc/ca.pem"));
+		assert!(b.ca.is_none());
 		assert!(b.client_auth.is_none());
+	}
+
+	/// `ca` + `client_auth` given as file paths are read and passed on as
+	/// PEM text — previously `client_auth` was dropped entirely.
+	#[test]
+	fn build_broker_config_loads_ca_and_client_auth_from_files() {
+		let pki = crate::tls_load::test_pki::Pki::generate();
+		let dir = tempfile::tempdir().unwrap();
+		let path = |name: &str, body: &str| {
+			let p = dir.path().join(name);
+			std::fs::write(&p, body).unwrap();
+			p.to_string_lossy().into_owned()
+		};
+		let cfg = mqtt_cfg(
+			Some(path("ca.pem", &pki.ca_pem)),
+			Some((
+				path("client.pem", &pki.client_cert_pem),
+				path("client.key", &pki.client_key_pem),
+			)),
+		);
+		let b = build_broker_config(&cfg).unwrap().expect("Some");
+		assert_eq!(b.ca.as_deref(), Some(pki.ca_pem.as_str()));
+		let auth = b.client_auth.expect("client_auth wired through");
+		assert_eq!(auth.cert_pem, pki.client_cert_pem);
+		assert_eq!(auth.key_pem, pki.client_key_pem);
+	}
+
+	#[test]
+	fn build_broker_config_rejects_unreadable_ca_path() {
+		let cfg = mqtt_cfg(Some("/nonexistent/broker-ca.pem".into()), None);
+		let err = build_broker_config(&cfg)
+			.expect_err("must fail")
+			.to_string();
+		assert!(err.contains("/nonexistent/broker-ca.pem"), "got: {err}");
 	}
 
 	#[test]

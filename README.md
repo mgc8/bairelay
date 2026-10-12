@@ -242,6 +242,10 @@ Set `certificate = "/path/to/fullchain-and-key.pem"` at the top level to enable 
 
 `tests/scripts/gen-test-certs.sh` produces a self-signed CA + leaf for local testing.
 
+### TLS to the MQTT broker
+
+Set `ca` in `[mqtt]` to connect over TLS (port is usually 8883); the broker's certificate is verified against that CA. For mutual TLS add `client_auth = ["client.pem", "client.key"]`. Each value is a file path (as in Neolink) or the PEM text itself inline. All of it is loaded and checked at startup and by `bairelay check-config`, so a wrong path, a bad certificate or a certificate/key mismatch fails immediately rather than at every broker connect.
+
 ### Security defaults you should know about
 
 Bairelay assumes a **trusted LAN** as its deployment context. That assumption shows up in a few places worth calling out:

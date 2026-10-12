@@ -6,7 +6,7 @@ pub mod status;
 pub mod test_support;
 pub mod topics;
 
-pub use client::{connect, MqttConfig, MqttEventLoop, SharedMqttClient};
+pub use client::{connect, ClientAuth, MqttConfig, MqttEventLoop, SharedMqttClient};
 pub use control::{parse_control_message, ControlCommand};
 pub use discovery::{CameraEnableFlags, DiscoveryPublisher};
 pub use error::MqttError;
