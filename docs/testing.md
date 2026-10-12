@@ -534,6 +534,7 @@ Required:
 - A built bairelay binary (`cargo build --release`).
 - `ffmpeg` (which also provides `ffprobe`).
 - GNU coreutils' `timeout` (the script falls back to `gtimeout` on macOS; install from Homebrew if missing).
+- The RTSP port free: stop any deployed bairelay service sharing the config's bind address first. The harness exits 2 if the port is already taken, rather than probing the other instance.
 
 Optional — the harness exercises whichever tools it finds installed and skips the rest:
 

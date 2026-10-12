@@ -272,15 +272,12 @@ run_client() {
 	# because of the previous filename collision.
 	local log="$OUT_DIR/${client}-${transport}-${label}.log"
 	local t="$DURATION"
-	# Build TLS-related ffmpeg/ffprobe flags. Under --tls we ask ffmpeg's
-	# TLS demuxer to verify the peer cert against our test CA. These flags
-	# go BEFORE -i per ffmpeg conventions. If a future ffmpeg drops support
-	# for -tls_verify on the RTSP demuxer, the fallback is `-tls_verify 0`
-	# (handshake-only check, no CA pinning) — flip the assignment below.
+	# TLS flags for ffmpeg/ffprobe: none. The rtsps demuxer exposes no
+	# tls_verify / ca_file options (ffmpeg 7.x errors "Option not found";
+	# ffprobe ignores them), so these probes check handshake + stream
+	# only. Cert-chain and client-auth verification live in
+	# crates/rtsp/tests/tls_handshake.rs.
 	local ff_tls_args=()
-	if [ "$TLS" -eq 1 ]; then
-		ff_tls_args=(-tls_verify 1 -ca_file "$CA_PEM")
-	fi
 	case "$client" in
 		ffprobe)
 			# ffprobe -show_streams with a bounded timeout. TCP transport = reliable.
@@ -384,6 +381,16 @@ run_client() {
 # ── Launch bairelay ─────────────────────────────────────────────────────
 
 SERVER_LOG="$OUT_DIR/bairelay.log"
+
+# Refuse to start if something already listens on the probe port (e.g. a
+# deployed bairelay service): the readiness poll below would see that
+# listener and every probe would silently test the other instance.
+if nc -z -w 1 "$RTSP_HOST" "$EFFECTIVE_PORT" 2>/dev/null; then
+	echo "error: $RTSP_HOST:$EFFECTIVE_PORT is already in use by another process" >&2
+	echo "       (a deployed bairelay service?) — stop it and re-run" >&2
+	exit 2
+fi
+
 echo "starting bairelay..."
 "$BAIRELAY_BIN" mqtt-rtsp -c "$CONFIG_TO_USE" > "$SERVER_LOG" 2>&1 &
 BAIRELAY_PID=$!
@@ -413,6 +420,12 @@ trap cleanup EXIT INT TERM
 echo "waiting for RTSP listener on $RTSP_HOST:$EFFECTIVE_PORT..."
 READY=0
 for _ in $(seq 1 60); do
+	# Liveness first: a port answering means nothing if our process died.
+	if ! kill -0 "$BAIRELAY_PID" 2>/dev/null; then
+		echo "error: bairelay exited during startup, see $SERVER_LOG" >&2
+		tail -20 "$SERVER_LOG" >&2
+		exit 2
+	fi
 	if grep -q 'RTSP server listening\|RTSP server started' "$SERVER_LOG" 2>/dev/null; then
 		READY=1
 		break
@@ -421,11 +434,6 @@ for _ in $(seq 1 60); do
 	if nc -z -w 1 "$RTSP_HOST" "$EFFECTIVE_PORT" 2>/dev/null; then
 		READY=1
 		break
-	fi
-	if ! kill -0 "$BAIRELAY_PID" 2>/dev/null; then
-		echo "error: bairelay exited during startup, see $SERVER_LOG" >&2
-		tail -20 "$SERVER_LOG" >&2
-		exit 2
 	fi
 	sleep 0.5
 done
@@ -496,10 +504,8 @@ done
 FIRST_CAM=$(echo "$CAMERAS" | head -1)
 FANOUT_URL="$RTSP_SCHEME://$RTSP_HOST:$EFFECTIVE_PORT/$FIRST_CAM"
 echo "=== multi-client fanout: 2× ffmpeg on $FIRST_CAM ==="
+# No TLS flags: see the ff_tls_args note in run_client.
 FANOUT_TLS_ARGS=()
-if [ "$TLS" -eq 1 ]; then
-	FANOUT_TLS_ARGS=(-tls_verify 1 -ca_file "$CA_PEM")
-fi
 # Run the fanout block in the parent shell (NOT a `(...)` subshell):
 # `record` increments PASS / FAIL counters, and a subshell-local
 # increment is invisible to the line-`totals:` print at the end of the
