@@ -4,6 +4,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
 use crate::client::SharedMqttClient;
+use crate::control::IrMode;
 use crate::error::MqttError;
 use crate::topics;
 
@@ -122,6 +123,23 @@ impl<'a> StatusPublisher<'a> {
 			.await
 	}
 
+	/// Publish IR night-vision mode (retained).
+	pub async fn publish_ir(&self, mode: IrMode) -> Result<(), MqttError> {
+		let topic = topics::status_ir(&self.topic_prefix, &self.camera_name);
+		self.client
+			.publish_retained(&topic, mode.as_payload().as_bytes())
+			.await
+	}
+
+	/// Publish status LED state (retained).
+	pub async fn publish_led(&self, on: bool) -> Result<(), MqttError> {
+		let payload = if on { "on" } else { "off" };
+		let topic = topics::status_led(&self.topic_prefix, &self.camera_name);
+		self.client
+			.publish_retained(&topic, payload.as_bytes())
+			.await
+	}
+
 	/// Publish PTZ preset position as JSON (retained).
 	pub async fn publish_ptz_preset(&self, json: &str) -> Result<(), MqttError> {
 		let topic = topics::status_ptz_preset(&self.topic_prefix, &self.camera_name);
@@ -197,6 +215,28 @@ mod tests {
 		pub_.publish_pir(true).await.unwrap();
 		pub_.publish_pir(false).await.unwrap();
 		pub_.publish_ptz_preset(r#"{"presets":[]}"#).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn publish_ir_and_led_retained_on_status_topics() {
+		let (c, mock) = crate::test_support::mock_client();
+		let pub_ = StatusPublisher::new(&c, "bairelay", "cam1");
+		pub_.publish_ir(IrMode::Auto).await.unwrap();
+		pub_.publish_ir(IrMode::Off).await.unwrap();
+		pub_.publish_led(true).await.unwrap();
+		let got = mock.published();
+		let expect = [
+			("bairelay/cam1/status/ir", "auto"),
+			("bairelay/cam1/status/ir", "off"),
+			("bairelay/cam1/status/led", "on"),
+		];
+		assert_eq!(got.len(), expect.len(), "published: {got:?}");
+		for ((topic, payload, retained), (et, ep)) in got.iter().zip(expect) {
+			assert_eq!(
+				(topic.as_str(), payload.as_slice(), *retained),
+				(et, ep.as_bytes(), true)
+			);
+		}
 	}
 
 	#[test]

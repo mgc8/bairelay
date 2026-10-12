@@ -1,7 +1,7 @@
 //! Per-camera cache of the most-recent MQTT status values.
 //!
 //! Each camera task that publishes a status topic (battery, motion,
-//! floodlight, floodlight_tasks, pir) writes the just-published value
+//! floodlight, floodlight_tasks, pir, ir, led) writes the just-published value
 //! into this cache. On a broker reconnect, `handle_connack` walks
 //! every camera's cache and re-emits any set value via the standard
 //! `publish_*` retained publishers.
@@ -25,6 +25,7 @@
 //!   discovery publisher intentionally clears it on every reconnect.
 
 use crate::stream_source::RwLockPoisonRecover as _;
+use bairelay_mqtt::control::IrMode;
 use std::sync::RwLock;
 
 #[derive(Debug, Default)]
@@ -34,6 +35,8 @@ pub struct StatusCache {
 	floodlight: RwLock<Option<bool>>,
 	floodlight_tasks: RwLock<Option<bool>>,
 	pir: RwLock<Option<bool>>,
+	ir: RwLock<Option<IrMode>>,
+	led: RwLock<Option<bool>>,
 }
 
 impl StatusCache {
@@ -71,6 +74,20 @@ impl StatusCache {
 	pub fn pir(&self) -> Option<bool> {
 		*self.pir.read_recover()
 	}
+
+	pub fn set_ir(&self, mode: IrMode) {
+		*self.ir.write_recover() = Some(mode);
+	}
+	pub fn ir(&self) -> Option<IrMode> {
+		*self.ir.read_recover()
+	}
+
+	pub fn set_led(&self, on: bool) {
+		*self.led.write_recover() = Some(on);
+	}
+	pub fn led(&self) -> Option<bool> {
+		*self.led.read_recover()
+	}
 }
 
 #[cfg(test)]
@@ -85,6 +102,8 @@ mod tests {
 		assert_eq!(c.floodlight(), None);
 		assert_eq!(c.floodlight_tasks(), None);
 		assert_eq!(c.pir(), None);
+		assert_eq!(c.ir(), None);
+		assert_eq!(c.led(), None);
 	}
 
 	#[test]
@@ -95,11 +114,15 @@ mod tests {
 		c.set_floodlight(false);
 		c.set_floodlight_tasks(true);
 		c.set_pir(false);
+		c.set_ir(IrMode::Auto);
+		c.set_led(true);
 		assert_eq!(c.battery_level(), Some(72));
 		assert_eq!(c.motion(), Some(true));
 		assert_eq!(c.floodlight(), Some(false));
 		assert_eq!(c.floodlight_tasks(), Some(true));
 		assert_eq!(c.pir(), Some(false));
+		assert_eq!(c.ir(), Some(IrMode::Auto));
+		assert_eq!(c.led(), Some(true));
 	}
 
 	#[test]

@@ -17,11 +17,23 @@ pub enum PtzDirection {
 }
 
 /// IR night-vision mode.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IrMode {
 	On,
 	Off,
 	Auto,
+}
+
+impl IrMode {
+	/// Canonical MQTT payload: the same strings `control/ir` accepts and
+	/// the HA `select` entity lists as options.
+	pub fn as_payload(self) -> &'static str {
+		match self {
+			IrMode::On => "on",
+			IrMode::Off => "off",
+			IrMode::Auto => "auto",
+		}
+	}
 }
 
 /// A validated control or query command extracted from an MQTT message.

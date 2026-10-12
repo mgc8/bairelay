@@ -50,6 +50,9 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 	cam.status_cache().set_floodlight(false);
 	cam.status_cache().set_floodlight_tasks(true);
 	cam.status_cache().set_pir(false);
+	cam.status_cache()
+		.set_ir(bairelay_mqtt::control::IrMode::Auto);
+	cam.status_cache().set_led(true);
 
 	cam.republish_cached_status()
 		.await
@@ -81,6 +84,14 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 	assert!(
 		saw("bairelay/cam1/status/pir", b"off"),
 		"pir=off retained must land"
+	);
+	assert!(
+		saw("bairelay/cam1/status/ir", b"auto"),
+		"ir=auto retained must land"
+	);
+	assert!(
+		saw("bairelay/cam1/status/led", b"on"),
+		"led=on retained must land"
 	);
 }
 

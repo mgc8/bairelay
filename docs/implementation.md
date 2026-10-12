@@ -78,9 +78,9 @@ Inbound deserialisation tolerates absent fields; outbound serialisation still wr
 
 Reolink fixed-mount cameras (e.g. Argus Altas) report `<ptzMode>none</ptzMode>` in the support XML — non-empty but explicitly NOT a motorised mount. A naive `is_empty()` check classifies them as PTZ-capable and HA discovery emits four phantom Pan buttons. The single point of truth is `crate::capabilities::ptz_mode_indicates_ptz`: `none` / `0` / `false` (case-insensitive) and empty all return `false`. Real motorised cameras advertise `pt`, `ptz`, `3d`. Note this only stops *new* publications — leaked retained discovery topics for cameras previously misclassified must be cleaned up manually with `mosquitto_pub -r -m ""`.
 
-### IR LED is write-only
+### IR + status LED state
 
-`crates/core/src/bc_protocol/ledstate.rs::irled_light_set` writes the IR night-vision mode but bairelay_neolink_core has no getter, so bairelay's HA `select` entity (`build_ir`) emits `state_topic: None`. HA shows it as "unknown" forever — fire-and-forget control. Don't confuse with PIR (passive IR motion sensor), which has a separate `get_pirstate` reader.
+One `get_ledstate()` reply (`<LedState>`) carries both the IR night-vision mode (`state`: `auto` / `open` / `close`) and the status LED (`lightState`: `open` / `close`). `camera_tasks::publish_led_state` reads it once on connect and publishes `status/ir` (`auto` / `on` / `off`) + `status/led` (`on` / `off`), retained and cached for broker-reconnect replay; `control/ir` and `control/led` republish on success. Like PIR, it's a configuration value, not a live sensor — no polling. Unrecognised camera spellings publish nothing for that field. `status/ir` is the configured mode; the camera's actual day/night switch arrives separately on the cmd 33 alarm push. Don't confuse IR with PIR (passive IR motion sensor), which has its own `get_pirstate` reader.
 
 ### Time + DST split across two Bc messages
 

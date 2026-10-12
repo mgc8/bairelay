@@ -12,6 +12,7 @@ use bairelay_mqtt::{topics, SharedMqttClient, StatusPublisher};
 use bairelay_neolink_core::bc_protocol::{Direction, LightState};
 
 use crate::camera::CameraHandle;
+use crate::camera_tasks::{publish_after_led_write, LedWrite};
 
 pub async fn dispatch_control(
 	cmd: ControlCommand,
@@ -105,16 +106,38 @@ pub async fn dispatch_control(
 		ControlCommand::FloodlightTasks { state, .. } => {
 			timeout_to_result(timeout(CMD_TIMEOUT, bc.floodlight_tasks_enable(state)).await)
 		}
-		ControlCommand::Led { state, .. } => {
-			timeout_to_result(timeout(CMD_TIMEOUT, bc.led_light_set(state)).await)
+		ControlCommand::Led {
+			camera: ref cam_name,
+			state,
+		} => {
+			let _led = cam.led_write_lock().lock().await;
+			let result = timeout_to_result(timeout(CMD_TIMEOUT, bc.led_light_set(state)).await);
+			if result.is_ok() {
+				let publisher = StatusPublisher::new(mqtt, topic_prefix, cam_name);
+				let cache = cam.status_cache();
+				let written = LedWrite::Led(state);
+				publish_after_led_write(cam_name, &*bc, &publisher, &cache, written).await;
+			}
+			result
 		}
-		ControlCommand::Ir { mode, .. } => {
+		ControlCommand::Ir {
+			camera: ref cam_name,
+			mode,
+		} => {
 			let ls = match mode {
 				IrMode::On => LightState::On,
 				IrMode::Off => LightState::Off,
 				IrMode::Auto => LightState::Auto,
 			};
-			timeout_to_result(timeout(CMD_TIMEOUT, bc.irled_light_set(ls)).await)
+			let _led = cam.led_write_lock().lock().await;
+			let result = timeout_to_result(timeout(CMD_TIMEOUT, bc.irled_light_set(ls)).await);
+			if result.is_ok() {
+				let publisher = StatusPublisher::new(mqtt, topic_prefix, cam_name);
+				let cache = cam.status_cache();
+				let written = LedWrite::Ir(mode);
+				publish_after_led_write(cam_name, &*bc, &publisher, &cache, written).await;
+			}
+			result
 		}
 		ControlCommand::Pir {
 			camera: ref cam_name,
@@ -750,7 +773,9 @@ mod tests {
 	/// `ControlCommand::Led { state: true }` dispatches to `led_light_set(true)`.
 	#[tokio::test]
 	async fn dispatch_led_on_invokes_driver() {
-		let fake = FakeCameraBuilder::new().build();
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| Ok(led_state("auto", "open")))
+			.build();
 		let (cameras, fake) = test_cameras_with_fake("cam-led", fake);
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 
@@ -766,10 +791,16 @@ mod tests {
 		.await;
 
 		assert_eq!(*fake.calls().led_light_set.lock().unwrap(), vec![true]);
-		assert!(mock
-			.published()
+		let rows = mock.published();
+		assert!(rows
 			.iter()
 			.any(|(t, p, _)| t == "bairelay/cam-led/control/led" && p == b"OK"));
+		assert!(
+			rows.iter()
+				.any(|(t, p, r)| t == "bairelay/cam-led/status/led" && p == b"on" && *r),
+			"status/led must be republished; observed: {rows:?}"
+		);
+		assert_eq!(cameras["cam-led"].status_cache().led(), Some(true));
 	}
 
 	/// `ControlCommand::Ir` maps each IrMode variant onto the matching
@@ -783,9 +814,17 @@ mod tests {
 			(IrMode::Auto, LightState::Auto),
 		];
 		for (mode, expected) in cases {
-			let fake = FakeCameraBuilder::new().build();
+			// Re-read after the write reports the requested mode.
+			let cam_state = match mode {
+				IrMode::On => "open",
+				IrMode::Off => "close",
+				IrMode::Auto => "auto",
+			};
+			let fake = FakeCameraBuilder::new()
+				.with_ledstate(move || Ok(led_state(cam_state, "close")))
+				.build();
 			let (cameras, fake) = test_cameras_with_fake("cam-ir", fake);
-			let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+			let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 			dispatch_control(
 				ControlCommand::Ir {
 					camera: "cam-ir".to_string(),
@@ -799,7 +838,104 @@ mod tests {
 			let calls = fake.calls().irled_light_set.lock().unwrap().clone();
 			assert_eq!(calls.len(), 1, "one irled_light_set call per dispatch");
 			assert_eq!(calls[0], expected);
+			// New mode republished on status/ir (retained) and cached.
+			assert!(mock
+				.published()
+				.iter()
+				.any(|(t, p, r)| t == "bairelay/cam-ir/status/ir"
+					&& p == mode.as_payload().as_bytes()
+					&& *r));
+			assert_eq!(cameras["cam-ir"].status_cache().ir(), Some(mode));
 		}
+	}
+
+	fn led_state(ir: &str, light: &str) -> bairelay_neolink_core::bc::xml::LedState {
+		bairelay_neolink_core::bc::xml::LedState {
+			state: ir.into(),
+			light_state: light.into(),
+			..Default::default()
+		}
+	}
+
+	fn status_rows(mock: &bairelay_mqtt::test_support::MockHandle, topic: &str) -> Vec<Vec<u8>> {
+		mock.published()
+			.into_iter()
+			.filter(|(t, _, _)| t == topic)
+			.map(|(_, p, _)| p)
+			.collect()
+	}
+
+	/// The camera answers OK but ignores the write: bairelay publishes
+	/// what the post-write re-read reports, not what was requested.
+	#[tokio::test]
+	async fn dispatch_ir_publishes_camera_state_not_requested_mode() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| Ok(led_state("auto", "close")))
+			.build();
+		let (cameras, _fake) = test_cameras_with_fake("cam-ir", fake);
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cmd = ControlCommand::Ir {
+			camera: "cam-ir".to_string(),
+			mode: IrMode::On,
+		};
+		dispatch_control(cmd, &cameras, &mqtt, "bairelay").await;
+		assert_eq!(
+			status_rows(&mock, "bairelay/cam-ir/status/ir"),
+			vec![b"auto".to_vec()]
+		);
+		assert_eq!(cameras["cam-ir"].status_cache().ir(), Some(IrMode::Auto));
+	}
+
+	/// Re-read fails after a successful write: fall back to publishing
+	/// the requested value.
+	#[tokio::test]
+	async fn dispatch_led_falls_back_to_requested_when_reread_fails() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| {
+				Err(bairelay_neolink_core::bc_protocol::Error::Other(
+					"reread refused",
+				))
+			})
+			.build();
+		let (cameras, _fake) = test_cameras_with_fake("cam-led", fake);
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cmd = ControlCommand::Led {
+			camera: "cam-led".to_string(),
+			state: false,
+		};
+		dispatch_control(cmd, &cameras, &mqtt, "bairelay").await;
+		assert_eq!(
+			status_rows(&mock, "bairelay/cam-led/status/led"),
+			vec![b"off".to_vec()]
+		);
+		assert_eq!(cameras["cam-led"].status_cache().led(), Some(false));
+	}
+
+	/// A failed write publishes no state, leaves the cache alone, and
+	/// replies FAIL.
+	#[tokio::test]
+	async fn dispatch_failed_led_and_ir_writes_publish_nothing() {
+		let fake = FakeCameraBuilder::new().with_led_writes_failing().build();
+		let (cameras, _fake) = test_cameras_with_fake("cam-x", fake);
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let led = ControlCommand::Led {
+			camera: "cam-x".to_string(),
+			state: true,
+		};
+		let ir = ControlCommand::Ir {
+			camera: "cam-x".to_string(),
+			mode: IrMode::Off,
+		};
+		dispatch_control(led, &cameras, &mqtt, "bairelay").await;
+		dispatch_control(ir, &cameras, &mqtt, "bairelay").await;
+		assert!(status_rows(&mock, "bairelay/cam-x/status/led").is_empty());
+		assert!(status_rows(&mock, "bairelay/cam-x/status/ir").is_empty());
+		let cache = cameras["cam-x"].status_cache();
+		assert_eq!((cache.led(), cache.ir()), (None, None));
+		assert_eq!(
+			status_rows(&mock, "bairelay/cam-x/control/led"),
+			vec![b"FAIL".to_vec()]
+		);
 	}
 
 	/// `Siren { state: true }` invokes `siren()`; `state: false` is a no-op

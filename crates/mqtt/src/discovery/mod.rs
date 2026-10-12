@@ -430,7 +430,9 @@ pub fn build_motion(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	))
 }
 
-/// `switch` entity driving the status LED.
+/// `switch` entity driving the status LED. State mirrors the
+/// `lightState` bairelay reads via `get_ledstate()` on connect and
+/// republishes after every `control/led`.
 pub fn build_led(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "led");
@@ -443,14 +445,16 @@ pub fn build_led(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 		command_topic: cam_topic(ctx, "control", "led"),
 		payload_off: "off".to_string(),
 		payload_on: "on".to_string(),
-		state_topic: None,
-		state_off: None,
-		state_on: None,
+		state_topic: Some(cam_topic(ctx, "status", "led")),
+		state_off: Some("off".to_string()),
+		state_on: Some("on".to_string()),
 	};
 	Some((config_topic(ctx, "switch", &unique_id), to_json(&payload)))
 }
 
-/// `select` entity driving the IR night-vision mode.
+/// `select` entity driving the IR night-vision mode. State mirrors the
+/// LED-status `state` field (configured mode, not the live day/night
+/// switch), read on connect and republished after every `control/ir`.
 pub fn build_ir(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "ir");
@@ -462,7 +466,7 @@ pub fn build_ir(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 		availability: availability_block(ctx),
 		command_topic: cam_topic(ctx, "control", "ir"),
 		options: vec!["on".to_string(), "off".to_string(), "auto".to_string()],
-		state_topic: None,
+		state_topic: Some(cam_topic(ctx, "status", "ir")),
 	};
 	Some((config_topic(ctx, "select", &unique_id), to_json(&payload)))
 }
@@ -827,6 +831,21 @@ mod tests {
 		let v = parse(&json);
 		assert_eq!(v["unique_id"], "bairelay_frontdoor_md");
 		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/motion");
+	}
+
+	#[test]
+	fn led_and_ir_carry_state_topics() {
+		let f = Fixture::new("bairelay");
+		let caps = CameraCapabilitiesView::default();
+		let ctx = f.ctx(&caps);
+		let (_, led) = build_led(&ctx).expect("emitted");
+		let v = parse(&led);
+		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/led");
+		assert_eq!(v["state_on"], "on");
+		assert_eq!(v["state_off"], "off");
+		let (_, ir) = build_ir(&ctx).expect("emitted");
+		let v = parse(&ir);
+		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/ir");
 	}
 
 	#[test]

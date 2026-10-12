@@ -91,6 +91,8 @@ struct FakeState {
 	battery_info_pending: bool,
 	get_pirstate: Option<BoxFn<RfAlarmCfg>>,
 	get_pirstate_pending: bool,
+	get_ledstate_pending: bool,
+	led_writes_fail: bool,
 	is_floodlight_tasks_enabled: Option<BoxFn<bool>>,
 	get_snapshot: Option<BoxFn<Vec<u8>>>,
 	get_snapshot_pending: bool,
@@ -138,6 +140,14 @@ impl FakeCamera {
 	/// Access the call log recorded by side-effect methods.
 	pub fn calls(&self) -> &FakeCalls {
 		&self.inner.calls
+	}
+
+	fn led_write_result(&self) -> Result<()> {
+		if self.inner.led_writes_fail {
+			Err(Error::Other("FakeCamera: scripted LED write failure"))
+		} else {
+			Ok(())
+		}
 	}
 }
 
@@ -365,6 +375,19 @@ impl FakeCameraBuilder {
 		self
 	}
 
+	/// Make `led_light_set` / `irled_light_set` record the call, then
+	/// return an error (both are infallible by default).
+	pub fn with_led_writes_failing(mut self) -> Self {
+		self.state.led_writes_fail = true;
+		self
+	}
+
+	/// Make `get_ledstate` await `pending()` forever.
+	pub fn with_ledstate_pending(mut self) -> Self {
+		self.state.get_ledstate_pending = true;
+		self
+	}
+
 	/// Make `get_snapshot` await `pending()` forever.
 	pub fn with_snapshot_pending(mut self) -> Self {
 		self.state.get_snapshot_pending = true;
@@ -541,12 +564,12 @@ impl CameraDriver for FakeCamera {
 
 	async fn led_light_set(&self, state: bool) -> Result<()> {
 		self.inner.calls.led_light_set.lock().unwrap().push(state);
-		Ok(())
+		self.led_write_result()
 	}
 
 	async fn irled_light_set(&self, state: LightState) -> Result<()> {
 		self.inner.calls.irled_light_set.lock().unwrap().push(state);
-		Ok(())
+		self.led_write_result()
 	}
 
 	async fn reboot(&self) -> Result<()> {
@@ -564,6 +587,10 @@ impl CameraDriver for FakeCamera {
 	}
 
 	async fn get_ledstate(&self) -> Result<LedState> {
+		if self.inner.get_ledstate_pending {
+			std::future::pending::<()>().await;
+			unreachable!()
+		}
 		match self.inner.get_ledstate.as_ref() {
 			Some(f) => f(),
 			None => unset("get_ledstate"),

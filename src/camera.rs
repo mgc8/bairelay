@@ -226,6 +226,10 @@ pub struct CameraHandle {
 	/// `spawn_session_tasks` consults it so a reconnect doesn't restart
 	/// the poller and re-run the same futile probes on every wake.
 	battery_unsupported: Arc<AtomicBool>,
+	/// Serialises `control/ir` / `control/led`. Both are read-modify-
+	/// write of one `<LedState>` on the camera, so overlapping commands
+	/// would otherwise undo each other's field.
+	led_write_lock: tokio::sync::Mutex<()>,
 	/// Global `Config::stream_prune_grace_secs` propagated by the
 	/// orchestrator at construction. Threaded through to
 	/// [`crate::config::resolve_idle_disconnect_timeout`] so the floor
@@ -303,6 +307,7 @@ impl CameraHandle {
 			preview_state_rx,
 			status_cache: Arc::new(StatusCache::default()),
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
+			led_write_lock: tokio::sync::Mutex::new(()),
 			prune_grace: Duration::ZERO,
 		}
 	}
@@ -464,6 +469,11 @@ impl CameraHandle {
 	/// receives a clone of this Arc and writes the just-published
 	/// value after every successful publish. Read by
 	/// [`Self::republish_cached_status`] on every broker reconnect.
+	/// Lock held across an IR / LED read-modify-write + republish.
+	pub fn led_write_lock(&self) -> &tokio::sync::Mutex<()> {
+		&self.led_write_lock
+	}
+
 	pub fn status_cache(&self) -> Arc<StatusCache> {
 		Arc::clone(&self.status_cache)
 	}
@@ -502,6 +512,12 @@ impl CameraHandle {
 		}
 		if let Some(enabled) = self.status_cache.pir() {
 			publisher.publish_pir(enabled).await?;
+		}
+		if let Some(mode) = self.status_cache.ir() {
+			publisher.publish_ir(mode).await?;
+		}
+		if let Some(on) = self.status_cache.led() {
+			publisher.publish_led(on).await?;
 		}
 		Ok(())
 	}
@@ -1110,6 +1126,15 @@ impl CameraHandle {
 				)
 				.await;
 			}
+			// Spawned, not awaited: an unresponsive camera must not hold
+			// up the grace-period watcher or ignore session cancel.
+			tasks.spawn(camera_tasks::publish_led_state(
+				self.config.name.clone(),
+				Arc::clone(driver),
+				mqtt.clone(),
+				self.topic_prefix.clone(),
+				self.status_cache(),
+			));
 		}
 
 		// Grace-period watcher for battery cameras: when the wake-lock
@@ -2734,6 +2759,13 @@ mod tests {
 					..Default::default()
 				})
 			})
+			.with_ledstate(|| {
+				Ok(bairelay_neolink_core::bc::xml::LedState {
+					state: "auto".into(),
+					light_state: "close".into(),
+					..Default::default()
+				})
+			})
 			.with_support(|| {
 				Ok(Support {
 					ptz_mode: Some("pt".to_string()),
@@ -2804,6 +2836,20 @@ mod tests {
 			pir_published,
 			"enable_pir = true must trigger a status/pir publish"
 		);
+
+		// publish_led_state ran unconditionally: IR mode + LED state.
+		let has = |topic: &str, payload: &[u8]| {
+			pubs.iter()
+				.any(|(t, p, r)| t == topic && p == payload && *r)
+		};
+		assert!(
+			has("bairelay/cam-sess/status/ir", b"auto"),
+			"status/ir=auto"
+		);
+		assert!(
+			has("bairelay/cam-sess/status/led", b"off"),
+			"status/led=off"
+		);
 	}
 
 	/// Once `battery_poller` has latched the "no battery" verdict, a
@@ -2825,6 +2871,7 @@ mod tests {
 		let fake = FakeCameraBuilder::new()
 			// battery_info deliberately unset — a spawned poller panics.
 			.with_support(|| Ok(bairelay_neolink_core::bc::xml::Support::default()))
+			.with_ledstate(|| Ok(bairelay_neolink_core::bc::xml::LedState::default()))
 			.with_linktype(|| {
 				Err(bairelay_neolink_core::bc_protocol::Error::Other(
 					"scripted link fail",

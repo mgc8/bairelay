@@ -48,6 +48,16 @@ pub fn status_pir(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/status/pir")
 }
 
+/// IR night-vision mode (`on` / `off` / `auto`): `{prefix}/{cam}/status/ir`
+pub fn status_ir(prefix: &str, cam: &str) -> String {
+	format!("{prefix}/{cam}/status/ir")
+}
+
+/// Status LED on/off: `{prefix}/{cam}/status/led`
+pub fn status_led(prefix: &str, cam: &str) -> String {
+	format!("{prefix}/{cam}/status/led")
+}
+
 /// PTZ preset position: `{prefix}/{cam}/status/ptz/preset`
 pub fn status_ptz_preset(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/status/ptz/preset")

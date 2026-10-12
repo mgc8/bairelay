@@ -10,8 +10,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use bairelay_neolink_core::bc::xml::LedState;
 use bairelay_neolink_core::bc_protocol::{CameraDriver, Error as CoreError, MotionStatus};
 
+use bairelay_mqtt::control::IrMode;
 use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
 use bairelay_rtsp::buffer::LastFrameBuffer;
 
@@ -492,6 +494,103 @@ pub async fn publish_pir_state(
 		}
 		Err(_) => {
 			tracing::debug!(camera = %camera_name, "PIR state query timed out");
+		}
+	}
+}
+
+// ── LED / IR Initial Publish ─────────────────────────────────────────
+
+/// Camera IR `state` → MQTT mode. Unknown values map to `None` so a
+/// firmware with a new spelling publishes nothing rather than a lie.
+pub(crate) fn ir_mode_from_camera(state: &str) -> Option<IrMode> {
+	match state.to_ascii_lowercase().as_str() {
+		"open" => Some(IrMode::On),
+		"close" => Some(IrMode::Off),
+		"auto" => Some(IrMode::Auto),
+		_ => None,
+	}
+}
+
+/// Camera status-LED `lightState` → on/off; unknown values → `None`.
+pub(crate) fn led_on_from_camera(light_state: &str) -> Option<bool> {
+	match light_state.to_ascii_lowercase().as_str() {
+		"open" => Some(true),
+		"close" => Some(false),
+		_ => None,
+	}
+}
+
+/// Publish (retained) + cache the IR mode and LED state one
+/// `<LedState>` reply carries; unrecognised fields are skipped.
+async fn publish_led_reply(
+	camera_name: &str,
+	publisher: &StatusPublisher<'_>,
+	status_cache: &StatusCache,
+	led: &LedState,
+) {
+	tracing::debug!(camera = %camera_name, ir = %led.state, led = %led.light_state, "LED state");
+	if let Some(mode) = ir_mode_from_camera(&led.state) {
+		let _ = publisher.publish_ir(mode).await;
+		status_cache.set_ir(mode);
+	}
+	if let Some(on) = led_on_from_camera(&led.light_state) {
+		let _ = publisher.publish_led(on).await;
+		status_cache.set_led(on);
+	}
+}
+
+/// The IR / LED value a `control/ir` or `control/led` just wrote.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LedWrite {
+	Ir(IrMode),
+	Led(bool),
+}
+
+/// After a successful IR / LED write, publish what the camera now
+/// reports rather than what was requested: the camera may ignore a
+/// write and still answer OK. If the re-read fails, fall back to the
+/// requested value. Callers hold the camera's LED write lock.
+pub(crate) async fn publish_after_led_write(
+	camera_name: &str,
+	bc_camera: &dyn CameraDriver,
+	publisher: &StatusPublisher<'_>,
+	status_cache: &StatusCache,
+	written: LedWrite,
+) {
+	match tokio::time::timeout(Duration::from_secs(10), bc_camera.get_ledstate()).await {
+		Ok(Ok(led)) => publish_led_reply(camera_name, publisher, status_cache, &led).await,
+		_ => match written {
+			LedWrite::Ir(mode) => {
+				let _ = publisher.publish_ir(mode).await;
+				status_cache.set_ir(mode);
+			}
+			LedWrite::Led(on) => {
+				let _ = publisher.publish_led(on).await;
+				status_cache.set_led(on);
+			}
+		},
+	}
+}
+
+/// Query and publish IR mode + status LED once on connect — one
+/// `get_ledstate()` reply carries both. After that they change only via
+/// `control/ir` / `control/led` (handled in mqtt_dispatch). Cameras
+/// without the LED ability fail the query and publish nothing.
+pub async fn publish_led_state(
+	camera_name: String,
+	bc_camera: Arc<dyn CameraDriver>,
+	mqtt: SharedMqttClient,
+	topic_prefix: String,
+	status_cache: Arc<StatusCache>,
+) {
+	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
+	match tokio::time::timeout(Duration::from_secs(10), bc_camera.get_ledstate()).await {
+		Ok(Ok(led)) => publish_led_reply(&camera_name, &publisher, &status_cache, &led).await,
+		Ok(Err(e)) => {
+			tracing::debug!(camera = %camera_name, error = %e, "LED state query failed");
+		}
+		Err(_) => {
+			tracing::debug!(camera = %camera_name, "LED state query timed out");
 		}
 	}
 }
@@ -1904,6 +2003,109 @@ mod tests {
 			.published()
 			.iter()
 			.any(|(t, _, _)| t == "bairelay/cam-ft/status/floodlight_tasks"));
+	}
+
+	fn led_state(ir: &str, light: &str) -> bairelay_neolink_core::bc::xml::LedState {
+		bairelay_neolink_core::bc::xml::LedState {
+			state: ir.into(),
+			light_state: light.into(),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn camera_led_values_map_to_mqtt_payloads() {
+		assert_eq!(ir_mode_from_camera("open"), Some(IrMode::On));
+		assert_eq!(ir_mode_from_camera("close"), Some(IrMode::Off));
+		assert_eq!(ir_mode_from_camera("Auto"), Some(IrMode::Auto));
+		assert_eq!(ir_mode_from_camera("dusk"), None);
+		assert_eq!(ir_mode_from_camera(""), None);
+		assert_eq!(led_on_from_camera("open"), Some(true));
+		assert_eq!(led_on_from_camera("CLOSE"), Some(false));
+		assert_eq!(led_on_from_camera("blink"), None);
+	}
+
+	/// One `get_ledstate()` reply publishes both IR mode and LED state
+	/// (retained) and records them for broker-reconnect replay.
+	#[tokio::test]
+	async fn publish_led_state_publishes_ir_and_led() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| Ok(led_state("open", "close")))
+			.build();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cache = empty_cache();
+		publish_led_state(
+			"cam1".into(),
+			fake,
+			mqtt,
+			"bairelay".into(),
+			Arc::clone(&cache),
+		)
+		.await;
+		let rows = mock.published();
+		let has = |t: &str, p: &[u8]| rows.iter().any(|(rt, rp, r)| rt == t && rp == p && *r);
+		assert!(has("bairelay/cam1/status/ir", b"on"), "observed: {rows:?}");
+		assert!(
+			has("bairelay/cam1/status/led", b"off"),
+			"observed: {rows:?}"
+		);
+		assert_eq!(cache.ir(), Some(IrMode::On));
+		assert_eq!(cache.led(), Some(false));
+	}
+
+	/// Unrecognised camera values publish nothing for that field — the
+	/// other field still lands.
+	#[tokio::test]
+	async fn publish_led_state_skips_unknown_values() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| Ok(led_state("dusk", "open")))
+			.build();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cache = empty_cache();
+		publish_led_state(
+			"cam1".into(),
+			fake,
+			mqtt,
+			"bairelay".into(),
+			Arc::clone(&cache),
+		)
+		.await;
+		let topics = mock.published_topics();
+		assert!(!topics.iter().any(|t| t == "bairelay/cam1/status/ir"));
+		assert!(topics.iter().any(|t| t == "bairelay/cam1/status/led"));
+		assert_eq!(cache.ir(), None);
+	}
+
+	/// Driver error (e.g. camera lacks the LED ability) publishes nothing.
+	#[tokio::test]
+	async fn publish_led_state_handles_driver_error() {
+		let fake = FakeCameraBuilder::new()
+			.with_ledstate(|| {
+				Err(bairelay_neolink_core::bc_protocol::Error::Other(
+					"led refused",
+				))
+			})
+			.build();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		publish_led_state("cam1".into(), fake, mqtt, "bairelay".into(), empty_cache()).await;
+		assert!(mock.published().is_empty());
+	}
+
+	/// Timeout branch — driver hangs past 10 s; nothing published.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn publish_led_state_timeout_branch() {
+		let fake = FakeCameraBuilder::new().with_ledstate_pending().build();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let task = tokio::spawn(publish_led_state(
+			"cam1".into(),
+			fake,
+			mqtt,
+			"bairelay".into(),
+			empty_cache(),
+		));
+		tokio::time::advance(Duration::from_secs(11)).await;
+		let _ = task.await;
+		assert!(mock.published().is_empty());
 	}
 
 	/// `publish_pir_state` timeout branch — driver hangs past 10 s.
