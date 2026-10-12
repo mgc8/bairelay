@@ -443,9 +443,11 @@ The implementation drops the socket the instant `accept()` returns. There's no T
    When motion ends -> MotionStatus::Stop -> publishes status/motion=off.
 
 9. After motion_wake_hold_secs, the push_listener's wake-lock guard
-   drops + a fallback status/motion=off is published. This catches the
-   case where step 7 fails (e.g. the camera went back to sleep before
-   bairelay reconnected) so HA never gets stuck on motion=on.
+   drops + a fallback status/motion=off is published — unless a later
+   push from the same camera arrived meanwhile, in which case that
+   push's timer clears. This catches the case where step 7 fails (e.g.
+   the camera went back to sleep before bairelay reconnected) so HA
+   never gets stuck on motion=on.
 
 10. With no other wake-lock holders, the camera goes idle, the
     watchdog disconnects it, the camera resumes its sleep-mode
