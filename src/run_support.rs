@@ -5,7 +5,7 @@
 //! `main()` itself is still uncoverable (it's the binary entrypoint
 //! wired to `#[tokio::main]`), but the **data-shape** decisions —
 //! picking the one-shot output mode, loading + validating config,
-//! formatting success / failure payloads, and the Ctrl+C shutdown
+//! formatting success / failure payloads, and the shutdown-signal
 //! fanout — now live here behind straightforward function signatures.
 
 use std::path::Path;
@@ -77,21 +77,24 @@ pub async fn sleep_or_cancel(delay: Duration, cancel: &CancellationToken) -> boo
 	}
 }
 
-/// The post-Ctrl+C body: log + cancel the token. Extracted so tests
+/// The post-signal body: log + cancel the token. Extracted so tests
 /// can exercise the cancel side effect without driving a real signal.
-pub fn on_ctrl_c_received(token: &CancellationToken) {
-	tracing::info!("Received Ctrl+C, aborting one-shot");
+pub fn on_shutdown_signal(token: &CancellationToken, signal: &str) {
+	tracing::info!(signal, "Shutdown requested, aborting one-shot");
 	token.cancel();
 }
 
-/// Spawn a Ctrl+C listener that fires `token.cancel()` on the first
-/// signal. Returns the `JoinHandle` so tests can await completion
-/// after driving a synthetic signal. Used by the one-shot path.
-pub fn spawn_ctrl_c_cancel(token: CancellationToken) -> tokio::task::JoinHandle<()> {
+/// Install the shutdown-signal listener (Ctrl+C; plus SIGTERM on Unix)
+/// and spawn a task that fires `token.cancel()` on the first signal.
+/// Handlers are registered before this returns. Returns the
+/// `JoinHandle` so tests can await completion. Used by the one-shot
+/// path.
+pub fn spawn_shutdown_cancel(token: CancellationToken) -> tokio::task::JoinHandle<()> {
+	let requested = crate::shutdown_signal::requested();
 	tokio::spawn(async move {
-		if tokio::signal::ctrl_c().await.is_ok() {
-			on_ctrl_c_received(&token);
-		}
+		let signal = requested.await;
+		on_shutdown_signal(&token, signal);
+		crate::shutdown_signal::force_exit_on_next(crate::oneshot::classify::EXIT_INTERRUPTED);
 	})
 }
 
@@ -328,10 +331,10 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 		let camera_name = cli.camera_name().expect("oneshot without camera name");
 		let cam_cfg = find_camera_config(&config, camera_name)?;
 
-		// Install Ctrl+C → CancellationToken. Process exits via
-		// std::process::exit after run_oneshot returns.
+		// Install Ctrl+C / SIGTERM → CancellationToken. Process exits
+		// via std::process::exit after run_oneshot returns.
 		let cancel = CancellationToken::new();
-		spawn_ctrl_c_cancel(cancel.clone());
+		spawn_shutdown_cancel(cancel.clone());
 
 		// `--use-stream-raw` needs the concrete `BcCamera`. Everything
 		// else routes through the `CameraDriver` trait seam so the
@@ -576,10 +579,10 @@ cameras = []
 	}
 
 	#[test]
-	fn on_ctrl_c_received_cancels_token() {
+	fn on_shutdown_signal_cancels_token() {
 		let tok = CancellationToken::new();
 		assert!(!tok.is_cancelled());
-		on_ctrl_c_received(&tok);
+		on_shutdown_signal(&tok, "SIGTERM");
 		assert!(tok.is_cancelled());
 	}
 
@@ -942,11 +945,11 @@ cameras = []
 	}
 
 	#[tokio::test]
-	async fn spawn_ctrl_c_cancel_returns_handle() {
-		// We can't reliably drive Ctrl+C in a unit test — just spawn the
-		// handle + cancel it via the token to exercise drop.
+	async fn spawn_shutdown_cancel_returns_handle() {
+		// The signal path itself is covered by shutdown_signal's SIGTERM
+		// test; here just spawn the handle and abort it to exercise drop.
 		let tok = CancellationToken::new();
-		let handle = spawn_ctrl_c_cancel(tok.clone());
+		let handle = spawn_shutdown_cancel(tok.clone());
 		// Cancel externally — the handle's task waits on tokio::signal
 		// so abort it to complete the test cleanly.
 		handle.abort();

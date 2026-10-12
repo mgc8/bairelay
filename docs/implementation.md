@@ -165,9 +165,11 @@ MQTT supports only one Last Will per connection. The bridge sets a global LWT on
 
 ### Shutdown ordering
 
-The MQTT event loop is the **last subsystem to shut down**. The Ctrl+C handler cancels the global token (cameras, RTSP, watchdog, startup-wake); each per-camera teardown publishes its final `connection_state = false`; only after `orchestrator.run().await` returns does `main()` cancel a separate `mqtt_cancel: CancellationToken` and await the event-loop task with a 2 s timeout against a wedged broker.
+The MQTT event loop is the **last subsystem to shut down**. The shutdown-signal handler (`src/shutdown_signal/`: Ctrl+C everywhere, plus SIGTERM on Unix — what systemd, Docker and the HA app's s6 send) cancels the global token (cameras, RTSP, watchdog, startup-wake); each per-camera teardown publishes its final `connection_state = false`; only after `orchestrator.run().await` returns does `main()` cancel a separate `mqtt_cancel: CancellationToken` and await the event-loop task with a 2 s timeout against a wedged broker.
 
 Without the separate token, per-camera teardown races the event-loop exit and hits `Failed to send mqtt requests to eventloop`.
+
+**Shutdown budget.** With cameras connected a clean exit takes well under 1 s. Every session task and camera-lifetime poller must exit as soon as its cancel token fires — including a camera request already in flight (`camera_tasks::cancellable`) and the grace-period timer (`camera::grace_period_watch`). A task that ignores cancel costs a full drain window (2 s per session teardown, 2 s for the preview poller) on every shutdown and every battery-camera sleep. SIGTERM handlers are registered synchronously at startup (`shutdown_signal::requested`), so there's no window where the default kill action still applies. Tokio never uninstalls its handlers, so after the first signal `shutdown_signal::force_exit_on_next` arms a second listener: a second Ctrl+C / SIGTERM during a wedged teardown exits immediately with 130 instead of being swallowed.
 
 ---
 

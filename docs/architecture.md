@@ -266,7 +266,7 @@ The CLI's coarse exit-code table for one-shot commands (see `src/oneshot/classif
 | 4    | connection / auth (login refused, transport dead, DNS)    |
 | 5    | protocol (malformed reply, XML parse, time-sync issue)    |
 | 6    | unsupported (`MissingAbility` — camera lacks the feature) |
-| 130  | Ctrl+C                                                    |
+| 130  | interrupted (Ctrl+C; SIGTERM on Unix)                     |
 
 Scripts can branch on the exit code without parsing stdout.
 

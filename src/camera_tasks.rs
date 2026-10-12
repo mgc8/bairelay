@@ -242,10 +242,11 @@ pub async fn battery_poller(
 		tokio::select! {
 			_ = cancel.cancelled() => break,
 			_ = ticker.tick() => {
-				let tick = tokio::time::timeout(
-					Duration::from_secs(10),
-					bc_camera.battery_info(),
-				).await;
+				let Some(tick) =
+					cancellable(&cancel, Duration::from_secs(10), bc_camera.battery_info()).await
+				else {
+					break;
+				};
 
 				let outcome = classify_battery_tick(&tick);
 				let (next, streak_tripped) = advance_battery_counter(
@@ -342,7 +343,12 @@ pub async fn preview_poller(
 				// users can tell live from stale.
 				if camera.state().is_connected() {
 					if let Some(bc) = camera.bc_camera() {
-						match tokio::time::timeout(SNAPSHOT_TIMEOUT, bc.get_snapshot()).await {
+						let Some(snapshot) =
+							cancellable(&cancel, SNAPSHOT_TIMEOUT, bc.get_snapshot()).await
+						else {
+							break;
+						};
+						match snapshot {
 							Ok(Ok(bytes)) => {
 								last_frame.set_jpeg(bytes::Bytes::from(bytes));
 							}
@@ -414,7 +420,11 @@ pub async fn floodlight_poller(
 		tokio::select! {
 			_ = cancel.cancelled() => break,
 			_ = ticker.tick() => {
-				match tokio::time::timeout(Duration::from_secs(10), bc_camera.is_floodlight_tasks_enabled()).await {
+				let request = bc_camera.is_floodlight_tasks_enabled();
+				let Some(result) = cancellable(&cancel, Duration::from_secs(10), request).await else {
+					break;
+				};
+				match result {
 					Ok(Ok(enabled)) => {
 						tracing::debug!(camera = %camera_name, enabled, "Floodlight tasks");
 						let _ = publisher.publish_floodlight_tasks_enabled(enabled).await;
@@ -497,6 +507,24 @@ pub async fn publish_pir_state(
 		Err(_) => {
 			tracing::debug!(camera = %camera_name, "PIR state query timed out");
 		}
+	}
+}
+
+// ── Cancellable camera requests ──────────────────────────────────────
+
+/// Await a camera request bounded by `limit`, abandoning it the moment
+/// `cancel` fires: `None` when cancelled, else the timeout result. A
+/// poll in flight at shutdown or session end must not hold teardown
+/// for its whole timeout — the camera may already be logged out.
+async fn cancellable<F: std::future::Future>(
+	cancel: &CancellationToken,
+	limit: Duration,
+	request: F,
+) -> Option<Result<F::Output, tokio::time::error::Elapsed>> {
+	tokio::select! {
+		biased;
+		_ = cancel.cancelled() => None,
+		result = tokio::time::timeout(limit, request) => Some(result),
 	}
 }
 
@@ -2043,6 +2071,89 @@ mod tests {
 		assert_eq!(led_on_from_camera("open"), Some(true));
 		assert_eq!(led_on_from_camera("CLOSE"), Some(false));
 		assert_eq!(led_on_from_camera("blink"), None);
+	}
+
+	/// A snapshot in flight when cancel fires is abandoned, not awaited
+	/// for its 10 s timeout. Real time: a paused clock would hide the
+	/// stall by auto-advancing through the timeout.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn preview_poller_abandons_in_flight_snapshot_on_cancel() {
+		use crate::camera::CameraHandle;
+		use crate::config::test_helpers::minimal_camera_config;
+		let cancel = CancellationToken::new();
+		let handle = Arc::new(CameraHandle::new(
+			minimal_camera_config("cam-pv"),
+			cancel.clone(),
+			None,
+		));
+		handle.set_driver_for_test(FakeCameraBuilder::new().with_snapshot_pending().build());
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		let poller = tokio::spawn(preview_poller(
+			"cam-pv".to_string(),
+			Arc::clone(&handle),
+			Arc::new(LastFrameBuffer::new()),
+			mqtt,
+			"bairelay".to_string(),
+			10,
+			handle.preview_state_rx(),
+			true,
+			cancel.clone(),
+		));
+		tokio::time::sleep(Duration::from_millis(100)).await; // snapshot now pending
+		cancel.cancel();
+		tokio::time::timeout(Duration::from_millis(500), poller)
+			.await
+			.expect("poller must exit promptly on cancel")
+			.unwrap();
+	}
+
+	/// Same for a floodlight-tasks request in flight when cancel fires.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn floodlight_poller_abandons_in_flight_request_on_cancel() {
+		let fake = FakeCameraBuilder::new()
+			.with_is_floodlight_tasks_enabled_pending()
+			.build();
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let poller = tokio::spawn(floodlight_poller(
+			"cam-fl".to_string(),
+			fake,
+			mqtt,
+			"bairelay".to_string(),
+			10,
+			cancel.clone(),
+			empty_cache(),
+		));
+		tokio::time::sleep(Duration::from_millis(100)).await; // request now pending
+		cancel.cancel();
+		tokio::time::timeout(Duration::from_millis(500), poller)
+			.await
+			.expect("poller must exit promptly on cancel")
+			.unwrap();
+	}
+
+	/// Same for a battery request in flight when cancel fires.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn battery_poller_abandons_in_flight_request_on_cancel() {
+		let fake = FakeCameraBuilder::new().with_battery_info_pending().build();
+		let (mqtt, _mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let poller = tokio::spawn(battery_poller(
+			"cam-bat".to_string(),
+			fake,
+			mqtt,
+			"bairelay".to_string(),
+			10,
+			cancel.clone(),
+			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
+		));
+		tokio::time::sleep(Duration::from_millis(100)).await; // request now pending
+		cancel.cancel();
+		tokio::time::timeout(Duration::from_millis(500), poller)
+			.await
+			.expect("poller must exit promptly on cancel")
+			.unwrap();
 	}
 
 	fn caps(status_led: bool, ir_leds: bool) -> CameraCapabilities {

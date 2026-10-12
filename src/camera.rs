@@ -1169,13 +1169,11 @@ impl CameraHandle {
 			let grace =
 				crate::config::resolve_idle_disconnect_timeout(&self.config, self.prune_grace);
 			let gp = GracePeriod::new(self.wake_lock.clone(), grace);
-			let sc = session_cancel.clone();
-			let cam_name = self.config.name.clone();
-			tasks.spawn(async move {
-				gp.run().await;
-				tracing::info!(camera = %cam_name, "Grace period expired, disconnecting");
-				sc.cancel();
-			});
+			tasks.spawn(grace_period_watch(
+				gp,
+				session_cancel.clone(),
+				self.config.name.clone(),
+			));
 		}
 
 		tasks
@@ -1381,6 +1379,21 @@ impl CameraHandle {
 		if let Some(task) = preview_task {
 			let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
 		}
+	}
+}
+
+/// Session-scoped grace-period watcher: cancels the session once the
+/// wake lock has been idle for the grace period. Exits as soon as the
+/// session ends for any other reason (shutdown, connection loss) —
+/// otherwise teardown would wait out its full drain window on a timer
+/// that has nothing left to count down.
+async fn grace_period_watch(gp: GracePeriod, session_cancel: CancellationToken, camera: String) {
+	tokio::select! {
+		_ = gp.run() => {
+			tracing::info!(camera = %camera, "Grace period expired, disconnecting");
+			session_cancel.cancel();
+		}
+		_ = session_cancel.cancelled() => {}
 	}
 }
 
@@ -1610,6 +1623,23 @@ impl CameraHandle {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The grace-period watcher exits when the session ends for another
+	/// reason — it must not hold teardown's drain window while the wake
+	/// lock is still held and its countdown never started.
+	#[tokio::test]
+	async fn grace_period_watch_exits_on_session_cancel() {
+		let lock = WakeLockCounter::new();
+		let _held = lock.acquire();
+		let gp = GracePeriod::new(lock.clone(), Duration::from_secs(45));
+		let session_cancel = CancellationToken::new();
+		let watch = tokio::spawn(grace_period_watch(gp, session_cancel.clone(), "cam".into()));
+		session_cancel.cancel();
+		tokio::time::timeout(Duration::from_millis(500), watch)
+			.await
+			.expect("watcher must exit on session cancel")
+			.unwrap();
+	}
 
 	#[test]
 	fn new_camera_handle_has_audio_presence_unknown() {

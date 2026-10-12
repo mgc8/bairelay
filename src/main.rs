@@ -5,7 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::info;
 
 use bairelay::bcmedia_dump::BcMediaDumpConfig;
 use bairelay::camera::CameraHandle;
@@ -129,7 +129,7 @@ async fn async_main() -> Result<()> {
 		"Loaded configuration"
 	);
 
-	// Set up cancellation token (Ctrl+C handler registered after MQTT is ready).
+	// Set up cancellation token (shutdown-signal handler registered after MQTT is ready).
 	let token = CancellationToken::new();
 
 	// Capture the MQTT topic prefix (default "bairelay") — must be read
@@ -226,7 +226,7 @@ async fn async_main() -> Result<()> {
 	// Create orchestrator. After this point the per-camera name list
 	// lives on the orchestrator; the shutdown handler captures a
 	// clone of the cameras map so it can unpublish HA discovery
-	// payloads on Ctrl+C.
+	// payloads on shutdown.
 	let camera_names_list: Vec<String> = camera_names(&config);
 	let orchestrator = Orchestrator::with_bcmedia_dump_and_discovery(
 		config,
@@ -237,14 +237,14 @@ async fn async_main() -> Result<()> {
 	);
 	info!("Managing {} camera(s)", orchestrator.camera_count());
 
-	// Register Ctrl+C handler. Publishes "disconnected" for all cameras,
+	// Register the shutdown-signal handler (Ctrl+C; SIGTERM on Unix). Publishes "disconnected" for all cameras,
 	// unpublishes HA discovery config (retained-empty), flushes, then
 	// cancels the global token. MQTT is cancelled separately by main()
 	// AFTER orchestrator.run() returns, so per-camera teardown paths
 	// can still publish their own final state without racing a dead
 	// event loop.
 	//
-	// Shutdown order on Ctrl+C:
+	// Shutdown order on a shutdown signal:
 	// 1. Publish "disconnected" availability per camera (HA sees the outage).
 	// 2. Unpublish HA discovery config topics (retained empty → HA deletes entities).
 	// 3. 200 ms flush pause so the event loop drains the retained writes.
@@ -260,11 +260,13 @@ async fn async_main() -> Result<()> {
 		let shutdown_mqtt = mqtt_shared.clone();
 		let shutdown_prefix = topic_prefix.clone();
 		let shutdown_cameras = orchestrator.cameras_arc();
+		let shutdown_requested = bairelay::shutdown_signal::requested();
 		tokio::spawn(async move {
-			if let Err(e) = tokio::signal::ctrl_c().await {
-				error!("Failed to listen for Ctrl+C: {}", e);
-			}
-			info!("Received Ctrl+C, shutting down...");
+			let signal = shutdown_requested.await;
+			info!(signal, "Shutdown requested, shutting down...");
+			bairelay::shutdown_signal::force_exit_on_next(
+				bairelay::oneshot::classify::EXIT_INTERRUPTED,
+			);
 
 			// 1. Publish "disconnected" while MQTT is still running.
 			// 2. Unpublish HA discovery so HA clears the Bairelay
@@ -274,7 +276,7 @@ async fn async_main() -> Result<()> {
 			//
 			// Both steps are wrapped in a 2-second hard timeout.
 			// rumqttc's per-AsyncClient Request queue (256 slots) can
-			// saturate if the broker was already flapping when Ctrl+C
+			// saturate if the broker was already flapping when the signal
 			// fired; without this guard, `publish().await` can block
 			// indefinitely waiting for queue space, stalling the
 			// whole shutdown. On timeout we log and fall through to
@@ -359,7 +361,7 @@ async fn async_main() -> Result<()> {
 	// Spawn the startup wake cycle (non-blocking) so each camera's
 	// last-frame buffer is populated before the first RTSP DESCRIBE lands
 	// and its capability cache is probed before HA discovery publishes.
-	// The global cancel token is forwarded so Ctrl+C during the warm
+	// The global cancel token is forwarded so a shutdown during the warm
 	// cycle doesn't stall up to PER_CAMERA_TIMEOUT per camera.
 	{
 		let cameras = orchestrator.cameras_arc();
@@ -584,7 +586,7 @@ async fn async_main() -> Result<()> {
 	// Cameras are drained; gracefully shut down every supervisor-managed
 	// service (RTSP listeners, wake server, push listener, watchdog,
 	// startup-wake). Each service holds the global cancel token; the
-	// supervisor cancels it (idempotent — Ctrl+C already fired it) and
+	// supervisor cancels it (idempotent — the shutdown signal already fired it) and
 	// joins each task with a 2 s budget so a wedged subsystem can't
 	// hold the process open.
 	sup.shutdown(Duration::from_secs(2)).await;

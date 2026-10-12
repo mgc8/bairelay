@@ -318,7 +318,7 @@ Other:
   help            Print help for the given subcommand
 ```
 
-Every camera command takes a camera name (matched against `[[cameras]]` in the config) and exits with a coarse exit code: 0 success, 1 generic, 2 usage, 3 config, 4 connection / auth, 5 protocol, 6 unsupported (`MissingAbility`), 130 Ctrl+C — so shell scripts can branch without parsing stdout.
+Every camera command takes a camera name (matched against `[[cameras]]` in the config) and exits with a coarse exit code: 0 success, 1 generic, 2 usage, 3 config, 4 connection / auth, 5 protocol, 6 unsupported (`MissingAbility`), 130 interrupted (Ctrl+C / SIGTERM) — so shell scripts can branch without parsing stdout.
 
 Add `--json` to any read command for machine-readable output; `-v` / `-vv` / `-vvv` raises `RUST_LOG` (info → debug → trace). `-c` / `--config` is global and accepted before or after the subcommand (`bairelay -c cfg.toml <cmd>` and `bairelay <cmd> -c cfg.toml` are equivalent).
 

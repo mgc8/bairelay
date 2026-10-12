@@ -24,7 +24,7 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Connect, run `op`, log out. Honours Ctrl+C via `cancel`; on cancel
+/// Connect, run `op`, log out. Honours Ctrl+C / SIGTERM via `cancel`; on cancel
 /// we skip logout, short-circuit with `InterruptedError`, and rely on
 /// the camera to park itself via its own idle timeout once our TCP
 /// session drops.
@@ -36,7 +36,7 @@ where
 	let max_enc = max_encryption(cfg);
 
 	tokio::select! {
-		// Ctrl+C wins the race — skip logout; dropping the TCP session
+		// A shutdown signal wins the race — skip logout; dropping the TCP session
 		// is enough for the camera to park via its own idle timeout.
 		// `biased` would force this arm first, but tokio::select!'s
 		// random polling already resolves a pre-cancelled token in

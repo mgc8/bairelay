@@ -114,7 +114,7 @@ Captures real-camera `BcMedia` streams into files the test harness can replay la
 
 Pass `--dump-bcmedia <dir>` on the `rtsp` or `mqtt-rtsp` subcommand. Every `BcMedia` packet pulled by the reader task gets mirrored to `<dir>/<camera>-<stream>.bcmedia`. With the flag absent, the hot path is a single `Option::is_some()` branch and no files are touched.
 
-There is **no per-capture duration flag.** Capture runs as long as the process; stop with Ctrl+C.
+There is **no per-capture duration flag.** Capture runs as long as the process; stop with Ctrl+C (or SIGTERM).
 
 ```
 RUST_LOG=bairelay=info cargo run -- mqtt-rtsp \
@@ -126,7 +126,7 @@ Step by step:
 
 1. Bairelay starts, connects every camera, runs the startup-wake cycle. Startup wake subscribes to Main just long enough to warm the last-frame buffer, so the first `<cam>-main.bcmedia` gets bytes immediately.
 2. Whenever any `StreamSource` is active (startup wake, MQTT wakeup, RTSP client), packets append to the matching capture file. A sidecar `.meta.json` lands next to the first write.
-3. Ctrl+C triggers the graceful shutdown path; the capture buffer flushes before the camera's stop-video handshake. No packets lost on a clean exit.
+3. Ctrl+C / SIGTERM triggers the graceful shutdown path; the capture buffer flushes before the camera's stop-video handshake. No packets lost on a clean exit.
 
 ### Capturing specific streams
 
