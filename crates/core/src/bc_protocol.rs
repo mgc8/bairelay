@@ -1,4 +1,5 @@
 use crate::bc;
+use crate::redact::UidTail;
 use futures::stream::StreamExt;
 use log::*;
 use serde::{Deserialize, Serialize};
@@ -320,6 +321,9 @@ impl BcCamera {
 			let flags = resolution::discovery_flags_for(options.discovery);
 			let (allow_local, allow_remote, allow_map, allow_relay) =
 				(flags.local, flags.remote, flags.map, flags.relay);
+			// Full UID at debug; the info-level success lines below show
+			// only its tail (info logs end up in bug reports).
+			debug!("{}: UDP discovery for UID {}", options.name, uid);
 
 			let res = tokio::select! {
 				Ok(v) = async {
@@ -331,7 +335,7 @@ impl BcCamera {
 							info!(
 								"{}: Local discovery success {} at {}",
 								options.name,
-								uid_local,
+								UidTail(&uid_local),
 								disc.get_addr()
 							);
 							Ok(CameraLocation::Udp(disc))
@@ -411,7 +415,7 @@ impl BcCamera {
 									info!(
 										"{}: Remote discovery success {} at {}",
 										options.name,
-										uid_remote,
+										UidTail(&uid_remote),
 										disc.get_addr()
 									);
 									Ok(CameraLocation::Udp(disc))
@@ -429,7 +433,7 @@ impl BcCamera {
 									info!(
 										"{}: Map success {} at {}",
 										options.name,
-										uid_map,
+										UidTail(&uid_map),
 										disc.get_addr()
 									);
 									Ok(CameraLocation::Udp(disc))
@@ -447,7 +451,7 @@ impl BcCamera {
 									info!(
 										"{}: Relay success {} at {}",
 										options.name,
-										uid_relay,
+										UidTail(&uid_relay),
 										disc.get_addr()
 									);
 									Ok(CameraLocation::Udp(disc))

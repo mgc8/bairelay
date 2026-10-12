@@ -6,6 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bairelay_neolink_core::bcudp::xml::{EmptyTag, IpPort, M2cQr, M2dQr, UdpXml};
+use bairelay_neolink_core::redact::UidTail;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -106,8 +107,9 @@ async fn handle(
 			let token = rand::random::<u64>();
 			let ac = rand::random::<u32>();
 			if !anchors.issue(&q.uid, token, ac, std::time::Instant::now()) {
+				// Full UID is in the D2M_Q debug line above.
 				warn!(
-					%src, uid = %q.uid,
+					%src, uid = %UidTail(&q.uid),
 					cap = crate::registry::MAX_MAP_ENTRIES,
 					"session-anchor map at capacity; rejecting D2M_Q"
 				);

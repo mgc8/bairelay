@@ -75,6 +75,8 @@ pub mod bcmedia;
 pub mod bcudp;
 /// Cloud bundle minting for account ("cloud") cameras (apis.reolink.com).
 pub mod cloud;
+/// Log-safe renderings of identifiers (camera UIDs) for info-level logs.
+pub mod redact;
 
 /// This is the top level error structure of the library
 ///

@@ -318,6 +318,8 @@ Reconnect on transient network failures still uses `ReconnectBackoff::sleep_with
 
 Default filter: `info` for bairelay, `warn` for `rumqttc`. Override with `RUST_LOG=bairelay=debug`. `rumqttc`'s debug output is extremely noisy (multiline ping messages every 30 s) — suppress it unless specifically debugging MQTT protocol issues.
 
+Camera UIDs in info / warn lines go through `bairelay_neolink_core::redact::UidTail` — `*` padding plus the last 6 characters, length preserved so short-form and firmware-suffixed long-form UIDs stay distinguishable. The full UID is logged at debug alongside. Info logs get pasted into bug reports; debug is the diagnostic level. Any new info / warn UID log uses the same wrapper.
+
 All MQTT publishes log their values at debug level. All control commands log dispatch and OK / FAIL result.
 
 `-v` / `-vv` / `-vvv` on the CLI maps to `info` / `debug` / `trace` via `run_support::cli_output_mode`.

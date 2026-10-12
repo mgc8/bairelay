@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bairelay_neolink_core::bcudp::xml::{
 	D2rHb, D2rR, HbTimer, IpPort, R2cCr, R2cT, R2dC, R2dDcr, R2dHbr, R2dRr, UdpXml,
 };
+use bairelay_neolink_core::redact::UidTail;
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -340,12 +341,18 @@ async fn handle_heartbeat(
 	// Tokio's `Instant::now()` honours `tokio::time::pause` / `advance`,
 	// which lets unit tests drive stale-eviction without sleeping.
 	let now = tokio::time::Instant::now().into_std();
+	// Info / warn lines show only the UID tail (they end up in bug
+	// reports); the full UID is logged at debug.
 	match registry.upsert(&hb.uid, src, hb.token, now) {
-		Some(true) => info!(%src, uid = %hb.uid, "wake-server registered camera"),
+		Some(true) => {
+			info!(%src, uid = %UidTail(&hb.uid), "wake-server registered camera");
+			debug!(%src, uid = %hb.uid, "wake-server registered camera (full UID)");
+		}
 		Some(false) => {} // refresh, no log
 		None => {
+			debug!(%src, uid = %hb.uid, "registry full; rejected UID");
 			warn!(
-				%src, uid = %hb.uid,
+				%src, uid = %UidTail(&hb.uid),
 				cap = crate::registry::MAX_MAP_ENTRIES,
 				"camera registry at capacity; rejecting D2R_HB"
 			);
@@ -356,7 +363,8 @@ async fn handle_heartbeat(
 	// wake server cares about emits one every ~20 s, so a stale peer is
 	// detected within one heartbeat cycle of its TTL. No background task.
 	for evicted in registry.purge_stale(now, stale_after) {
-		info!(uid = %evicted, "wake-server deregistered stale camera");
+		info!(uid = %UidTail(&evicted), "wake-server deregistered stale camera");
+		debug!(uid = %evicted, "wake-server deregistered stale camera (full UID)");
 	}
 	// Same hot-path purge for session anchors so a flood of D2M_Q with
 	// random UIDs cannot grow the anchor map past stale_after.
