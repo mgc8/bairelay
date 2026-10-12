@@ -19,8 +19,10 @@ compiles this crate.
 | `bcxml_try_parse` | `neolink_core::fuzz_api::parse_bc_xml` (wraps `BcXml::try_parse`) | Largest serde struct surface in the project. |
 | `aac_parse_adts` | `bairelay_rtsp::codec::aac::parse_adts` | ADTS audio frame header; RTP timestamp slope depends on it. |
 | `nal_split_decode` | `bairelay_rtsp::codec::nal::{split_annex_b, is_decodable_nal}` | Per-NAL hot path. |
+| `udp_flow_state` | `neolink_core::fuzz_api::flow_state_drive_arbitrary` (drives `UdpFlowState`) | BcUdp reorder / ack state machine; bounded-state invariants. |
+| `adpcm_decode_block` | `bairelay_rtsp::transcode::adpcm::AdpcmDecoder::decode_block` | Camera ADPCM audio blocks. |
 
-The two `neolink_core` targets reach `pub(crate)` parsers via the
+The `neolink_core` targets reach `pub(crate)` parsers via the
 `fuzz_api` module that the `fuzz-api` Cargo feature exposes. Production
 builds never compile that module.
 

@@ -17,8 +17,8 @@ bytes = "1"
 # `fuzz_api` shim around `Bc::deserialize` and `BcXml::try_parse`
 # becomes reachable from this out-of-tree crate.
 bairelay-neolink-core = { path = "../crates/core", features = ["fuzz-api"] }
-bairelay_rtsp = { path = "../crates/rtsp" }
-bairelay_wake_server = { path = "../crates/wake-server" }
+bairelay-rtsp = { path = "../crates/rtsp" }
+bairelay-wake-server = { path = "../crates/wake-server" }
 
 # Detach from the parent workspace. Without this, cargo would try to
 # pull this crate into the bairelay workspace and `cargo +nightly fuzz
