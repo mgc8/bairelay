@@ -1053,27 +1053,38 @@ mod tests {
 		);
 	}
 
+	// Both tests take their port from the OS rather than a fixed number:
+	// parallel tests call `connect_try_port`, which binds random ports in
+	// 53500..54000, so any fixed port in that range can be taken first.
+
 	#[tokio::test]
 	async fn connect_try_port_prefers_given_port_if_free() {
-		let sock = tokio::time::timeout(T, connect_try_port(53999))
+		let port = UdpSocket::bind("0.0.0.0:0")
+			.await
+			.unwrap()
+			.local_addr()
+			.unwrap()
+			.port();
+		let sock = tokio::time::timeout(T, connect_try_port(port))
 			.await
 			.unwrap()
 			.unwrap();
-		let addr = sock.local_addr().unwrap();
-		// Should get 53999 first since no-one holds it.
-		assert_eq!(addr.port(), 53999);
+		// The just-released port is free, so it's tried (and won) first.
+		assert_eq!(sock.local_addr().unwrap().port(), port);
 	}
 
 	#[tokio::test]
 	async fn connect_try_port_falls_back_if_port_taken() {
-		// Hold 53998 so connect_try_port must fall back to the shuffle.
-		let hold = UdpSocket::bind("0.0.0.0:53998").await.unwrap();
-		let sock = tokio::time::timeout(T, connect_try_port(53998))
+		// Hold an OS-assigned port so connect_try_port must fall back to
+		// the shuffled 53500..54000 range.
+		let hold = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+		let held = hold.local_addr().unwrap().port();
+		let sock = tokio::time::timeout(T, connect_try_port(held))
 			.await
 			.unwrap()
 			.unwrap();
 		let addr = sock.local_addr().unwrap();
-		assert_ne!(addr.port(), 53998);
+		assert_ne!(addr.port(), held);
 		assert!((53500..54000).contains(&addr.port()));
 		drop(hold);
 	}
