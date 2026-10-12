@@ -22,3 +22,10 @@ query-filters:
   # so any real unused binding would fail the build before merge.
   - exclude:
       id: rust/unused-variable
+
+# Integration-test trees: assert / panic messages over fixture data trip
+# rust/cleartext-logging. In-file `#[cfg(test)]` modules can't be
+# path-filtered; those alerts are dismissed as "used in tests".
+paths-ignore:
+  - tests/**
+  - crates/*/tests/**
