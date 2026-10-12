@@ -26,7 +26,7 @@ cargo tarpaulin
 
 Current baseline is **~88 %**. See `docs/implementation.md` § Coverage policy for per-file targets and documented gaps.
 
-A separate `cargo-fuzz` harness lives in `fuzz/`, excluded from the workspace so `cargo test` never compiles it (libfuzzer-sys is nightly-only). Seven targets cover the parsers + state machines facing untrusted bytes — the wake-server UDP entry point, BcUdp / Bc / BcXml deserialization, ADTS audio headers, the NAL split-and-decode hot path, and the per-packet `UdpFlowState` send/recv decision table. Day-to-day:
+A separate `cargo-fuzz` harness lives in `fuzz/`, excluded from the workspace so `cargo test` never compiles it (libfuzzer-sys is nightly-only). Its targets (listed in `fuzz/README.md`) cover the parsers + state machines facing untrusted bytes — the wake-server UDP entry point, BcUdp / Bc / BcXml deserialization, ADTS audio headers, ADPCM audio blocks, the NAL split-and-decode hot path, and the per-packet `UdpFlowState` send/recv decision table. Day-to-day:
 
 ```
 scripts/fuzz.sh                       # all targets, 10s each
