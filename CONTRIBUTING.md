@@ -116,7 +116,7 @@ Live-verify is the load-bearing one for any change touching the RTSP path, MQTT 
 
 ## Fuzzing
 
-`fuzz/` is a detached cargo project (libfuzzer-sys, nightly-only). Seven targets cover the parsers + state machines facing untrusted bytes. Day-to-day:
+`fuzz/` is a detached cargo project (libfuzzer-sys, nightly-only). Its targets (listed in `fuzz/README.md`) cover the parsers + state machines facing untrusted bytes. Day-to-day:
 
 ```bash
 scripts/fuzz.sh                    # all targets, 10s each
