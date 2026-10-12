@@ -70,11 +70,11 @@ tests/
 
 ## Test infrastructure crates expose
 
-`bairelay_neolink_core`'s test helpers are gated behind the crate's `test-util` Cargo feature; the binary's `[dev-dependencies]` opts in. The other crates' helpers compile unconditionally. See `docs/implementation.md` § Test infrastructure for full API:
+`bairelay_neolink_core`'s exported test helpers are gated behind the crate's `test-util` Cargo feature; the binary's `[dev-dependencies]` opts in. Entries marked crate-internal are `cfg(test)`-only. The other crates' helpers compile unconditionally. See `docs/implementation.md` § Test infrastructure for full API:
 
 - `bairelay_neolink_core::bc_protocol::FakeCameraBuilder` + `FakeCalls`
 - `bairelay_neolink_core::bc_protocol::connection::mock::MockConnection`
-- `bairelay_neolink_core::bc_protocol::connection::discovery::test_support::ScriptedDiscoverer`
+- `bairelay_neolink_core::bc_protocol::connection::discovery::test_support::ScriptedDiscoverer` (crate-internal, test-only)
 - `bairelay_mqtt::test_support::mock_client()` + `MockHandle`
 - `bairelay::stream_source::PacketSource` (binary)
 - `bairelay::oneshot::snapshot::MockVideoStream` (binary, test-only)

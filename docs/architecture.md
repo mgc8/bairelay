@@ -230,7 +230,7 @@ Cleared on service restart; repopulated by the startup-wake cycle. Never persist
 
 ### Placeholder streams during gaps
 
-Per-`StreamSource` `GapState { Live, Bridging }`. A 200 ms ticker compares `last_live_frame_at` against `gap_threshold_secs` (default 1.0). On exceedance, the source flips to `Bridging` and re-broadcasts cached `VideoBurst::iframe_nals` with synthesised PTS so RTSP clients see continuous RTP. Audio packets are dropped on the wire while bridging but per-codec PTS counters advance via the camera's audio cadence so A/V stays aligned on Live resume.
+Per-`StreamSource` `GapState { Live, Bridging }`. A 200 ms ticker compares `last_live_frame_at` against `gap_threshold_secs` (default 3.0). On exceedance, the source flips to `Bridging` and re-broadcasts cached `VideoBurst::iframe_nals` with synthesised PTS so RTSP clients see continuous RTP. Audio packets are dropped on the wire while bridging but per-codec PTS counters advance via the camera's audio cadence so A/V stays aligned on Live resume.
 
 Per-camera `PreviewState { Live, Connecting, Sleeping }` published via `watch::Sender`. The MQTT preview publisher composites a caption (e.g. `SLEEPING`) on stale JPEGs so HA dashboards distinguish live from stale.
 
