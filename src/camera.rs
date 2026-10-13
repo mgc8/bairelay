@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
@@ -230,6 +230,10 @@ pub struct CameraHandle {
 	/// write of one `<LedState>` on the camera, so overlapping commands
 	/// would otherwise undo each other's field.
 	led_write_lock: tokio::sync::Mutex<()>,
+	/// Bumped by the push listener for every push from this camera. A
+	/// push's hold window only clears `motion` if no later push has
+	/// arrived, so back-to-back pushes don't cut each other short.
+	push_seq: AtomicU64,
 	/// Global `Config::stream_prune_grace_secs` propagated by the
 	/// orchestrator at construction. Threaded through to
 	/// [`crate::config::resolve_idle_disconnect_timeout`] so the floor
@@ -308,6 +312,7 @@ impl CameraHandle {
 			status_cache: Arc::new(StatusCache::default()),
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
 			led_write_lock: tokio::sync::Mutex::new(()),
+			push_seq: AtomicU64::new(0),
 			prune_grace: Duration::ZERO,
 		}
 	}
@@ -476,6 +481,11 @@ impl CameraHandle {
 
 	pub fn status_cache(&self) -> Arc<StatusCache> {
 		Arc::clone(&self.status_cache)
+	}
+
+	/// Push counter the push listener bumps; see the `push_seq` field.
+	pub fn push_seq(&self) -> &AtomicU64 {
+		&self.push_seq
 	}
 
 	/// `true` once `battery_poller` has concluded this camera has no

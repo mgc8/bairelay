@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -162,6 +163,7 @@ fn handle_push(
 	);
 
 	let handle = Arc::clone(handle);
+	let seq = handle.push_seq().fetch_add(1, Ordering::SeqCst) + 1;
 	let Some(mqtt_client) = mqtt.cloned() else {
 		// MQTT disabled in config — wake-lock alone still drives the
 		// connect loop, so observability suffers but the wake-on-motion
@@ -174,7 +176,7 @@ fn handle_push(
 	let hold = cfg.motion_wake_hold;
 	let cancel = cancel.clone();
 	tokio::spawn(async move {
-		fire_motion(handle, mqtt_client, prefix, hold, cancel).await;
+		fire_motion(handle, mqtt_client, prefix, hold, seq, cancel).await;
 	});
 }
 
@@ -211,12 +213,14 @@ pub(crate) fn match_camera_by_uid<'a>(
 /// for `hold`, then publish a fallback `status/motion=off` so HA never
 /// gets stuck on `on` if the in-session `motion_listener` never picks
 /// up the live `Stop`. Idempotent w.r.t. the in-session publisher —
-/// duplicate `motion=off` is harmless (HA dedups).
+/// duplicate `motion=off` is harmless (HA dedups). `seq` is this push's
+/// [`CameraHandle::push_seq`]; a later push takes over the clear.
 async fn fire_motion(
 	handle: Arc<CameraHandle>,
 	mqtt: SharedMqttClient,
 	topic_prefix: String,
 	hold: Duration,
+	seq: u64,
 	cancel: CancellationToken,
 ) {
 	let _guard = handle.wake_lock().acquire();
@@ -229,6 +233,11 @@ async fn fire_motion(
 	// Hold for `hold`, bailing on cancel — same primitive used by the
 	// camera reconnect path so the contract lives in one place.
 	crate::run_support::sleep_or_cancel(hold, &cancel).await;
+
+	if handle.push_seq().load(Ordering::SeqCst) != seq {
+		tracing::debug!(camera = %handle.name(), "push motion: a later push owns the fallback clear");
+		return;
+	}
 
 	// Cap the fallback publish so a wedged broker (Ctrl+C race against
 	// detached fire_motion tasks) can't hold the runtime open during
@@ -654,6 +663,83 @@ mod tests {
 		})
 		.await;
 		assert!(saw_off, "expected fallback status/motion=off after hold");
+
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+	}
+
+	#[tokio::test]
+	async fn later_push_owns_the_fallback_clear() {
+		// Push A at t=0 and B at t≈400 ms, hold 600 ms. A's window ends
+		// first but B's is still running, so only B may clear — at
+		// t≈1000 ms, not 600 ms.
+		let registry = bairelay_wake_server::make_registry();
+		registry.upsert(
+			"YARDUID01234",
+			"127.0.0.1:55004".parse().unwrap(),
+			0xFEED_FACE,
+			Instant::now(),
+		);
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		let handle = handle_with_uid("yard", Some("YARDUID0"));
+		cameras.insert("yard".into(), Arc::clone(&handle));
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let cfg = RuntimeConfig {
+			bind_addr: "127.0.0.1".parse().unwrap(),
+			bind_port: port,
+			motion_wake_hold: Duration::from_millis(600),
+			stale_after: Duration::from_secs(80),
+		};
+		let server = tokio::spawn(run_with_listener(
+			listener,
+			cfg,
+			registry,
+			Arc::new(cameras),
+			Some(mqtt),
+			"bairelay".into(),
+			cancel.clone(),
+		));
+
+		let motion_payloads = |mock: &bairelay_mqtt::test_support::MockHandle| -> Vec<Vec<u8>> {
+			mock.published()
+				.into_iter()
+				.filter(|(t, _, _)| t == "bairelay/yard/status/motion")
+				.map(|(_, p, _)| p)
+				.collect()
+		};
+
+		let _a = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(400)).await;
+		let _b = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+
+		// t≈800 ms: past A's window, inside B's, ~200 ms of slack each way.
+		tokio::time::sleep(Duration::from_millis(400)).await;
+		assert_eq!(
+			motion_payloads(&mock),
+			[b"on".to_vec(), b"on".to_vec()],
+			"A's expiry must not clear while B is live"
+		);
+		assert_eq!(handle.status_cache().motion(), Some(true));
+
+		let cleared = tokio::time::timeout(Duration::from_secs(2), async {
+			while motion_payloads(&mock).len() < 3 {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await;
+		assert!(cleared.is_ok(), "B's expiry clears motion");
+		assert_eq!(
+			motion_payloads(&mock),
+			[b"on".to_vec(), b"on".to_vec(), b"off".to_vec()]
+		);
+		assert_eq!(handle.status_cache().motion(), Some(false));
 
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
