@@ -77,10 +77,32 @@ impl MockHandle {
 /// [`SharedMqttClient::for_test_stub`] handles it — so `publish*`
 /// calls return `Ok(())` without broker I/O.
 pub fn mock_client() -> (SharedMqttClient, MockHandle) {
+	capturing_client(1024, true)
+}
+
+/// Like [`mock_client`], but every publish fails, as it does once the
+/// client's event loop is gone. Attempts are still recorded.
+pub fn failing_client() -> (SharedMqttClient, MockHandle) {
+	capturing_client(1024, false)
+}
+
+/// Like [`mock_client`], but nothing drains the request queue: the
+/// first `capacity` publishes succeed and every later one blocks, as
+/// with a broker that has stopped responding. Attempts are still
+/// recorded, blocked ones included.
+pub fn wedged_client(capacity: usize) -> (SharedMqttClient, MockHandle) {
+	capturing_client(capacity, true)
+}
+
+fn capturing_client(capacity: usize, keep_event_loop: bool) -> (SharedMqttClient, MockHandle) {
 	let buf = Arc::new(Mutex::new(Vec::new()));
 	let (client, event_loop) =
-		AsyncClient::new(MqttOptions::new("mock-client", "127.0.0.1", 1883), 1024);
-	Box::leak(Box::new(event_loop));
+		AsyncClient::new(MqttOptions::new("mock-client", "127.0.0.1", 1883), capacity);
+	// The event loop owns the request channel's receiver: leaked, the
+	// channel stays open; dropped, every publish fails.
+	if keep_event_loop {
+		Box::leak(Box::new(event_loop));
+	}
 	let shared = SharedMqttClient::__test_new_with_capture(client, Arc::clone(&buf));
 	(shared, MockHandle { buf })
 }
@@ -109,6 +131,32 @@ mod tests {
 		assert_eq!(rows[1].0, "bairelay/cam/control/reboot/reply");
 		assert_eq!(rows[1].1, b"OK".to_vec());
 		assert!(!rows[1].2, "second publish should not be retained");
+	}
+
+	#[tokio::test]
+	async fn failing_client_records_and_fails_every_publish() {
+		let (client, mock) = failing_client();
+		assert!(client.publish_retained("bairelay/a", b"1").await.is_err());
+		assert!(client.publish("bairelay/b", b"2").await.is_err());
+		assert_eq!(
+			mock.published_topics(),
+			["bairelay/a".to_string(), "bairelay/b".to_string()]
+		);
+	}
+
+	#[tokio::test]
+	async fn wedged_client_blocks_once_its_queue_is_full() {
+		let (client, mock) = wedged_client(1);
+		client.publish("bairelay/a", b"1").await.unwrap();
+		// Nothing will ever drain the queue, so one pending poll means
+		// blocked for good.
+		let blocked = tokio::select! {
+			biased;
+			_ = client.publish("bairelay/b", b"2") => false,
+			_ = std::future::ready(()) => true,
+		};
+		assert!(blocked, "second publish must block");
+		assert_eq!(mock.count(), 2, "the blocked attempt is still recorded");
 	}
 
 	#[tokio::test]

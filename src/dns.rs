@@ -174,6 +174,7 @@ async fn recv_answer(sock: &UdpSocket, id: u16, buf: &mut [u8]) -> io::Result<Ve
 #[cfg(test)]
 pub(crate) mod test_support {
 	use super::*;
+	use std::net::IpAddr;
 
 	/// Answer `query` the way a recursive resolver would: the question
 	/// echoed, a CNAME, then one `A` record per address — all names
@@ -196,7 +197,12 @@ pub(crate) mod test_support {
 
 	/// A UDP resolver on loopback that answers every query with `addrs`.
 	pub(crate) async fn fake_resolver(addrs: Vec<Ipv4Addr>) -> SocketAddr {
-		let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		fake_resolver_on(Ipv4Addr::LOCALHOST.into(), addrs).await
+	}
+
+	/// [`fake_resolver`] on `ip`.
+	pub(crate) async fn fake_resolver_on(ip: IpAddr, addrs: Vec<Ipv4Addr>) -> SocketAddr {
+		let sock = UdpSocket::bind((ip, 0)).await.unwrap();
 		let addr = sock.local_addr().unwrap();
 		tokio::spawn(async move {
 			let mut buf = [0u8; 512];
@@ -210,7 +216,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-	use super::test_support::{answer, fake_resolver};
+	use super::test_support::{answer, fake_resolver, fake_resolver_on};
 	use super::*;
 
 	const PUSHX: &str = "pushx.reolink.com";
@@ -286,6 +292,48 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(got, addrs);
+	}
+
+	#[tokio::test]
+	async fn lookup_a_skips_a_reply_to_another_query() {
+		// A late answer to an earlier attempt lands first.
+		let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let resolver = sock.local_addr().unwrap();
+		let addrs = vec![Ipv4Addr::new(203, 0, 113, 9)];
+		let reply = addrs.clone();
+		tokio::spawn(async move {
+			let mut buf = [0u8; 512];
+			let (n, peer) = sock.recv_from(&mut buf).await.unwrap();
+			let mut stale = answer(&buf[..n], &[Ipv4Addr::LOCALHOST]);
+			stale[0] ^= 0xFF;
+			sock.send_to(&stale, peer).await.unwrap();
+			sock.send_to(&answer(&buf[..n], &reply), peer)
+				.await
+				.unwrap();
+		});
+		let got = lookup_a(resolver, PUSHX, Duration::from_secs(2))
+			.await
+			.unwrap();
+		assert_eq!(got, addrs);
+	}
+
+	#[tokio::test]
+	async fn lookup_a_reaches_an_ipv6_resolver() {
+		let addrs = vec![Ipv4Addr::new(203, 0, 113, 9)];
+		let resolver = fake_resolver_on(Ipv6Addr::LOCALHOST.into(), addrs.clone()).await;
+		let got = lookup_a(resolver, PUSHX, Duration::from_secs(2))
+			.await
+			.unwrap();
+		assert_eq!(got, addrs);
+	}
+
+	#[tokio::test]
+	async fn lookup_a_rejects_an_invalid_name() {
+		let resolver = fake_resolver(vec![]).await;
+		let err = lookup_a(resolver, "a..b", Duration::from_secs(2))
+			.await
+			.unwrap_err();
+		assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 	}
 
 	#[tokio::test]
