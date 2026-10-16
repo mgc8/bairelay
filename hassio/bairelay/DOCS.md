@@ -40,7 +40,7 @@ The full, editable configuration lives at `/config/bairelay/config.toml`. On the
 
 - Use the **File editor** app, the **Terminal** app, or SSH to edit it.
 - On every start, bairelay merges the options form (base) with this file (overlay). The file overrides the form field-by-field; cameras are matched by `name`.
-- MQTT broker credentials from HA's Mosquitto integration are auto-injected at startup. To use an external broker instead, add a full `[mqtt]` block to the file.
+- MQTT broker credentials from HA's Mosquitto integration are auto-injected at startup. To use an external broker instead, add a full `[mqtt]` block to the file. For TLS to it, set `tls = true` (system CAs) or `ca` (a private CA), plus `client_auth` for mutual TLS; keep certificate files under `/ssl` so the app can read them.
 - HA MQTT discovery is enabled by default with topic prefix `homeassistant`. To opt out or change the prefix, add `[mqtt.discovery] topic = "your-prefix"` or remove the `[mqtt]` block entirely (RTSP-only mode).
 - The exact merged configuration bairelay loaded is written to `/config/bairelay/effective.toml` on every start (read-only diagnostic; defaults stripped so you see only what's actually set). Don't edit that file — your changes will be overwritten next restart.
 - For the canonical reference, see `sample_config.toml` in the bairelay repo: <https://github.com/mgc8/bairelay/blob/main/sample_config.toml>.
