@@ -80,6 +80,8 @@ bairelay-neolink-core = { path = "crates/core", version = "1.1.2" }
 bairelay-mqtt = { path = "crates/mqtt", version = "1.1.2" }
 bairelay-rtsp = { path = "crates/rtsp", version = "1.1.2" }
 bairelay-wake-server = { path = "crates/wake-server", version = "1.1.2" }
+# Shared by core, wake-server and the binary; bump all three together.
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 [dependencies]
 anyhow = "1"
@@ -96,7 +98,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 bytes = "1"
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 ab_glyph = "0.2"
 time = { version = "0.3", features = ["macros", "formatting", "local-offset"] }

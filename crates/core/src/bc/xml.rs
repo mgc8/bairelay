@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use serde::{Deserialize, Serialize};
-use std::{io::BufRead, io::Write};
+use std::io::Write;
 
 #[cfg(test)]
 use indoc::indoc;
@@ -230,31 +230,20 @@ pub struct BcXml {
 }
 
 impl BcXml {
-	/// Parse a BcXml payload from an arbitrary reader.
-	///
-	/// `quick_xml::de` does not expose a configurable depth cap in the
-	/// 0.36 series, but bairelay clips depth-bomb risk *upstream* via
-	/// `bc::de::MAX_BC_BODY_LEN` (8 MiB) — the body length is verified
-	/// in `bc_header` before the XML payload reaches this parser, so a
-	/// pathological deeply-nested input is bounded by the same byte
-	/// budget the rest of the wire path enforces. If quick-xml ever
-	/// gains a `Deserializer::with_max_depth(...)` knob, wire it in
-	/// here and drop this comment.
-	pub(crate) fn try_parse(s: impl BufRead) -> Result<Self, quick_xml::de::DeError> {
-		quick_xml::de::from_reader(s)
+	/// Parse a BcXml payload. See [`parse_lossy_utf8`] for the decoding rules.
+	pub(crate) fn try_parse(s: &[u8]) -> Result<Self, quick_xml::de::DeError> {
+		parse_lossy_utf8(s)
 	}
-	pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+	pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::SeError> {
 		let mut buf: Vec<u8> = Vec::new();
 		{
 			let mut writer = quick_xml::writer::Writer::new(&mut buf);
 			// Bubble the (in practice unreachable, since the inputs are
 			// fixed string literals) error rather than `expect`ing —
 			// keeps a public serializer in `crates/core/` panic-free.
-			writer
-				.write_event(quick_xml::events::Event::Decl(
-					quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None),
-				))
-				.map_err(quick_xml::de::DeError::from)?;
+			writer.write_event(quick_xml::events::Event::Decl(
+				quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None),
+			))?;
 			writer.write_serializable("body", &self)?;
 		}
 		// The camera firmware's TiXml parser condenses raw whitespace inside
@@ -264,8 +253,7 @@ impl BcXml {
 		// newlines as `&#x0A;` entities, which survive condensing — replicate
 		// that. quick-xml emits compact XML, so the only raw newlines in `buf`
 		// are inside text values, where this re-encoding is value-preserving.
-		w.write_all(&encode_certchain_newlines(&buf))
-			.map_err(|e| quick_xml::de::DeError::Custom(e.to_string()))?;
+		w.write_all(&encode_certchain_newlines(&buf))?;
 		Ok(w)
 	}
 }
@@ -300,20 +288,31 @@ fn encode_certchain_newlines(buf: &[u8]) -> Vec<u8> {
 	out
 }
 
+/// Deserialize camera XML, replacing invalid UTF-8 with U+FFFD first.
+///
+/// quick-xml rejects a whole document on any invalid UTF-8 byte. Camera
+/// firmware can carry legacy-encoded text (device names, OSD strings) in
+/// fields we never read, and one such byte must not fail the message, so
+/// we decode lossily. Nesting depth is capped by quick-xml's default
+/// recursion limit (128) on top of the `bc::de::MAX_BC_BODY_LEN` byte cap.
+pub(crate) fn parse_lossy_utf8<T: serde::de::DeserializeOwned>(
+	bytes: &[u8],
+) -> Result<T, quick_xml::de::DeError> {
+	quick_xml::de::from_str(&String::from_utf8_lossy(bytes))
+}
+
 impl Extension {
-	pub(crate) fn try_parse(s: impl BufRead) -> Result<Self, quick_xml::de::DeError> {
-		quick_xml::de::from_reader(s)
+	pub(crate) fn try_parse(s: &[u8]) -> Result<Self, quick_xml::de::DeError> {
+		parse_lossy_utf8(s)
 	}
-	pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+	pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::SeError> {
 		let mut writer = quick_xml::writer::Writer::new(&mut w);
 		// Bubble the (in practice unreachable, since the inputs are
 		// fixed string literals) error rather than `expect`ing —
 		// keeps a public serializer in `crates/core/` panic-free.
-		writer
-			.write_event(quick_xml::events::Event::Decl(
-				quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None),
-			))
-			.map_err(quick_xml::de::DeError::from)?;
+		writer.write_event(quick_xml::events::Event::Decl(
+			quick_xml::events::BytesDecl::new("1.0", Some("UTF-8"), None),
+		))?;
 		writer.write_serializable("Extension", &self)?;
 		Ok(w)
 	}
@@ -2559,7 +2558,7 @@ fn test_binary_deser() {
 fn test_enc3_extension() {
 	let _ = env_logger::builder().is_test(true).try_init();
 	let sample = indoc!(
-		r#"<?xml version="1.0\" encoding="UTF-8" ?>
+		r#"<?xml version="1.0" encoding="UTF-8" ?>
         <Extension version="1.1">
         <encryptLen>1024</encryptLen>
         <binaryData>1</binaryData>
@@ -2989,4 +2988,55 @@ fn encode_certchain_newlines_is_scoped() {
 		encode_certchain_newlines(b"x\n<certChain>a\nb\r</certChain>\ny").as_slice(),
 		b"x\n<certChain>a&#x0A;b&#x0D;</certChain>\ny".as_slice()
 	);
+}
+
+#[test]
+fn certchain_crlf_never_reaches_the_wire_raw() {
+	// quick-xml escapes `\r` in text itself (`&#13;`); our pass handles `\n`.
+	// Either way no raw CR/LF may survive, and the value must round-trip.
+	let pem = "-----BEGIN-----\r\nAAAA\r\n-----END-----\r\n";
+	let login = BcXml {
+		login_user: Some(LoginUser {
+			version: "1.1".to_string(),
+			user_name: "u".to_string(),
+			cert_chain: Some(pem.to_string()),
+			..Default::default()
+		}),
+		..Default::default()
+	};
+	let wire = login.serialize(vec![]).unwrap();
+	let xml = String::from_utf8(wire.clone()).unwrap();
+	let inner = &xml[xml.find("<certChain>").unwrap()..xml.find("</certChain>").unwrap()];
+	assert!(!inner.contains(['\r', '\n']), "{inner}");
+	let back = BcXml::try_parse(&wire).unwrap();
+	assert_eq!(back.login_user.unwrap().cert_chain.as_deref(), Some(pem));
+}
+
+#[test]
+fn invalid_utf8_is_replaced_not_fatal() {
+	// One stray legacy-encoded byte must not fail the whole message.
+	let ext = Extension::try_parse(
+		b"<Extension version=\"1.1\"><userName>ad\xffmin</userName><channelId>3</channelId></Extension>",
+	)
+	.unwrap();
+	assert_eq!(ext.user_name.as_deref(), Some("ad\u{FFFD}min"));
+	assert_eq!(ext.channel_id, Some(3));
+
+	// Same inside an element we don't model.
+	let ext = Extension::try_parse(
+		b"<Extension version=\"1.1\"><osdName>\xfe\xff</osdName><channelId>4</channelId></Extension>",
+	)
+	.unwrap();
+	assert_eq!(ext.channel_id, Some(4));
+}
+
+#[test]
+fn deeply_nested_input_does_not_overflow() {
+	let depth = 10_000;
+	let mut xml = String::from("<body>");
+	xml.push_str(&"<a>".repeat(depth));
+	xml.push_str(&"</a>".repeat(depth));
+	xml.push_str("</body>");
+	// Either outcome is acceptable; reaching this assertion is the test.
+	let _ = BcXml::try_parse(xml.as_bytes());
 }

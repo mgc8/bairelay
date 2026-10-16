@@ -78,6 +78,9 @@ pub mod cloud;
 /// Log-safe renderings of identifiers (camera UIDs) for info-level logs.
 pub mod redact;
 
+#[cfg(test)]
+mod xml_corpus_tests;
+
 /// This is the top level error structure of the library
 ///
 /// Most commands will either return their `Ok(result)` or this `Err(Error)`
