@@ -832,7 +832,7 @@ impl CameraHandle {
 
 	/// Attempt to connect and login to the camera.
 	async fn try_connect(&self) -> anyhow::Result<Arc<BcCamera>> {
-		let opts = crate::bc_opts::build_bc_opts(&self.config);
+		let opts = crate::bc_opts::build_bc_opts_resolved(&self.config).await?;
 		let max_enc = crate::bc_opts::max_encryption(&self.config);
 		let camera = BcCamera::new(&opts).await?;
 		camera.login_with_maxenc(max_enc).await?;

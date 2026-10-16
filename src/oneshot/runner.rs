@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::bc_opts::{build_bc_opts, max_encryption};
+use crate::bc_opts::{build_bc_opts_resolved, max_encryption};
 use crate::config::CameraConfig;
 use crate::oneshot::errors::InterruptedError;
 
@@ -32,7 +32,6 @@ pub async fn run<F, T>(cfg: &CameraConfig, cancel: CancellationToken, op: F) -> 
 where
 	F: for<'a> FnOnce(&'a BcCamera) -> BoxFuture<'a, Result<T>>,
 {
-	let opts = build_bc_opts(cfg);
 	let max_enc = max_encryption(cfg);
 
 	tokio::select! {
@@ -43,6 +42,7 @@ where
 		// roughly the same number of poll cycles.
 		_ = cancel.cancelled() => Err(InterruptedError::new().into()),
 		res = async move {
+			let opts = build_bc_opts_resolved(cfg).await?;
 			let camera = timeout(CONNECT_TIMEOUT, BcCamera::new(&opts))
 				.await
 				.context("connect timed out")?

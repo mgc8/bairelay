@@ -142,6 +142,8 @@ Bairelay's primary targets are Linux and macOS — both are exercised by CI. Win
 
 Bairelay's config file is TOML. Start from `sample_config.toml` in the repo root — every defaultable option is shown commented out with its default value.
 
+A camera's `address` is an IP or hostname with an optional port (`192.168.1.187`, `cam1.lan:9000`, `[::1]:9000`). Hostnames are resolved on every connect attempt, so DNS or DHCP changes are picked up.
+
 ### Migrating from Neolink
 
 Bairelay's config is **a deliberate near-superset of Neolink's** so existing configs mostly drop in. To migrate:

@@ -1,27 +1,136 @@
 //! `BcCameraOpt` builder shared by the camera connect loop and CLI.
 
 use crate::config::{self, CameraConfig};
+use bairelay_neolink_core::bc_protocol::Error as CoreError;
 use bairelay_neolink_core::bc_protocol::{
 	BcCameraOpt, ConnectionProtocol, Credentials, DiscoveryMethods, MaxEncryption,
 };
 use std::net::IpAddr;
+use std::time::Duration;
+
+/// Upper bound on a single hostname lookup.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Host part of a camera `address`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressHost {
+	Ip(IpAddr),
+	Name(String),
+}
+
+/// A parsed camera `address`: `ip`, `ip:port`, `host`, `host:port`,
+/// `[ipv6]` / `[ipv6]:port`, or bare IPv6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedAddress {
+	pub host: AddressHost,
+	pub port: Option<u16>,
+}
+
+fn parse_port(s: &str) -> Result<u16, String> {
+	s.parse::<u16>().map_err(|_| format!("invalid port '{s}'"))
+}
+
+fn valid_hostname(h: &str) -> bool {
+	!h.is_empty()
+		&& h.len() <= 253
+		&& h.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// Parse a camera `address` string. Pure; no DNS.
+pub fn parse_address(raw: &str) -> Result<ParsedAddress, String> {
+	let s = raw.trim();
+	if s.is_empty() {
+		return Err("address is empty".into());
+	}
+	if let Some(rest) = s.strip_prefix('[') {
+		let (inner, tail) = rest
+			.split_once(']')
+			.ok_or_else(|| "missing ']' in bracketed address".to_string())?;
+		let ip: std::net::Ipv6Addr = inner
+			.parse()
+			.map_err(|_| format!("invalid IPv6 address '{inner}'"))?;
+		let port = match tail {
+			"" => None,
+			t => Some(parse_port(
+				t.strip_prefix(':')
+					.ok_or_else(|| format!("unexpected '{t}' after ']'"))?,
+			)?),
+		};
+		return Ok(ParsedAddress {
+			host: AddressHost::Ip(IpAddr::V6(ip)),
+			port,
+		});
+	}
+	if let Ok(ip) = s.parse::<IpAddr>() {
+		return Ok(ParsedAddress {
+			host: AddressHost::Ip(ip),
+			port: None,
+		});
+	}
+	let (host, port) = match s.split_once(':') {
+		None => (s, None),
+		Some((h, p)) => {
+			if p.contains(':') {
+				return Err(format!("invalid address '{s}'"));
+			}
+			(h, Some(parse_port(p)?))
+		}
+	};
+	if host.is_empty() {
+		return Err("host is empty".into());
+	}
+	if let Ok(ip) = host.parse::<IpAddr>() {
+		return Ok(ParsedAddress {
+			host: AddressHost::Ip(ip),
+			port,
+		});
+	}
+	if !valid_hostname(host) {
+		return Err(format!("invalid host '{host}'"));
+	}
+	Ok(ParsedAddress {
+		host: AddressHost::Name(host.to_string()),
+		port,
+	})
+}
+
+/// Resolve a hostname to IPs under [`RESOLVE_TIMEOUT`]. Failure carries
+/// `CoreError::AddrResolutionError` so one-shots exit with the
+/// connection code.
+pub async fn resolve_host(host: &str) -> anyhow::Result<Vec<IpAddr>> {
+	let fail = |why: String| {
+		anyhow::Error::new(CoreError::AddrResolutionError)
+			.context(format!("cannot resolve host '{host}': {why}"))
+	};
+	let found = tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, 0)))
+		.await
+		.map_err(|_| fail("timed out".into()))?
+		.map_err(|e| fail(e.to_string()))?;
+	let mut ips: Vec<IpAddr> = vec![];
+	for sa in found {
+		if !ips.contains(&sa.ip()) {
+			ips.push(sa.ip());
+		}
+	}
+	if ips.is_empty() {
+		return Err(fail("no addresses returned".into()));
+	}
+	Ok(ips)
+}
 
 /// Build a `BcCameraOpt` from the service `CameraConfig` using the same
-/// rules the long-running camera connect loop uses.
+/// rules the long-running camera connect loop uses. Hostnames are not
+/// resolved here; see [`build_bc_opts_resolved`].
 pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
 	let mut addrs = vec![];
 	let mut port = None;
 
-	if let Some(ref addr_str) = cfg.address {
-		// Parse "host:port" format
-		if let Some((host, p)) = addr_str.rsplit_once(':') {
-			if let Ok(ip) = host.parse::<IpAddr>() {
-				addrs.push(ip);
-			}
-			port = p.parse().ok();
-		} else if let Ok(ip) = addr_str.parse::<IpAddr>() {
+	if let Some(Ok(parsed)) = cfg.address.as_deref().map(parse_address) {
+		if let AddressHost::Ip(ip) = parsed.host {
 			addrs.push(ip);
 		}
+		port = parsed.port;
 	}
 
 	let discovery = match cfg.discovery {
@@ -55,6 +164,27 @@ pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
 		cloud_refresh_token: cfg.cloud_refresh_token.clone(),
 		debug: cfg.debug.unwrap_or(false),
 	}
+}
+
+/// [`build_bc_opts`] plus DNS resolution of a hostname `address`, run
+/// on every connect attempt so DNS/DHCP changes are picked up. Failure
+/// is warned (host only) and returned as a connect failure.
+pub async fn build_bc_opts_resolved(cfg: &CameraConfig) -> anyhow::Result<BcCameraOpt> {
+	let mut opts = build_bc_opts(cfg);
+	if let Some(Ok(ParsedAddress {
+		host: AddressHost::Name(host),
+		..
+	})) = cfg.address.as_deref().map(parse_address)
+	{
+		match resolve_host(&host).await {
+			Ok(ips) => opts.addrs = ips,
+			Err(e) => {
+				tracing::warn!(camera = %cfg.name, host = %host, "hostname resolution failed: {e:#}");
+				return Err(e);
+			}
+		}
+	}
+	Ok(opts)
 }
 
 /// Translate the config-level max-encryption enum into the bairelay_neolink_core
@@ -235,5 +365,81 @@ mod tests {
 		assert!(opts.addrs.is_empty());
 		assert_eq!(opts.port, None);
 		assert_eq!(opts.uid.as_deref(), Some("ABC123"));
+	}
+
+	#[test]
+	fn parse_address_table() {
+		let ip = |s: &str| AddressHost::Ip(s.parse().unwrap());
+		let name = |s: &str| AddressHost::Name(s.to_string());
+		let ok = [
+			("127.0.0.1", ip("127.0.0.1"), None),
+			("127.0.0.1:9000", ip("127.0.0.1"), Some(9000)),
+			("cam1", name("cam1"), None),
+			(
+				"cam1.example.com:9001",
+				name("cam1.example.com"),
+				Some(9001),
+			),
+			("::1", ip("::1"), None),
+			("[::1]", ip("::1"), None),
+			("[::1]:9000", ip("::1"), Some(9000)),
+		];
+		for (raw, host, port) in ok {
+			assert_eq!(
+				parse_address(raw),
+				Ok(ParsedAddress { host, port }),
+				"{raw}"
+			);
+		}
+		for bad in [
+			"",
+			" ",
+			":9000",
+			"cam1:",
+			"cam1:abc",
+			"cam1:70000",
+			"[::1",
+			"[::1]x",
+			"[zz]:1",
+			"a:b:c",
+			"bad host",
+			"cam1/x",
+		] {
+			assert!(parse_address(bad).is_err(), "{bad} should be rejected");
+		}
+	}
+
+	#[test]
+	fn build_bc_opts_keeps_hostname_port_without_ips() {
+		let mut cfg = sample_cfg();
+		cfg.address = Some("cam1.example.com:9100".into());
+		let opts = build_bc_opts(&cfg);
+		assert!(opts.addrs.is_empty());
+		assert_eq!(opts.port, Some(9100));
+	}
+
+	#[tokio::test]
+	async fn resolve_host_resolves_localhost() {
+		let ips = resolve_host("localhost").await.unwrap();
+		assert!(ips.iter().any(|ip| ip.is_loopback()));
+	}
+
+	#[tokio::test]
+	async fn resolve_host_failure_is_connection_error() {
+		let err = resolve_host("nonexistent.invalid").await.unwrap_err();
+		assert!(format!("{err:#}").contains("nonexistent.invalid"));
+		assert_eq!(crate::oneshot::classify::classify(&err), 4);
+	}
+
+	#[tokio::test]
+	async fn build_bc_opts_resolved_fills_addrs_for_hostname() {
+		let mut cfg = sample_cfg();
+		cfg.address = Some("localhost:9000".into());
+		let opts = build_bc_opts_resolved(&cfg).await.unwrap();
+		assert!(opts.addrs.iter().any(|ip| ip.is_loopback()));
+		assert_eq!(opts.port, Some(9000));
+
+		cfg.address = Some("nonexistent.invalid".into());
+		assert!(build_bc_opts_resolved(&cfg).await.is_err());
 	}
 }

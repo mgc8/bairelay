@@ -1231,6 +1231,12 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 			));
 		}
 
+		if let Some(addr) = &cam.address {
+			if let Err(e) = crate::bc_opts::parse_address(addr) {
+				return Err(format!("Camera '{}': invalid address: {e}", cam.name));
+			}
+		}
+
 		// Camera must have address or uid
 		if cam.address.is_none() && cam.uid.is_none() {
 			return Err(format!(
@@ -1523,6 +1529,30 @@ mod tests {
 		let cfg = parse_config(toml).expect("parse");
 		let err = validate_config(&cfg).expect_err("cloud needs a uid");
 		assert!(err.contains("requires a uid"), "got: {err}");
+	}
+
+	#[test]
+	fn malformed_address_is_rejected_and_hostname_accepted() {
+		let mk = |addr: &str| {
+			format!(
+				"[[cameras]]\nname = \"cam1\"\naddress = \"{addr}\"\nusername = \"admin\"\npassword = \"pw\"\n"
+			)
+		};
+		for bad in ["cam1:abc", ":9000", "[::1"] {
+			let cfg = parse_config(&mk(bad)).expect("parse");
+			let err = validate_config(&cfg).expect_err(bad);
+			assert!(
+				err.contains("cam1") && err.contains("invalid address"),
+				"got: {err}"
+			);
+		}
+		for good in [
+			"cam1.example.com",
+			"cam1.example.com:9000",
+			"127.0.0.1:9000",
+		] {
+			validate_config(&parse_config(&mk(good)).expect("parse")).expect(good);
+		}
 	}
 
 	#[test]
