@@ -167,8 +167,11 @@ pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
 }
 
 /// [`build_bc_opts`] plus DNS resolution of a hostname `address`, run
-/// on every connect attempt so DNS/DHCP changes are picked up. Failure
-/// is warned (host only) and returned as a connect failure.
+/// on every connect attempt so DNS/DHCP changes are picked up. With a
+/// `uid` set, a failure is warned (camera name + host only) and the
+/// connect continues with empty `addrs` so UID discovery runs. Without
+/// one, the failure is returned unlogged, naming the host, for the
+/// caller to report as a connect failure.
 pub async fn build_bc_opts_resolved(cfg: &CameraConfig) -> anyhow::Result<BcCameraOpt> {
 	let mut opts = build_bc_opts(cfg);
 	if let Some(Ok(ParsedAddress {
@@ -178,10 +181,10 @@ pub async fn build_bc_opts_resolved(cfg: &CameraConfig) -> anyhow::Result<BcCame
 	{
 		match resolve_host(&host).await {
 			Ok(ips) => opts.addrs = ips,
-			Err(e) => {
-				tracing::warn!(camera = %cfg.name, host = %host, "hostname resolution failed: {e:#}");
-				return Err(e);
+			Err(e) if cfg.uid.is_some() => {
+				tracing::warn!(camera = %cfg.name, host = %host, "hostname resolution failed, trying UID discovery: {e:#}");
 			}
+			Err(e) => return Err(e),
 		}
 	}
 	Ok(opts)
@@ -404,6 +407,7 @@ mod tests {
 			"a:b:c",
 			"bad host",
 			"cam1/x",
+			"fe80::1%eth0",
 		] {
 			assert!(parse_address(bad).is_err(), "{bad} should be rejected");
 		}
@@ -438,8 +442,70 @@ mod tests {
 		let opts = build_bc_opts_resolved(&cfg).await.unwrap();
 		assert!(opts.addrs.iter().any(|ip| ip.is_loopback()));
 		assert_eq!(opts.port, Some(9000));
+	}
 
+	use std::sync::{Arc, Mutex};
+
+	/// Shared in-memory sink for log lines emitted under
+	/// [`capture_warns`].
+	#[derive(Clone, Default)]
+	struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+	impl std::io::Write for LogSink {
+		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+			self.0.lock().unwrap().extend_from_slice(buf);
+			Ok(buf.len())
+		}
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	/// Run `fut` on this thread with a WARN-level subscriber; returns its
+	/// output and every WARN line it emitted.
+	async fn capture_warns<T>(fut: impl std::future::Future<Output = T>) -> (T, String) {
+		let sink = LogSink::default();
+		let writer = sink.clone();
+		let subscriber = tracing_subscriber::fmt()
+			.with_max_level(tracing::Level::WARN)
+			.with_ansi(false)
+			.with_writer(move || writer.clone())
+			.finish();
+		let guard = tracing::subscriber::set_default(subscriber);
+		let out = fut.await;
+		drop(guard);
+		let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+		(out, logs)
+	}
+
+	/// Without a uid the failure is the caller's to log: the error names
+	/// the host and nothing is warned here.
+	#[tokio::test]
+	async fn build_bc_opts_resolved_fails_unresolvable_host_without_uid() {
+		let mut cfg = sample_cfg();
+		cfg.uid = None;
 		cfg.address = Some("nonexistent.invalid".into());
-		assert!(build_bc_opts_resolved(&cfg).await.is_err());
+		let (res, logs) = capture_warns(build_bc_opts_resolved(&cfg)).await;
+		let err = res.unwrap_err();
+		assert!(
+			format!("{err:#}").contains("nonexistent.invalid"),
+			"{err:#}"
+		);
+		assert_eq!(crate::oneshot::classify::classify(&err), 4);
+		assert!(logs.is_empty(), "no warn on the no-uid path, got: {logs}");
+	}
+
+	/// With a uid the failure is warned once and UID discovery runs.
+	#[tokio::test]
+	async fn build_bc_opts_resolved_falls_back_to_uid_on_unresolvable_host() {
+		let mut cfg = sample_cfg();
+		cfg.uid = Some("UIDCAM1".into());
+		cfg.address = Some("nonexistent.invalid:9000".into());
+		let (res, logs) = capture_warns(build_bc_opts_resolved(&cfg)).await;
+		let opts = res.unwrap();
+		assert!(opts.addrs.is_empty());
+		assert_eq!(opts.uid.as_deref(), Some("UIDCAM1"));
+		assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
+		assert!(logs.contains("trying UID discovery"), "{logs}");
 	}
 }

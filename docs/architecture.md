@@ -152,7 +152,7 @@ Each camera gets a tokio task tree rooted in the orchestrator. All tasks for a c
 
 ```
 global CancellationToken
-├── MQTT event loop (polls broker, spawns dispatch tasks)
+├── MQTT event loop (own cancel token; spawns dispatch + ConnAck tasks)
 ├── watchdog (30 s sweep, requests disconnect for idle cameras)
 └── camera "frontdoor" token
     └── connection loop (discover → login → keepalive → reconnect)
@@ -243,6 +243,7 @@ Per-camera `PreviewState { Live, Connecting, Sleeping }` published via `watch::S
 | `CameraDiscoverer` | `bairelay_neolink_core::bc_protocol::connection::discovery`  | Discovery fallback chain (local/remote/map/relay)    |
 | `VideoStream`      | `bairelay_neolink_core::bc_protocol::stream`                 | `BcMedia` pull loop over `StreamData`                |
 | `PacketSource`     | `bairelay::stream_source` (binary)                  | `BcMedia` injection for translator-loop tests        |
+| `EventSource`      | `bairelay::mqtt_loop` (binary)                      | scripted MQTT events for `run_event_loop` tests      |
 | `StreamProvider`   | `bairelay_rtsp::provider`                           | RTSP server's view of a camera                       |
 
 Production impls forward to the concrete types (`BcCamera`, `Discovery`, `StreamData`, etc.); test impls (`FakeCamera`, `ScriptedDiscoverer`, `MockVideoStream`, `FakeStreamProvider`) live alongside and let unit tests exercise the same code paths a live camera would drive.

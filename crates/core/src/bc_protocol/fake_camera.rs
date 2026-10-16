@@ -11,6 +11,7 @@
 // per test; let the normal dead-code lint fire once all methods are used
 // so accidentally unused scaffolding surfaces naturally.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -114,10 +115,11 @@ struct FakeState {
 	get_linktype: Option<BoxFn<LinkType>>,
 	get_support: Option<BoxFn<Support>>,
 	get_abilityinfo: Option<BoxFn<AbilityInfo>>,
-	motion_stream: Mutex<Option<MotionData>>,
+	/// One [`MotionData`] per `listen_on_motion` call, in order.
+	motion_stream: Mutex<VecDeque<MotionData>>,
 	floodlight_stream: Mutex<Option<Receiver<FloodlightStatusList>>>,
 	/// When `Some`, `listen_on_motion` returns `Err(f())` on every call
-	/// rather than consuming the `motion_stream` value.
+	/// rather than consuming a `motion_stream` value.
 	motion_stream_error: Option<Box<dyn Fn() -> Error + Send + Sync>>,
 	/// When `Some`, `listen_on_floodlight` returns `Err(f())` on every
 	/// call rather than consuming the `floodlight_stream` value.
@@ -206,11 +208,15 @@ impl FakeCameraBuilder {
 		self
 	}
 
-	/// Pre-seed the [`MotionData`] handle returned by
-	/// [`CameraDriver::listen_on_motion`]. Consumed on first call;
-	/// second call panics.
+	/// Queue a [`MotionData`] handle for
+	/// [`CameraDriver::listen_on_motion`]. Each call returns the next
+	/// queued handle, in the order queued; a call with none left panics.
 	pub fn with_motion_stream(mut self, data: MotionData) -> Self {
-		self.state.motion_stream = Mutex::new(Some(data));
+		self.state
+			.motion_stream
+			.get_mut()
+			.expect("motion_stream lock")
+			.push_back(data);
 		self
 	}
 
@@ -446,7 +452,7 @@ impl CameraDriver for FakeCamera {
 		if let Some(f) = self.inner.motion_stream_error.as_ref() {
 			return Err(f());
 		}
-		match self.inner.motion_stream.lock().unwrap().take() {
+		match self.inner.motion_stream.lock().unwrap().pop_front() {
 			Some(data) => Ok(data),
 			None => unset("listen_on_motion (stream not configured, or already consumed)"),
 		}

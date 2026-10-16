@@ -53,6 +53,11 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 	cam.status_cache()
 		.set_ir(bairelay_mqtt::control::IrMode::Auto);
 	cam.status_cache().set_led(true);
+	cam.status_cache().set_ai_objects(
+		[bairelay_neolink_core::bc_protocol::AiObject::Vehicle]
+			.into_iter()
+			.collect(),
+	);
 
 	cam.republish_cached_status()
 		.await
@@ -92,6 +97,110 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 	assert!(
 		saw("bairelay/cam1/status/led", b"on"),
 		"led=on retained must land"
+	);
+	for object in ["person", "vehicle", "animal", "face", "package"] {
+		let payload: &[u8] = if object == "vehicle" { b"on" } else { b"off" };
+		assert!(
+			saw(&format!("bairelay/cam1/status/ai/{object}"), payload),
+			"ai/{object} retained must land"
+		);
+	}
+}
+
+/// Replay skips a cached `off` for an AI object whose topic discovery
+/// retracts (doorbell-only objects on a camera without a doorbell);
+/// a cached `on` is evidence and replays.
+#[tokio::test]
+async fn republish_cached_status_skips_retracted_ai_off() {
+	use bairelay::camera::CameraHandle;
+	use bairelay::capabilities::{CameraCapabilities, Presence};
+	use bairelay::config::test_helpers::minimal_camera_config;
+	use bairelay_neolink_core::bc_protocol::AiObject;
+	use tokio_util::sync::CancellationToken;
+
+	let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+	let cancel = CancellationToken::new();
+	let cam = CameraHandle::new(minimal_camera_config("cam1"), cancel, Some(mqtt));
+	cam.set_capabilities_for_test(CameraCapabilities {
+		ai: Presence::Present,
+		doorbell: Presence::Absent,
+		..Default::default()
+	});
+	cam.status_cache()
+		.set_ai_objects([AiObject::Package].into_iter().collect());
+
+	cam.republish_cached_status()
+		.await
+		.expect("republish must succeed");
+
+	let ai: Vec<(String, Vec<u8>)> = mock
+		.published()
+		.into_iter()
+		.filter(|(t, _, _)| t.starts_with("bairelay/cam1/status/ai/"))
+		.map(|(t, p, _)| (t, p))
+		.collect();
+	let row = |object: &str, payload: &[u8]| {
+		(
+			format!("bairelay/cam1/status/ai/{object}"),
+			payload.to_vec(),
+		)
+	};
+	assert_eq!(
+		ai,
+		vec![
+			row("person", b"off"),
+			row("vehicle", b"off"),
+			row("animal", b"off"),
+			row("package", b"on"),
+		]
+	);
+}
+
+/// Replay reads the AI cache under the AI publish lock: a set the
+/// motion listener caches while the replay waits (its session-start
+/// reset) is the set the replay emits, never the stale one.
+#[tokio::test(start_paused = true)]
+async fn republish_cached_status_reads_ai_cache_under_publish_lock() {
+	use bairelay::camera::CameraHandle;
+	use bairelay::config::test_helpers::minimal_camera_config;
+	use bairelay_neolink_core::bc_protocol::{AiObject, AiObjects};
+	use std::sync::Arc;
+	use tokio_util::sync::CancellationToken;
+
+	let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+	let cam = Arc::new(CameraHandle::new(
+		minimal_camera_config("cam1"),
+		CancellationToken::new(),
+		Some(mqtt),
+	));
+	let cache = cam.status_cache();
+	cache.set_ai_objects([AiObject::Vehicle].into_iter().collect());
+
+	let guard = cache.lock_ai_publish().await;
+	let replay = tokio::spawn({
+		let cam = Arc::clone(&cam);
+		async move { cam.republish_cached_status().await }
+	});
+	tokio::time::sleep(Duration::from_millis(1)).await;
+	assert!(!replay.is_finished(), "replay waits on the AI lock");
+	cache.set_ai_objects(AiObjects::default());
+	drop(guard);
+	tokio::time::timeout(Duration::from_secs(1), replay)
+		.await
+		.expect("replay must finish once the lock is free")
+		.unwrap()
+		.expect("republish must succeed");
+
+	let ai: Vec<(String, Vec<u8>)> = mock
+		.published()
+		.into_iter()
+		.filter(|(t, _, _)| t.starts_with("bairelay/cam1/status/ai/"))
+		.map(|(t, p, _)| (t, p))
+		.collect();
+	assert_eq!(ai.len(), 5, "{ai:?}");
+	assert!(
+		ai.iter().all(|(_, p)| p == b"off"),
+		"stale on replayed: {ai:?}"
 	);
 }
 

@@ -78,9 +78,6 @@ pub mod cloud;
 /// Log-safe renderings of identifiers (camera UIDs) for info-level logs.
 pub mod redact;
 
-#[cfg(test)]
-mod xml_corpus_tests;
-
 /// This is the top level error structure of the library
 ///
 /// Most commands will either return their `Ok(result)` or this `Err(Error)`
@@ -89,6 +86,10 @@ pub use bc_protocol::Error;
 pub(crate) use bc_protocol::{Credentials, Result};
 
 pub(crate) type NomErrorType<'a> = nom::error::VerboseError<&'a [u8]>;
+
+/// Snapshot harness over a directory of real camera XML payloads.
+#[cfg(test)]
+mod xml_corpus_tests;
 
 /// Thin public shims around otherwise `pub(crate)` parsers so the
 /// out-of-tree fuzz harness can drive them. Gated on the `fuzz-api`

@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::camera::CameraHandle;
+use crate::camera_tasks::SNAPSHOT_TIMEOUT;
 
 /// Maximum total time spent warming a single camera (acquire wake lock,
 /// wait for connect, pull I-frame, capture snapshot).
@@ -26,9 +27,6 @@ const PER_CAMERA_TIMEOUT: Duration = Duration::from_secs(30);
 /// Maximum time to wait for the first I-frame after the stream source has
 /// been requested.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Maximum time allowed for the synchronous `get_snapshot` round trip.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Poll interval while waiting for the first I-frame.
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -164,10 +162,7 @@ async fn warm_one(
 
 	// 4) Request a JPEG snapshot from the camera and stash it.
 	if let Some(camera) = handle.bc_camera() {
-		tokio::select! {
-			_ = cancel.cancelled() => return Ok(()),
-			_ = capture_snapshot_into_buffer(&camera, name, &last_frame) => {}
-		}
+		capture_snapshot_into_buffer(&camera, name, &last_frame, &cancel).await;
 	} else {
 		tracing::warn!(camera = %name, "bc_camera unavailable for snapshot");
 	}
@@ -187,8 +182,7 @@ async fn warm_one(
 	Ok(())
 }
 
-/// Request a JPEG snapshot via [`CameraDriver::get_snapshot`] (bounded
-/// by [`SNAPSHOT_TIMEOUT`]) and push successful bytes into
+/// Request a JPEG snapshot via [`CameraDriver::get_snapshot`] (retrying the wake-time 400 and bounded per attempt by [`SNAPSHOT_TIMEOUT`]) and push successful bytes into
 /// `last_frame`. Errors / timeouts log at warn and leave the buffer
 /// untouched. Lifted out of [`warm_one`] so behaviour tests can drive
 /// it against a `FakeCamera` without the stream / audio dependencies.
@@ -196,8 +190,14 @@ pub(crate) async fn capture_snapshot_into_buffer(
 	camera: &std::sync::Arc<dyn bairelay_neolink_core::bc_protocol::CameraDriver>,
 	name: &str,
 	last_frame: &bairelay_rtsp::buffer::LastFrameBuffer,
+	cancel: &CancellationToken,
 ) {
-	match tokio::time::timeout(SNAPSHOT_TIMEOUT, camera.get_snapshot()).await {
+	let Some(result) =
+		crate::camera_tasks::snapshot_with_retry(camera.as_ref(), name, cancel).await
+	else {
+		return;
+	};
+	match result {
 		Ok(Ok(bytes)) => {
 			last_frame.set_jpeg(bytes::Bytes::from(bytes));
 			tracing::info!(camera = %name, "Captured startup JPEG snapshot");
@@ -300,7 +300,7 @@ mod tests {
 		let driver: Arc<dyn CameraDriver> = fake;
 
 		let lfb = LastFrameBuffer::new();
-		capture_snapshot_into_buffer(&driver, "cam1", &lfb).await;
+		capture_snapshot_into_buffer(&driver, "cam1", &lfb, &CancellationToken::new()).await;
 
 		let got = lfb
 			.jpeg()
@@ -326,7 +326,7 @@ mod tests {
 		let driver: Arc<dyn CameraDriver> = fake;
 
 		let lfb = LastFrameBuffer::new();
-		capture_snapshot_into_buffer(&driver, "cam1", &lfb).await;
+		capture_snapshot_into_buffer(&driver, "cam1", &lfb, &CancellationToken::new()).await;
 
 		assert!(
 			lfb.jpeg().is_none(),
@@ -563,7 +563,7 @@ mod tests {
 			})
 			.build();
 		let driver: Arc<dyn CameraDriver> = fake;
-		capture_snapshot_into_buffer(&driver, "cam1", &lfb).await;
+		capture_snapshot_into_buffer(&driver, "cam1", &lfb, &CancellationToken::new()).await;
 
 		let after = lfb.jpeg().expect("prior frame must still be present");
 		assert_eq!(

@@ -529,7 +529,25 @@ impl CameraHandle {
 		if let Some(on) = self.status_cache.led() {
 			publisher.publish_led(on).await?;
 		}
+		let _ai_serial = self.status_cache.lock_ai_publish().await;
+		let caps = self.capabilities().unwrap_or_default().into();
+		if let Some(objects) = self.status_cache.ai_objects() {
+			let replay = camera_tasks::ai_object_publishes(caps, None, objects, Default::default());
+			for (object, detected) in replay {
+				publisher.publish_ai_object(object, detected).await?;
+			}
+		}
 		Ok(())
+	}
+
+	/// Seal the HA discovery publisher, shared by every camera's clone:
+	/// returns once in-flight `publish_discovery` calls have finished,
+	/// and later ones are no-ops. `unpublish_discovery` still clears.
+	/// The shutdown fan-out calls this before it unpublishes.
+	pub async fn seal_discovery(&self) {
+		if let Some(publisher) = self.discovery_publisher.as_ref() {
+			publisher.seal().await;
+		}
 	}
 
 	/// Remove retained HA discovery config payloads for this camera
@@ -830,14 +848,15 @@ impl CameraHandle {
 		}
 	}
 
-	/// Attempt to connect and login to the camera.
-	async fn try_connect(&self) -> anyhow::Result<Arc<BcCamera>> {
+	/// Attempt to connect and login to the camera. Returns the camera
+	/// and the device type its login `DeviceInfo` reports.
+	async fn try_connect(&self) -> anyhow::Result<(Arc<BcCamera>, Option<String>)> {
 		let opts = crate::bc_opts::build_bc_opts_resolved(&self.config).await?;
 		let max_enc = crate::bc_opts::max_encryption(&self.config);
 		let camera = BcCamera::new(&opts).await?;
-		camera.login_with_maxenc(max_enc).await?;
+		let device_info = camera.login_with_maxenc(max_enc).await?;
 
-		Ok(Arc::new(camera))
+		Ok((Arc::new(camera), device_info.device_type))
 	}
 
 	/// Send periodic keepalive probes to detect connection loss.
@@ -955,10 +974,12 @@ impl CameraHandle {
 	/// `concrete` is `Some`, stream-source spawns via
 	/// [`Self::stream_source`] work and logout is attempted at the end
 	/// of teardown; when `None` (test mode) both paths are skipped.
+	/// `device_type` is the login `DeviceInfo` type, a doorbell signal.
 	async fn run_connected_session(
 		self: &Arc<Self>,
 		driver: Arc<dyn CameraDriver>,
 		concrete: Option<Arc<BcCamera>>,
+		device_type: Option<&str>,
 	) {
 		self.set_state(CameraState::Connected);
 		self.set_preview_state(PreviewState::Live);
@@ -985,27 +1006,32 @@ impl CameraHandle {
 		// capable cam that only fluked one probe).
 		match driver.get_support().await {
 			Ok(support) => {
-				let has_ptz = crate::capabilities::ptz_mode_indicates_ptz(
-					support.ptz_mode.as_deref(),
-					support.ptz_cfg,
-				);
-				let (status_led, ir_leds) =
-					crate::capabilities::led_presence(&*driver, &support, self.config.channel_id)
-						.await;
+				let caps = crate::capabilities::camera_capabilities(
+					&*driver,
+					&support,
+					self.config.channel_id,
+					device_type,
+				)
+				.await;
+				let has_ptz = caps.has_ptz;
 				// Hardware confirmed absent: drop any cached value so a
 				// broker reconnect can't replay it after discovery
 				// retracts the entity.
-				if status_led.is_absent() {
+				if caps.status_led.is_absent() {
 					self.status_cache.clear_led();
 				}
-				if ir_leds.is_absent() {
+				if caps.ir_leds.is_absent() {
 					self.status_cache.clear_ir();
 				}
-				*self.capabilities.write_recover() = Some(CameraCapabilities {
-					has_ptz,
-					status_led,
-					ir_leds,
-				});
+				// The AI clear and the caps write share the AI publish
+				// lock, so the reconnect replay reads both or neither.
+				{
+					let _ai_serial = self.status_cache.lock_ai_publish().await;
+					if caps.ai.is_absent() {
+						self.status_cache.clear_ai_objects();
+					}
+					*self.capabilities.write_recover() = Some(caps);
+				}
 
 				// Populate the preset cache for HA discovery's
 				// `PtPreset` select. Only meaningful when has_ptz
@@ -1095,6 +1121,7 @@ impl CameraHandle {
 		}
 
 		if let Some(ref mqtt) = self.mqtt_client {
+			let caps = self.capabilities().unwrap_or_default();
 			if self.config.mqtt.enable_motion {
 				tasks.spawn(camera_tasks::motion_listener(
 					self.config.name.clone(),
@@ -1105,6 +1132,7 @@ impl CameraHandle {
 					session_cancel.clone(),
 					Duration::from_secs_f64(self.config.motion_wake_hold_secs),
 					self.status_cache(),
+					caps,
 				));
 			}
 			// `battery_unsupported` latches when the poller concludes the
@@ -1156,7 +1184,6 @@ impl CameraHandle {
 			// own capability; the read only runs if either is present.
 			// Spawned, not awaited: an unresponsive camera must not hold
 			// up the grace-period watcher or ignore session cancel.
-			let caps = self.capabilities().unwrap_or_default();
 			// Only confirmed hardware is read: with presence unknown the
 			// reply value may be a placeholder.
 			if caps.status_led.is_present() || caps.ir_leds.is_present() {
@@ -1342,12 +1369,16 @@ impl CameraHandle {
 				}
 			};
 			match connect_result {
-				Ok(camera) => {
+				Ok((camera, device_type)) => {
 					let driver: Arc<dyn CameraDriver> =
 						Arc::clone(&camera) as Arc<dyn CameraDriver>;
 					backoff.reset();
-					self.run_connected_session(driver, Some(Arc::clone(&camera)))
-						.await;
+					self.run_connected_session(
+						driver,
+						Some(Arc::clone(&camera)),
+						device_type.as_deref(),
+					)
+					.await;
 				}
 				Err(e) => {
 					if is_login_failure(&e) {
@@ -1621,12 +1652,14 @@ impl CameraHandle {
 	/// skipping the stream-source spawn / logout paths that require a
 	/// real [`BcCamera`]. Use together with a scripted `FakeCamera` to
 	/// exercise the capability probe + session-tasks + keepalive +
-	/// teardown code without a live TCP socket.
+	/// teardown code without a live TCP socket. `device_type` stands in
+	/// for the login `DeviceInfo` type.
 	pub(crate) async fn run_connected_session_for_test(
 		self: &Arc<Self>,
 		driver: Arc<dyn CameraDriver>,
+		device_type: Option<&str>,
 	) {
-		self.run_connected_session(driver, None).await
+		self.run_connected_session(driver, None, device_type).await
 	}
 }
 
@@ -1687,6 +1720,7 @@ mod tests {
 			has_ptz: true,
 			status_led: bairelay_mqtt::discovery::Presence::Present,
 			ir_leds: bairelay_mqtt::discovery::Presence::Present,
+			..Default::default()
 		});
 		let caps = handle.capabilities().expect("caps populated");
 		assert!(caps.has_ptz);
@@ -2611,6 +2645,7 @@ mod tests {
 			has_ptz: true,
 			status_led: bairelay_mqtt::discovery::Presence::Present,
 			ir_leds: bairelay_mqtt::discovery::Presence::Present,
+			..Default::default()
 		});
 
 		let before = mock.published().len();
@@ -2878,7 +2913,7 @@ mod tests {
 		// + 2-s drain deadline fire without real delay.
 		tokio::time::timeout(
 			Duration::from_secs(30),
-			handle.run_connected_session_for_test(driver),
+			handle.run_connected_session_for_test(driver, None),
 		)
 		.await
 		.expect("session must exit after MAX_FAILURES consecutive keepalive errors");
@@ -2976,7 +3011,7 @@ mod tests {
 
 		tokio::time::timeout(
 			Duration::from_secs(30),
-			handle.run_connected_session_for_test(driver),
+			handle.run_connected_session_for_test(driver, None),
 		)
 		.await
 		.expect("session must exit; a respawned battery poller would have panicked");
@@ -3020,7 +3055,7 @@ mod tests {
 
 		tokio::time::timeout(
 			Duration::from_secs(30),
-			handle.run_connected_session_for_test(driver),
+			handle.run_connected_session_for_test(driver, None),
 		)
 		.await
 		.expect("session must exit");
@@ -3031,6 +3066,187 @@ mod tests {
 			"get_support Err must leave caps cache empty",
 		);
 		assert_eq!(handle.state(), CameraState::Disconnected);
+	}
+
+	/// The channel `<Support>` item decides AI + doorbell presence at
+	/// connect; a confirmed-absent AI detector drops cached AI states
+	/// so a broker reconnect can't replay them after retraction.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn run_connected_session_detects_ai_and_doorbell_presence() {
+		use crate::capabilities::Presence;
+		use crate::config::test_helpers::minimal_camera_config;
+		use bairelay_neolink_core::bc::xml::{Support, SupportItem};
+		use bairelay_neolink_core::bc_protocol::{AiObject, FakeCameraBuilder};
+
+		let run = |ai_type: u32, doorbell_version: u32| async move {
+			let fake = FakeCameraBuilder::new()
+				.with_support(move || {
+					Ok(Support {
+						items: vec![SupportItem {
+							chn_id: 0,
+							ai_type: Some(ai_type),
+							doorbell_version: Some(doorbell_version),
+							..Default::default()
+						}],
+						..Default::default()
+					})
+				})
+				.with_linktype(|| {
+					Err(bairelay_neolink_core::bc_protocol::Error::Other(
+						"link fail",
+					))
+				})
+				.build();
+			let handle = Arc::new(CameraHandle::new(
+				minimal_camera_config("front_door"),
+				CancellationToken::new(),
+				None,
+			));
+			handle
+				.status_cache()
+				.set_ai_objects([AiObject::Person].into_iter().collect());
+			tokio::time::timeout(
+				Duration::from_secs(30),
+				handle.run_connected_session_for_test(fake, None),
+			)
+			.await
+			.expect("session must exit");
+			handle
+		};
+
+		let handle = run(1, 1).await;
+		let caps = handle.capabilities().expect("caps populated");
+		assert_eq!(
+			(caps.ai, caps.doorbell),
+			(Presence::Present, Presence::Present)
+		);
+		assert!(handle.status_cache().ai_objects().is_some());
+
+		let handle = run(0, 0).await;
+		let caps = handle.capabilities().expect("caps populated");
+		assert_eq!(
+			(caps.ai, caps.doorbell),
+			(Presence::Absent, Presence::Absent)
+		);
+		assert_eq!(handle.status_cache().ai_objects(), None);
+	}
+
+	/// Capability detection clears the AI cache and installs the new
+	/// caps under the AI publish lock, so a broker-reconnect replay
+	/// holding it never pairs stale objects with new caps.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn run_connected_session_clears_ai_cache_under_publish_lock() {
+		use crate::config::test_helpers::minimal_camera_config;
+		use bairelay_neolink_core::bc::xml::{Support, SupportItem};
+		use bairelay_neolink_core::bc_protocol::{AiObject, FakeCameraBuilder};
+
+		let probed = Arc::new(AtomicBool::new(false));
+		let fake = FakeCameraBuilder::new()
+			.with_support({
+				let probed = Arc::clone(&probed);
+				move || {
+					probed.store(true, Ordering::SeqCst);
+					Ok(Support {
+						items: vec![SupportItem {
+							chn_id: 0,
+							ai_type: Some(0),
+							..Default::default()
+						}],
+						..Default::default()
+					})
+				}
+			})
+			.with_linktype(|| {
+				Err(bairelay_neolink_core::bc_protocol::Error::Other(
+					"link fail",
+				))
+			})
+			.build();
+		let handle = Arc::new(CameraHandle::new(
+			minimal_camera_config("front_door"),
+			CancellationToken::new(),
+			None,
+		));
+		let cache = handle.status_cache();
+		cache.set_ai_objects([AiObject::Person].into_iter().collect());
+		let guard = cache.lock_ai_publish().await;
+		let session = tokio::spawn({
+			let handle = Arc::clone(&handle);
+			async move { handle.run_connected_session_for_test(fake, None).await }
+		});
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while !probed.load(Ordering::SeqCst) {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
+		})
+		.await
+		.expect("precondition: session probes support");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		assert!(
+			handle.capabilities().is_none(),
+			"caps wait on the AI publish lock"
+		);
+		assert!(
+			cache.ai_objects().is_some(),
+			"AI cache clear waits on the AI publish lock"
+		);
+
+		drop(guard);
+		tokio::time::timeout(Duration::from_secs(30), session)
+			.await
+			.expect("session must exit")
+			.unwrap();
+		assert_eq!(
+			handle.capabilities().map(|c| c.ai),
+			Some(crate::capabilities::Presence::Absent)
+		);
+		assert_eq!(cache.ai_objects(), None, "Absent AI clears the cache");
+	}
+
+	/// The login `DeviceInfo` type reaches capability detection: a
+	/// `bell` type marks the doorbell present when `<Support>` carries
+	/// no `doorbellVersion`; without it the same item reads absent.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn run_connected_session_threads_device_type_to_doorbell_presence() {
+		use crate::capabilities::Presence;
+		use crate::config::test_helpers::minimal_camera_config;
+		use bairelay_neolink_core::bc::xml::{Support, SupportItem};
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let run = |device_type: Option<&'static str>| async move {
+			let fake = FakeCameraBuilder::new()
+				.with_support(|| {
+					Ok(Support {
+						items: vec![SupportItem {
+							chn_id: 0,
+							doorbell_version: None,
+							..Default::default()
+						}],
+						..Default::default()
+					})
+				})
+				.with_linktype(|| {
+					Err(bairelay_neolink_core::bc_protocol::Error::Other(
+						"link fail",
+					))
+				})
+				.build();
+			let handle = Arc::new(CameraHandle::new(
+				minimal_camera_config("cam1"),
+				CancellationToken::new(),
+				None,
+			));
+			tokio::time::timeout(
+				Duration::from_secs(30),
+				handle.run_connected_session_for_test(fake, device_type),
+			)
+			.await
+			.expect("session must exit");
+			handle.capabilities().expect("caps populated").doorbell
+		};
+
+		assert_eq!(run(Some("Video Doorbell")).await, Presence::Present);
+		assert_eq!(run(None).await, Presence::Absent);
 	}
 
 	/// `idle_disconnect = true` spawns the grace-period task; with
@@ -3062,7 +3278,7 @@ mod tests {
 
 		tokio::time::timeout(
 			Duration::from_secs(30),
-			handle.run_connected_session_for_test(driver),
+			handle.run_connected_session_for_test(driver, None),
 		)
 		.await
 		.expect("grace period path must exit");

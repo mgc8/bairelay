@@ -25,13 +25,15 @@ Your client connects to bairelay; bairelay maintains the Baichuan session with t
 
 ### Supported cameras
 
-Bairelay's exclusive design target is **Reolink battery cameras** — the Argus 3 / Eco / 4, Argus PT, Argus Track, Argus Altas, etc. These are the cameras that:
+Bairelay's primary design target is **Reolink battery cameras** — the Argus 3 / Eco / 4, Argus PT, Argus Track, Argus Altas, etc. These are the cameras that:
 
 1. Speak Baichuan only (no native RTSP).
 2. Sleep aggressively to preserve battery and need to be woken on demand.
 3. Push motion alerts via a cloud channel rather than a LAN broadcast.
 
-Non-battery Reolink cameras (the wired RLC line, doorbells, NVR-attached models) almost universally support **native RTSP** out of the box — there is no need for a translation layer, so they are explicitly out of scope. Doorbells in particular have additional protocol surfaces (two-way audio, button events) that bairelay does not implement.
+**Battery-powered doorbells** (Reolink battery Video Doorbell class) are in scope for their event surface (doorbell press, AI objects: person, vehicle, animal, face, package), published to MQTT and Home Assistant. Presses and AI objects arrive on the camera's alarm push, which bairelay sees only while it holds a connected session: a press during a session publishes and extends the existing wake hold, and a press on a sleeping battery doorbell reaches bairelay only through the [push listener](#push-listener-tcp443), as a motion edge.
+
+Non-battery Reolink cameras (the wired RLC line, wired doorbells, NVR-attached models) almost universally support **native RTSP** out of the box — there is no need for a translation layer, so they are explicitly out of scope.
 
 Always-on Argus models should work incidentally — the wake-lock machinery is harmless when the camera never sleeps.
 
@@ -142,7 +144,7 @@ Bairelay's primary targets are Linux and macOS — both are exercised by CI. Win
 
 Bairelay's config file is TOML. Start from `sample_config.toml` in the repo root — every defaultable option is shown commented out with its default value.
 
-A camera's `address` is an IP or hostname with an optional port (`192.168.1.187`, `cam1.lan:9000`, `[::1]:9000`). Hostnames are resolved on every connect attempt, so DNS or DHCP changes are picked up.
+A camera's `address` is an IP or hostname with an optional port (`192.168.1.187`, `cam1.lan:9000`, `[::1]:9000`). Hostnames are resolved on every connect attempt, so DNS or DHCP changes are picked up. Scoped IPv6 (`fe80::1%eth0`) and an empty port (`192.168.1.187:`) are rejected at startup and by `check-config`.
 
 ### Migrating from Neolink
 
@@ -178,7 +180,7 @@ Bairelay's config is **a deliberate near-superset of Neolink's** so existing con
    ```toml
    [mqtt.discovery]
    topic = "homeassistant"
-   features = ["floodlight", "camera", "motion", "led", "ir", "reboot", "pt", "battery", "siren"]
+   features = ["floodlight", "camera", "motion", "led", "ir", "reboot", "pt", "battery", "siren", "ai", "doorbell"]
    ```
 
 7. **Talk (two-way audio) is not implemented.** If you used `neolink talk`, bairelay has no equivalent yet — see the future-development notes.
@@ -198,7 +200,7 @@ topic_prefix = "bairelay"
 
 [mqtt.discovery]
 topic = "homeassistant"
-features = ["floodlight", "camera", "motion", "led", "ir", "reboot", "pt", "battery", "siren"]
+features = ["floodlight", "camera", "motion", "led", "ir", "reboot", "pt", "battery", "siren", "ai", "doorbell"]
 
 [[cameras]]
 name = "driveway"
@@ -215,7 +217,7 @@ Key recommended defaults and why:
 - **`idle_disconnect = true`** — required for battery cams to sleep. Without it, bairelay holds the Baichuan session open forever and the camera will never enter low-power state.
 - **`idle_disconnect_timeout_secs = 45`** — grace period after the last RTSP client disconnects before the camera is allowed to sleep. Lower means faster sleep but more wake-up latency on the next connect; higher is the opposite. 30–60 s is the practical band.
 - **`gap_threshold_secs = 1.0`** (per-camera, in `[cameras.pause]`) — the placeholder/bridging trigger when the upstream stalls. Sub streams with a naturally low fps may need this raised. Default is fine for main streams.
-- **MQTT discovery `features`** — the listed nine cover every entity HA understands. Drop `pt` for non-PTZ cameras, drop `floodlight` / `siren` for models without that hardware. Bairelay won't emit a discovery payload for a feature the camera doesn't advertise capability for; the list is an opt-in cap.
+- **MQTT discovery `features`** — the listed features cover every entity HA understands (the `ai` and `doorbell` entries add the AI object sensors and the doorbell press event). Drop `pt` for non-PTZ cameras, drop `floodlight` / `siren` for models without that hardware. Bairelay omits the entities for hardware it detects as absent (PTZ, status LED, IR, AI, doorbell) and keeps them when detection is inconclusive; the list is an opt-in cap.
 
 ### Camera names and how they appear in MQTT / Home Assistant
 

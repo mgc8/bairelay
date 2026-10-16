@@ -12,9 +12,12 @@
 
 pub use bairelay_mqtt::discovery::Presence;
 
+use bairelay_neolink_core::bc::xml::{Support, SupportItem};
+
 /// Subset of the camera's reported `Support` XML relevant to HA
-/// discovery. `Default` yields "no optional hardware" — the safe
-/// assumption when the `get_support` call fails.
+/// discovery. `Default` yields no PTZ and every presence `Unknown`,
+/// which neither hides nor retracts an entity — the safe assumption
+/// when the `get_support` call fails.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CameraCapabilities {
 	/// `true` when the camera reports pan-tilt hardware via either
@@ -27,6 +30,11 @@ pub struct CameraCapabilities {
 	/// IR night-vision LEDs — the `ledState` ability in the login-time
 	/// `abilityInfo`. Independent of `status_led`.
 	pub ir_leds: Presence,
+	/// AI object detection — the channel `<Support>` item's `aitype`.
+	pub ai: Presence,
+	/// Doorbell button — the channel `<Support>` item's
+	/// `doorbellVersion`, or a login `DeviceInfo` type naming a bell.
+	pub doorbell: Presence,
 }
 
 /// `<Support>` item `ledCtrl` bit marking a status LED. Decoding from
@@ -46,7 +54,7 @@ pub const IR_LEDS_ABILITY: &str = "ledState";
 /// ability. Neither is derived from the `<LedState>` reply.
 pub async fn led_presence(
 	driver: &dyn bairelay_neolink_core::bc_protocol::CameraDriver,
-	support: &bairelay_neolink_core::bc::xml::Support,
+	support: &Support,
 	channel: u8,
 ) -> (Presence, Presence) {
 	let status_led = support_status_led(support, channel);
@@ -54,18 +62,64 @@ pub async fn led_presence(
 	(status_led, ir_leds)
 }
 
-/// Status-LED presence from the `<Support>` item for `channel`.
-/// `Unknown` when the item or its `ledCtrl` field is missing.
-pub fn support_status_led(
-	support: &bairelay_neolink_core::bc::xml::Support,
+/// Every capability of `channel`, from the `<Support>` reply, the cached
+/// login abilities and the login `DeviceInfo` type.
+pub async fn camera_capabilities(
+	driver: &dyn bairelay_neolink_core::bc_protocol::CameraDriver,
+	support: &Support,
 	channel: u8,
-) -> Presence {
-	let bits = support
+	device_type: Option<&str>,
+) -> CameraCapabilities {
+	let (status_led, ir_leds) = led_presence(driver, support, channel).await;
+	CameraCapabilities {
+		has_ptz: ptz_mode_indicates_ptz(support.ptz_mode.as_deref(), support.ptz_cfg),
+		status_led,
+		ir_leds,
+		ai: support_ai(support, channel),
+		doorbell: doorbell_presence(support, channel, device_type),
+	}
+}
+
+/// The `<Support>` item describing `channel`, if the camera sent one.
+fn channel_item(support: &Support, channel: u8) -> Option<&SupportItem> {
+	support
 		.items
 		.iter()
 		.find(|item| item.chn_id == u32::from(channel))
-		.and_then(|item| item.led_ctrl);
+}
+
+/// Status-LED presence from the `<Support>` item for `channel`.
+/// `Unknown` when the item or its `ledCtrl` field is missing.
+pub fn support_status_led(support: &Support, channel: u8) -> Presence {
+	let bits = channel_item(support, channel).and_then(|item| item.led_ctrl);
 	Presence::from_signal(bits.map(|b| b & LED_CTRL_STATUS_LED != 0))
+}
+
+/// AI detection presence from the `<Support>` item for `channel`:
+/// non-zero `aitype` is present, zero absent. `Unknown` when the item
+/// or its `aitype` field is missing.
+pub fn support_ai(support: &Support, channel: u8) -> Presence {
+	let ai_type = channel_item(support, channel).and_then(|item| item.ai_type);
+	Presence::from_signal(ai_type.map(|n| n > 0))
+}
+
+/// Doorbell presence: present when the `<Support>` item for `channel`
+/// has a non-zero `doorbellVersion` or the login `DeviceInfo` type
+/// contains `bell` (any case); absent when the item exists without
+/// either; `Unknown` when the camera sent no item for `channel`.
+pub fn doorbell_presence(support: &Support, channel: u8, device_type: Option<&str>) -> Presence {
+	let item = channel_item(support, channel);
+	let versioned = item
+		.and_then(|item| item.doorbell_version)
+		.is_some_and(|v| v > 0);
+	let bell_type = device_type.is_some_and(|t| t.to_ascii_lowercase().contains("bell"));
+	if versioned || bell_type {
+		Presence::Present
+	} else if item.is_some() {
+		Presence::Absent
+	} else {
+		Presence::Unknown
+	}
 }
 
 impl From<CameraCapabilities> for bairelay_mqtt::discovery::CameraCapabilitiesView {
@@ -74,6 +128,8 @@ impl From<CameraCapabilities> for bairelay_mqtt::discovery::CameraCapabilitiesVi
 			has_ptz: caps.has_ptz,
 			status_led: caps.status_led,
 			ir_leds: caps.ir_leds,
+			ai: caps.ai,
+			doorbell: caps.doorbell,
 		}
 	}
 }
@@ -96,7 +152,6 @@ pub fn ptz_mode_indicates_ptz(ptz_mode: Option<&str>, ptz_cfg: Option<u32>) -> b
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use bairelay_neolink_core::bc::xml::{Support, SupportItem};
 
 	#[test]
 	fn ptz_mode_pt_is_ptz() {
@@ -167,6 +222,102 @@ mod tests {
 		assert_eq!(
 			led_presence(&*fake, &Support::default(), 0).await,
 			(Unknown, Unknown)
+		);
+	}
+
+	fn support_item(chn_id: u32, ai_type: Option<u32>, doorbell_version: Option<u32>) -> Support {
+		Support {
+			items: vec![SupportItem {
+				chn_id,
+				ai_type,
+				doorbell_version,
+				..Default::default()
+			}],
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn support_ai_table() {
+		use Presence::*;
+		let cases: &[(Support, Presence)] = &[
+			(support_item(0, Some(1), None), Present),
+			(support_item(0, Some(0x7f), None), Present),
+			(support_item(0, Some(0), None), Absent),
+			(support_item(0, None, Some(1)), Unknown),
+			(support_item(1, Some(1), None), Unknown),
+			(Support::default(), Unknown),
+		];
+		for (i, (support, want)) in cases.iter().enumerate() {
+			assert_eq!(support_ai(support, 0), *want, "case {i}");
+		}
+	}
+
+	#[test]
+	fn doorbell_presence_table() {
+		use Presence::*;
+		let cases: &[(Support, Option<&str>, Presence)] = &[
+			(support_item(0, None, Some(1)), None, Present),
+			(support_item(0, None, Some(0)), None, Absent),
+			(support_item(0, None, None), None, Absent),
+			(support_item(0, None, None), Some("smart_bell"), Present),
+			(
+				support_item(0, None, None),
+				Some("Battery_DoorBell"),
+				Present,
+			),
+			(support_item(0, None, Some(0)), Some("BELL"), Present),
+			(support_item(0, None, None), Some("wifi_solo_ipc"), Absent),
+			(support_item(1, None, Some(1)), None, Unknown),
+			(Support::default(), None, Unknown),
+			(Support::default(), Some("ipc"), Unknown),
+			(Support::default(), Some("smart_bell"), Present),
+		];
+		for (i, (support, device_type, want)) in cases.iter().enumerate() {
+			assert_eq!(
+				doorbell_presence(support, 0, *device_type),
+				*want,
+				"case {i}"
+			);
+		}
+	}
+
+	/// Every field comes from its own detector for the camera's channel.
+	#[tokio::test]
+	async fn camera_capabilities_combines_every_detector() {
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+		use Presence::*;
+		let mut support = support_item(0, Some(1), None);
+		support.ptz_mode = Some("pt".to_string());
+		support.items[0].led_ctrl = Some(0x4047);
+		let fake = FakeCameraBuilder::new().with_abilities(&["motion"]).build();
+
+		let caps = camera_capabilities(&*fake, &support, 0, Some("smart_bell")).await;
+		assert!(caps.has_ptz);
+		assert_eq!(
+			(caps.status_led, caps.ir_leds, caps.ai, caps.doorbell),
+			(Present, Absent, Present, Present)
+		);
+
+		let caps = camera_capabilities(&*fake, &support, 0, None).await;
+		assert_eq!(caps.doorbell, Absent);
+
+		let caps = camera_capabilities(&*fake, &Support::default(), 0, None).await;
+		assert!(!caps.has_ptz);
+		assert_eq!((caps.ai, caps.doorbell), (Unknown, Unknown));
+	}
+
+	#[test]
+	fn capabilities_view_carries_ai_and_doorbell() {
+		let caps = CameraCapabilities {
+			ai: Presence::Absent,
+			doorbell: Presence::Present,
+			..Default::default()
+		};
+		let view = bairelay_mqtt::discovery::CameraCapabilitiesView::from(caps);
+		assert_eq!(
+			(view.ai, view.doorbell),
+			(Presence::Absent, Presence::Present)
 		);
 	}
 

@@ -531,6 +531,10 @@ pub struct DeviceInfo {
 	/// Does not exist for floodlights
 	#[serde(default)]
 	pub resolution: Option<Resolution>,
+	/// Device class, e.g. `"wifi_solo_ipc"` (battery camera) or
+	/// `"smart_bell"` (doorbell)
+	#[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+	pub device_type: Option<String>,
 }
 
 /// VersionInfo xml
@@ -1999,6 +2003,13 @@ pub struct SupportItem {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub ai_animal_type: Option<u32>,
+	/// Doorbell version; present and non-zero on doorbells (e.g. `16`)
+	#[serde(
+		default,
+		rename = "doorbellVersion",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub doorbell_version: Option<u32>,
 	/// Supports time lapse
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub timelapse: Option<u32>,
@@ -3030,6 +3041,9 @@ fn invalid_utf8_is_replaced_not_fatal() {
 	assert_eq!(ext.channel_id, Some(4));
 }
 
+/// quick-xml skips unknown elements iteratively, so unknown nesting of
+/// any depth parses without recursion. No `BcXml` field type is
+/// recursive, so no modelled path can reach the 128-level cap.
 #[test]
 fn deeply_nested_input_does_not_overflow() {
 	let depth = 10_000;
@@ -3037,6 +3051,6 @@ fn deeply_nested_input_does_not_overflow() {
 	xml.push_str(&"<a>".repeat(depth));
 	xml.push_str(&"</a>".repeat(depth));
 	xml.push_str("</body>");
-	// Either outcome is acceptable; reaching this assertion is the test.
-	let _ = BcXml::try_parse(xml.as_bytes());
+	let parsed = BcXml::try_parse(xml.as_bytes());
+	assert!(parsed.is_ok(), "unexpected parse error: {parsed:?}");
 }

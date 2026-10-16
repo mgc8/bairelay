@@ -3,6 +3,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
+use crate::ai::AiObject;
 use crate::client::SharedMqttClient;
 use crate::control::IrMode;
 use crate::error::MqttError;
@@ -57,6 +58,26 @@ impl<'a> StatusPublisher<'a> {
 		self.client
 			.publish_retained(&topic, payload.as_bytes())
 			.await
+	}
+
+	/// Publish the detection state of one AI object class (retained).
+	pub async fn publish_ai_object(
+		&self,
+		object: AiObject,
+		detected: bool,
+	) -> Result<(), MqttError> {
+		let payload = if detected { "on" } else { "off" };
+		let topic = topics::status_ai(&self.topic_prefix, &self.camera_name, object);
+		self.client
+			.publish_retained(&topic, payload.as_bytes())
+			.await
+	}
+
+	/// Publish a doorbell button press (`press`, not retained: a press
+	/// is an event, a retained copy would replay on every reconnect).
+	pub async fn publish_doorbell_press(&self) -> Result<(), MqttError> {
+		let topic = topics::status_doorbell(&self.topic_prefix, &self.camera_name);
+		self.client.publish(&topic, b"press").await
 	}
 
 	/// Publish "unknown" motion state (retained). Used at startup before
@@ -166,6 +187,48 @@ mod tests {
 		let pub_ = StatusPublisher::new(&c, &p, &n);
 		pub_.publish_connection(true).await.unwrap();
 		pub_.publish_connection(false).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn publish_ai_object_is_retained_on_off() {
+		let (c, mock) = crate::test_support::mock_client();
+		let pub_ = StatusPublisher::new(&c, "bairelay", "cam1");
+		pub_.publish_ai_object(AiObject::Person, true)
+			.await
+			.unwrap();
+		pub_.publish_ai_object(AiObject::Package, false)
+			.await
+			.unwrap();
+		assert_eq!(
+			mock.published(),
+			vec![
+				(
+					"bairelay/cam1/status/ai/person".to_string(),
+					b"on".to_vec(),
+					true
+				),
+				(
+					"bairelay/cam1/status/ai/package".to_string(),
+					b"off".to_vec(),
+					true
+				),
+			]
+		);
+	}
+
+	#[tokio::test]
+	async fn publish_doorbell_press_is_not_retained() {
+		let (c, mock) = crate::test_support::mock_client();
+		let pub_ = StatusPublisher::new(&c, "bairelay", "cam1");
+		pub_.publish_doorbell_press().await.unwrap();
+		assert_eq!(
+			mock.published(),
+			vec![(
+				"bairelay/cam1/status/doorbell".to_string(),
+				b"press".to_vec(),
+				false
+			)]
+		);
 	}
 
 	#[tokio::test]

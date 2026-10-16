@@ -26,13 +26,13 @@ Each camera entry:
 | Sub-field | Required | Description |
 |-----------|----------|-------------|
 | `name` | yes | Alphanumeric, underscore, or hyphen. Used as the camera's MQTT topic segment and HA entity name. |
-| `address` | one of address/uid | LAN IP or hostname (e.g. `192.168.1.50`). Leave blank if using `uid`. |
-| `uid` | one of address/uid | Reolink P2P UID (16 alphanumeric characters, e.g. `9527000ABCDEF123`). Leave blank if using `address`. |
+| `address` | one of address/uid | LAN IP or hostname (e.g. `192.168.1.50`). Tried first; UID discovery is the fallback when `uid` is also set. |
+| `uid` | one of address/uid | Reolink P2P UID (16 alphanumeric characters, e.g. `9527000ABCDEF123`). Used for discovery when `address` is blank or fails. |
 | `username` | no | Camera account username. Defaults to `admin` (Reolink's stock account). |
 | `password` | yes | The camera account password. |
 | `idle_disconnect` | no | Drop the camera connection when no clients are streaming, letting battery cameras sleep. Defaults to `true`. Turn off for always-on cameras you want kept warm. |
 
-Fill in exactly one of `address` or `uid` per camera. If both are present, `uid` is used and `address` is ignored.
+Fill in `address`, `uid`, or both. With both, bairelay connects to `address` first and falls back to UID discovery when that fails, including when a hostname fails to resolve.
 
 ## Configuration: TOML file
 

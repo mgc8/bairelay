@@ -20,7 +20,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `get_linktype()`                      | Used for keepalive (NOT `ping()`; see "Keepalive").       |
 | `get_support()`                       | Capability probe (PTZ, talk, etc.). Cache result.         |
 | `battery_info()`                      | Returns `BatteryInfo`. **`voltage` is i32 millivolts**, not volts. |
-| `listen_on_motion()`                  | Returns `MotionData` with `next_motion()` async stream.   |
+| `listen_on_motion()`                  | Returns `MotionData`. `next_motion()` coalesces to the latest `MotionStatus`; `next_alarm_update()` yields every `AlarmUpdate` (motion, AI objects, doorbell press) in order. cmd 33 classification is `classify_alarm` in `bc_protocol/alarm.rs`. |
 | `listen_on_floodlight()`             | Returns `mpsc::Receiver<FloodlightStatusList>`.           |
 | `is_floodlight_tasks_enabled()`      | Polls schedule state — distinct from on/off.              |
 | `get_pirstate()`                      | Returns `RfAlarmCfg`. One-shot query, NOT a stream.       |
@@ -30,7 +30,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `zoom_to(u32)`                        | Pre-multiply by 1000 (`level * 1000.0` for MQTT float).   |
 | `set_ptz_preset(u8, String)`          | Preset ID + name.                                         |
 | `start_video(kind, channel, record)` / `stop_video(kind)` | Returns `StreamData`; covered by `VideoStream` trait. |
-| `get_snapshot()`                      | JPEG; each call wakes battery cameras — use sparingly.    |
+| `get_snapshot()`                      | JPEG; each call wakes battery cameras — use sparingly. An Argus answers msg 109 with `400` (`CameraServiceUnavailable`) for several seconds after connect (6 s or more); startup wake and the preview poller retry through `camera_tasks::snapshot_with_retry` (2 s backoff while the next attempt starts within 12 s of the first, cancel-aware, 10 s per attempt). |
 
 ### Calls that can hang
 
@@ -99,6 +99,30 @@ Behaviour per state:
 
 `Unknown` never hides or retracts anything, so a failed or missing probe can't delete an entity. `get_ledstate` / `set_ledstate` carry no ability gate (the old `ledState` gate blocked the status LED on Argus). `camera_tasks::publish_led_state` reads once on connect, only when a feature is `Present`, and publishes only `Present` fields (retained, cached for broker-reconnect replay; the cache field is dropped when the feature turns out `Absent`). `control/led` / `control/ir` always reach the camera; on success the binary re-reads and publishes only the written field, only when `Present`. A per-camera lock serialises these read-modify-write commands. Like PIR, both are configuration values, not live sensors — no polling. `status/ir` is the configured mode; the live day/night switch arrives separately on the cmd 33 alarm push. Don't confuse IR with PIR (passive IR motion sensor), which has its own `get_pirstate` reader.
 
+### Alarm push classification (cmd 33)
+
+`bc_protocol/alarm.rs::classify_alarm` turns one `<AlarmEvent>` (`status` + `AItype`, both comma lists, lower-cased and trimmed, empty tokens dropped) into an `AlarmUpdate { motion, objects, visitor, doorbell_press }`. `listen_on_motion`'s task applies it to the first event for the listener's channel; `MotionData::next_alarm_update()` yields every update in order, `next_motion()` coalesces to the latest motion state.
+
+- `status` token `visitor` is a held state: after one button press the doorbell repeats it in every push for roughly 15 s (`MD,visitor` → `MD,visitor` → `visitor` → `none`). The classifier reports it per push as `visitor: Some(bool)` and leaves `doorbell_press` false; `visitor: None` (no event for the channel) leaves the state unchanged.
+- A press is the rising edge of `visitor`: `alarm.rs::VisitorEdge`, owned by `listen_on_motion`'s task, sets `doorbell_press` on a push holding `visitor` after one without it. Each subscribe starts with no visitor, so the first `visitor` push a new listener sees is a press.
+- `dn` / `daynight` is a day/night switch. Neither it nor `visitor` counts as motion.
+- A push whose status tokens are all in {`visitor`, `dn`, `daynight`} with no active `AItype` leaves motion at `NoChange` and `objects` at `None`.
+- Any other push is motion `Start` when a status token is outside {`none`, `visitor`, `dn`, `daynight`} or any `AItype` token is not `none`, else `Stop`, and `objects` is `Some(set)` where the set replaces the previous one (an empty set clears every class).
+- `AItype` mapping: `people` / `person` / `human` to person, `vehicle` / `car` to vehicle, `dog_cat` / `dog` / `cat` / `pet` to animal, `face`, `package`. Unknown tokens (`other`) still count as active motion but map to no class.
+- Argus cameras report motion as AI detections: `status` is `none` and `AItype` carries `people` / `vehicle` / `dog_cat`. Doorbells report `MD` plus the AI types.
+- Cameras repeat motion `Start` in every push while motion lasts. The motion listener logs, publishes and caches `status/motion` on transitions only (`camera_tasks::report_motion`; the state is unknown on each subscribe, so the first Start or Stop publishes). A Start or Stop also publishes and caches when the status cache holds the other state, e.g. the push listener's fallback `off` while motion is still on. The wake hold sees every Start and Stop: a Start cancels a pending release and holds the lock, a Stop schedules the release.
+
+Presence is resolved at connect into three-state `Presence` values (see Status LED above for `Unknown` semantics):
+
+- `ai` — `<Support>` item `aitype`: greater than 0 is `Present`, 0 is `Absent`, a missing item or field is `Unknown` (`capabilities::support_ai`).
+- `doorbell` — `doorbellVersion` greater than 0 in the channel's `<Support>` item, or a login `DeviceInfo` `type` containing `bell` (case-insensitive), is `Present`. A channel item with neither is `Absent`; no item is `Unknown` (`capabilities::doorbell_presence`). Argus items carry no `doorbellVersion` and report type `wifi_solo_ipc`; a Reolink doorbell reports `doorbellVersion` 16 and type `smart_bell`.
+
+MQTT surface: retained `status/ai/{person,vehicle,animal,face,package}` (`on` / `off`) and non-retained `status/doorbell` (`press`). A press publishes at QoS 1 without the retain flag, so a press queued during a broker outage is delivered late when the connection returns, and a QoS 1 redelivery can fire the HA event twice. HA entities (`ai` and `doorbell` discovery features, both in the default set): person / vehicle / animal binary sensors when `ai` is `Present` or `Unknown`; face / package binary sensors additionally need `doorbell` `Present`; one `event` entity (`device_class: doorbell`, event type `press`) unless `doorbell` is `Absent`. `Absent` retracts the matching retained configs and status topics. `CameraCapabilitiesView::retracts_ai_object` is the single retraction rule: `ai` `Absent`, or a doorbell-only class with `doorbell` `Absent`.
+
+At session start the motion listener publishes `off` for every class whose topic the current capabilities keep (retracted topics are cleared by discovery) and caches the empty set, clearing a retained `on` an earlier session or process left; each `Some` set after that publishes only the classes that changed. An `on` always publishes; an `off` publishes only when its topic is not retracted by current capabilities, or when that class was reported `on` earlier in the session, so a retracted topic is never re-created by an `off`. The cache replay after a broker reconnect applies the same filter. `StatusCache::lock_ai_publish` serialises the listener's cache-and-publish, capability detection's AI-cache clear and caps write, and the replay's read-and-publish, so a replay never re-emits a set the listener has replaced or pairs stale objects with new caps. A press is logged, published, not cached, and holds the wake lock for the per-camera `motion_wake_hold_secs` setting (extending a post-motion hold, never shortening an active motion hold).
+
+The motion listener is the only consumer of cmd 33 pushes, so AI objects and doorbell presses follow `enable_motion`, and `CameraEnableFlags::allows` gates the `ai` and `doorbell` discovery entities on the same flag. cmd 33 pushes arrive only while bairelay holds a connected session: a press during a session extends the existing wake hold, and a press on a sleeping battery doorbell reaches bairelay only through the push listener (`push_listener.rs`), as a motion edge.
+
 ### Time + DST split across two Bc messages
 
 Reolink cameras autonomously track DST in a Bc message *separate* from `<SystemGeneral>`. Setting the clock requires modelling both. Load-bearing semantics:
@@ -151,6 +175,8 @@ Subscribe to ALL camera topics on `ConnAck` (broker connect/reconnect), **not** 
 
 Control dispatch is spawned as a separate `tokio::spawn` task from the event loop. Dispatching inline would let a 10-second PTZ command block all MQTT processing.
 
+ConnAck handling (subscribe, discovery republish, cached-status replay) runs on its own task too (`mqtt_loop::ConnAckTask`). Its publishes wait on slots in the 256-slot rumqttc request channel, and only the event loop's `poll()` drains that channel: run inline, a channel filled during a broker outage would wedge the loop, and a replay waiting on `StatusCache::lock_ai_publish` behind a motion listener blocked on that channel would deadlock. A newer ConnAck aborts the previous run; the event loop's exit aborts one still in flight. `run_event_loop` also takes a shutdown token (`connack_stop` in `main.rs`, a child of the global token that the shutdown handler cancels before its fan-out): once it fires, a run in flight ends and a new ConnAck starts none, so a reconnect can't re-create the HA entities the fan-out deletes, while the loop keeps polling until its own cancel.
+
 ### `rumqttc` 10 KiB packet-size default
 
 `rumqttc 0.24`'s `MqttOptions` defaults `max_incoming_packet_size` and `max_outgoing_packet_size` to **10 KiB** — surprising given MQTT itself has no such default. Any new `MqttOptions` instance must call `set_max_packet_size` (we use 16 MiB) **before** the first JPEG flows.
@@ -167,7 +193,7 @@ MQTT supports only one Last Will per connection. The bridge sets a global LWT on
 
 ### Shutdown ordering
 
-The MQTT event loop is the **last subsystem to shut down**. The shutdown-signal handler (`src/shutdown_signal/`: Ctrl+C everywhere, plus SIGTERM on Unix — what systemd, Docker and the HA app's s6 send) cancels the global token (cameras, RTSP, watchdog, startup-wake); each per-camera teardown publishes its final `connection_state = false`; only after `orchestrator.run().await` returns does `main()` cancel a separate `mqtt_cancel: CancellationToken` and await the event-loop task with a 2 s timeout against a wedged broker.
+The MQTT event loop is the **last subsystem to shut down**. The shutdown fan-out first seals HA discovery (`DiscoveryPublisher::seal`: in-flight publishes finish, later ones are no-ops), then publishes `disconnected` per camera and unpublishes discovery, so no post-connect or `query/ptz/preset` publish re-creates a deleted entity. The shutdown-signal handler (`src/shutdown_signal/`: Ctrl+C everywhere, plus SIGTERM on Unix — what systemd, Docker and the HA app's s6 send) cancels the global token (cameras, RTSP, watchdog, startup-wake); each per-camera teardown publishes its final `connection_state = false`; only after `orchestrator.run().await` returns does `main()` cancel a separate `mqtt_cancel: CancellationToken` and await the event-loop task with a 2 s timeout against a wedged broker; the loop's exit aborts any ConnAck handling still in flight.
 
 Without the separate token, per-camera teardown races the event-loop exit and hits `Failed to send mqtt requests to eventloop`.
 

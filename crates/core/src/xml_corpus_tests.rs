@@ -71,7 +71,8 @@ fn xml_corpus_snapshots() {
 	files.sort();
 	assert!(!files.is_empty(), "no *.xml files in {dir:?}");
 
-	let mut changed = Vec::new();
+	let mut missing = Vec::new();
+	let mut differs = Vec::new();
 	for path in &files {
 		let xml = std::fs::read(path).expect("read corpus file");
 		let actual = render(&xml);
@@ -80,20 +81,25 @@ fn xml_corpus_snapshots() {
 			std::fs::write(&snap, &actual).expect("write snapshot");
 			continue;
 		}
-		match std::fs::read_to_string(&snap) {
-			Ok(expected) if expected == actual => {}
-			_ => {
-				std::fs::write(path.with_extension("xml.snap.new"), &actual)
-					.expect("write new snapshot");
-				changed.push(path.display().to_string());
-			}
-		}
+		let group = match std::fs::read_to_string(&snap) {
+			Ok(expected) if expected == actual => continue,
+			Ok(_) => &mut differs,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => &mut missing,
+			Err(e) => panic!("read snapshot {}: {e}", snap.display()),
+		};
+		std::fs::write(path.with_extension("xml.snap.new"), &actual).expect("write new snapshot");
+		group.push(path.display().to_string());
 	}
 	assert!(
-		changed.is_empty(),
-		"{} of {} snapshots changed (see *.xml.snap.new):\n{}",
-		changed.len(),
+		missing.is_empty() && differs.is_empty(),
+		"{} of {} files failed (see *.xml.snap.new)\n\
+		 no snapshot yet (run with BAIRELAY_XML_CORPUS_BLESS=1): {}\n{}\n\
+		 snapshot differs: {}\n{}",
+		missing.len() + differs.len(),
 		files.len(),
-		changed.join("\n")
+		missing.len(),
+		missing.join("\n"),
+		differs.len(),
+		differs.join("\n")
 	);
 }

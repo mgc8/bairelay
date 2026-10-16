@@ -2,20 +2,27 @@
 //! event branch table can be unit-tested without spinning up a real
 //! broker + `rumqttc::EventLoop`.
 //!
-//! The production `run_mqtt_event_loop` in `main.rs` is a thin wrapper
-//! around [`classify_event`] + a pair of side-effect helpers. Tests
-//! drive the classifier on every rumqttc event shape and drive the
-//! subscribe / discovery-republish helpers against captured `mock_client`
-//! sinks and FakeCamera-backed `CameraHandle` maps.
+//! [`run_event_loop`] is the production loop `main.rs` spawns, generic
+//! over an [`EventSource`] so tests feed it scripted events. It wraps
+//! [`classify_event`] + a pair of side-effect helpers. Tests drive the
+//! classifier on every rumqttc event shape, the loop over scripted
+//! events, and the subscribe / discovery-republish helpers against
+//! captured `mock_client` sinks and FakeCamera-backed `CameraHandle`
+//! maps.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bairelay_mqtt::{Event, Packet, SharedMqttClient, StatusPublisher};
+use bairelay_mqtt::{
+	parse_control_message, ConnectionError, Event, MqttEventLoop, Packet, SharedMqttClient,
+	StatusPublisher,
+};
+use tokio_util::sync::CancellationToken;
 
 use crate::camera::CameraHandle;
 use crate::config::Config;
+use crate::mqtt_dispatch::dispatch_control;
 
 /// Resolve the MQTT topic prefix from config, defaulting to
 /// `"bairelay"` when MQTT is disabled entirely. Centralised so the
@@ -70,7 +77,8 @@ pub fn build_broker_config(config: &Config) -> anyhow::Result<Option<bairelay_mq
 	}))
 }
 
-/// Publish "disconnected" availability for every camera, then
+/// Seal HA discovery (in-flight publishes finish, later ones are
+/// no-ops), publish "disconnected" availability for every camera, then
 /// unpublish HA discovery config for cameras whose `CameraHandle`
 /// had one attached. Wrapped under a 2 s hard timeout by the caller.
 /// Returns nothing — per-camera errors are logged and elided so a
@@ -81,6 +89,9 @@ pub async fn publish_shutdown_fanout(
 	mqtt: &SharedMqttClient,
 	topic_prefix: &str,
 ) {
+	for cam in cameras.values() {
+		cam.seal_discovery().await;
+	}
 	for name in camera_names {
 		let publisher = StatusPublisher::new(mqtt, topic_prefix, name);
 		let _ = publisher.publish_connection(false).await;
@@ -289,6 +300,138 @@ pub async fn handle_connack(
 				error = %e,
 				"Failed to re-publish cached MQTT status on ConnAck"
 			);
+		}
+	}
+}
+
+/// A source of MQTT events: the broker connection in production, a
+/// scripted channel in tests.
+pub trait EventSource {
+	type Error: std::fmt::Display;
+	/// The next event, as `rumqttc::EventLoop::poll` yields it.
+	fn poll(&mut self) -> impl std::future::Future<Output = Result<Event, Self::Error>> + Send;
+}
+
+impl EventSource for MqttEventLoop {
+	type Error = ConnectionError;
+	fn poll(&mut self) -> impl std::future::Future<Output = Result<Event, Self::Error>> + Send {
+		MqttEventLoop::poll(self)
+	}
+}
+
+/// The in-flight [`handle_connack`] run. Its publishes wait on slots
+/// in the rumqttc request channel, which only the event loop's `poll`
+/// drains, so it runs on its own task while the loop keeps polling.
+/// A newer ConnAck supersedes it; dropping it aborts it. Once `stop`
+/// fires (shutdown has begun), a run in flight ends and no new run
+/// starts, so a reconnect can't re-create the HA entities the shutdown
+/// fan-out deletes.
+pub(crate) struct ConnAckTask {
+	run: Option<tokio::task::JoinHandle<()>>,
+	stop: CancellationToken,
+}
+
+impl ConnAckTask {
+	pub(crate) fn new(stop: CancellationToken) -> Self {
+		Self { run: None, stop }
+	}
+
+	/// Abort the previous run, if any, and start one for a new ConnAck,
+	/// unless `stop` has fired.
+	pub(crate) fn restart(
+		&mut self,
+		cameras: &Arc<HashMap<String, Arc<CameraHandle>>>,
+		mqtt: &SharedMqttClient,
+		topic_prefix: &str,
+	) {
+		self.abort();
+		if self.stop.is_cancelled() {
+			tracing::debug!("MQTT ConnAck during shutdown; skipping resubscribe and republish");
+			return;
+		}
+		let (cameras, mqtt, prefix) = (Arc::clone(cameras), mqtt.clone(), topic_prefix.to_string());
+		let stop = self.stop.clone();
+		self.run = Some(tokio::spawn(async move {
+			// Biased: a run first polled after `stop` fired must not
+			// start, and one poll of `handle_connack` can run it whole.
+			tokio::select! {
+				biased;
+				_ = stop.cancelled() => {}
+				_ = handle_connack(&cameras, &mqtt, &prefix) => {}
+			}
+		}));
+	}
+
+	/// Abort the in-flight run, if any.
+	pub(crate) fn abort(&mut self) {
+		if let Some(task) = self.run.take() {
+			task.abort();
+		}
+	}
+}
+
+impl Drop for ConnAckTask {
+	fn drop(&mut self) {
+		self.abort();
+	}
+}
+
+/// Drive the MQTT event loop until `cancel` fires: dispatch control
+/// publishes, start ConnAck handling (see [`ConnAckTask`]), and pace
+/// reconnects on errors. Exiting aborts a ConnAck run still in flight.
+/// `shutdown` stops ConnAck handling only; the loop keeps polling until
+/// `cancel`, so the cameras' final publishes still reach the broker.
+pub async fn run_event_loop<S: EventSource>(
+	mut event_loop: S,
+	cameras: Arc<HashMap<String, Arc<CameraHandle>>>,
+	mqtt: SharedMqttClient,
+	topic_prefix: String,
+	cancel: CancellationToken,
+	shutdown: CancellationToken,
+) {
+	let mut backoff = MqttBackoff::new();
+	let mut connack = ConnAckTask::new(shutdown);
+	loop {
+		tokio::select! {
+			_ = cancel.cancelled() => break,
+			event = event_loop.poll() => {
+				match classify_event(&event) {
+					EventAction::Publish { topic, payload } => {
+						backoff.reset();
+						let payload_str = String::from_utf8_lossy(payload);
+						tracing::debug!(topic = %topic, payload = %payload_str, "MQTT message received");
+						if let Some(cmd) = parse_control_message(&topic_prefix, topic, payload) {
+							let cameras = Arc::clone(&cameras);
+							let mqtt = mqtt.clone();
+							let prefix = topic_prefix.clone();
+							tokio::spawn(async move {
+								dispatch_control(cmd, &cameras, &mqtt, &prefix).await;
+							});
+						}
+					}
+					EventAction::ConnAck => {
+						backoff.reset();
+						connack.restart(&cameras, &mqtt, &topic_prefix);
+					}
+					EventAction::LogError => {
+						// `rumqttc::EventLoop::poll()` returns errors with
+						// no internal pacing — without our own backoff, a
+						// missing broker produces hundreds of identical
+						// "Connection refused" warnings per second.
+						if let Err(ref e) = event {
+							let msg = e.to_string();
+							let (delay, should_log) = backoff.record_error(&msg);
+							if should_log {
+								tracing::warn!(error = %msg, "MQTT event loop error; retrying with backoff");
+							}
+							if !crate::run_support::sleep_or_cancel(delay, &cancel).await {
+								break;
+							}
+						}
+					}
+					EventAction::Ignore => {}
+				}
+			}
 		}
 	}
 }
@@ -604,5 +747,270 @@ mod tests {
 		// `capabilities().is_none() → continue` arm. No assertion
 		// needed: coverage is the entire point.
 		handle_connack(&cameras, &mqtt, "bairelay").await;
+	}
+
+	// ── run_event_loop ──────────────────────────────────────────────
+
+	type Polls = Arc<std::sync::atomic::AtomicUsize>;
+
+	/// Events fed from a channel; counts `poll` calls. Pends forever once
+	/// the script runs dry.
+	struct ScriptedEvents {
+		rx: tokio::sync::mpsc::UnboundedReceiver<Result<Event, &'static str>>,
+		polls: Polls,
+	}
+
+	impl EventSource for ScriptedEvents {
+		type Error = &'static str;
+		fn poll(&mut self) -> impl std::future::Future<Output = Result<Event, Self::Error>> + Send {
+			self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			async move {
+				match self.rx.recv().await {
+					Some(event) => event,
+					None => std::future::pending().await,
+				}
+			}
+		}
+	}
+
+	/// `run_event_loop` over a scripted source, with one
+	/// [`connack_camera`], so its ConnAck replay can wait on the AI
+	/// publish lock.
+	struct LoopRig {
+		tx: tokio::sync::mpsc::UnboundedSender<Result<Event, &'static str>>,
+		polls: Polls,
+		cam: Arc<CameraHandle>,
+		mock: bairelay_mqtt::test_support::MockHandle,
+		cancel: CancellationToken,
+		shutdown: CancellationToken,
+		task: tokio::task::JoinHandle<()>,
+	}
+
+	/// Camera `cam1` with caps and a motion-only discovery publisher on
+	/// `mqtt`, whose status cache holds a vehicle detection: its ConnAck
+	/// handling publishes discovery and replays five AI states.
+	fn connack_camera(mqtt: &SharedMqttClient) -> Arc<CameraHandle> {
+		use crate::config::test_helpers::minimal_camera_config;
+		use bairelay_neolink_core::bc_protocol::AiObject;
+
+		let discovery = bairelay_mqtt::DiscoveryPublisher::new(
+			mqtt.clone(),
+			"bairelay".to_string(),
+			"homeassistant".to_string(),
+			[bairelay_mqtt::discovery::Feature::Motion].into(),
+			"test".to_string(),
+		);
+		let cam = Arc::new(
+			CameraHandle::new(
+				minimal_camera_config("cam1"),
+				CancellationToken::new(),
+				Some(mqtt.clone()),
+			)
+			.with_discovery_publisher(discovery),
+		);
+		cam.set_capabilities_for_test(Default::default());
+		cam.status_cache()
+			.set_ai_objects([AiObject::Vehicle].into_iter().collect());
+		cam
+	}
+
+	impl LoopRig {
+		fn spawn() -> Self {
+			let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+			let cam = connack_camera(&mqtt);
+			let mut cameras = HashMap::new();
+			cameras.insert("cam1".to_string(), Arc::clone(&cam));
+			let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+			let polls = Polls::default();
+			let source = ScriptedEvents {
+				rx,
+				polls: Arc::clone(&polls),
+			};
+			let cancel = CancellationToken::new();
+			let shutdown = CancellationToken::new();
+			let task = tokio::spawn(run_event_loop(
+				source,
+				Arc::new(cameras),
+				mqtt,
+				"bairelay".to_string(),
+				cancel.clone(),
+				shutdown.clone(),
+			));
+			Self {
+				tx,
+				polls,
+				cam,
+				mock,
+				cancel,
+				shutdown,
+				task,
+			}
+		}
+
+		/// Wait (bounded) until the loop has called `poll` `n` times.
+		async fn await_polls(&self, n: usize, why: &str) {
+			tokio::time::timeout(Duration::from_secs(1), async {
+				while self.polls.load(std::sync::atomic::Ordering::SeqCst) < n {
+					tokio::time::sleep(Duration::from_millis(1)).await;
+				}
+			})
+			.await
+			.unwrap_or_else(|_| panic!("{why}"));
+		}
+
+		fn publishes_under(&self, prefix: &str) -> usize {
+			self.mock
+				.published_topics()
+				.iter()
+				.filter(|t| t.starts_with(prefix))
+				.count()
+		}
+
+		fn ai_publishes(&self) -> usize {
+			self.publishes_under("bairelay/cam1/status/ai/")
+		}
+
+		fn discovery_publishes(&self) -> usize {
+			self.publishes_under("homeassistant/")
+		}
+
+		async fn stop(self) {
+			self.cancel.cancel();
+			tokio::time::timeout(Duration::from_secs(1), self.task)
+				.await
+				.expect("event loop must exit promptly on cancel")
+				.unwrap();
+		}
+	}
+
+	/// ConnAck handling that waits on the AI publish lock (a motion
+	/// listener blocked on a full request channel) leaves the loop
+	/// polling, so the channel keeps draining and the lock frees.
+	#[tokio::test(start_paused = true)]
+	async fn event_loop_keeps_polling_while_connack_handling_waits() {
+		let rig = LoopRig::spawn();
+		let cache = rig.cam.status_cache();
+		let guard = cache.lock_ai_publish().await;
+
+		rig.tx.send(connack_event()).unwrap();
+		rig.await_polls(2, "event loop must poll again while ConnAck handling waits")
+			.await;
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		assert!(
+			rig.discovery_publishes() > 0,
+			"ConnAck republishes discovery"
+		);
+
+		drop(guard);
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		assert_eq!(
+			rig.ai_publishes(),
+			5,
+			"replay completes once the lock frees"
+		);
+		rig.stop().await;
+	}
+
+	/// A new ConnAck aborts the previous, still-waiting handler: one
+	/// replay runs, not two.
+	#[tokio::test(start_paused = true)]
+	async fn event_loop_new_connack_aborts_previous_handler() {
+		let rig = LoopRig::spawn();
+		let cache = rig.cam.status_cache();
+		let guard = cache.lock_ai_publish().await;
+
+		rig.tx.send(connack_event()).unwrap();
+		rig.tx.send(connack_event()).unwrap();
+		rig.await_polls(3, "event loop must take both ConnAcks")
+			.await;
+
+		drop(guard);
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		assert_eq!(rig.ai_publishes(), 5, "only the latest ConnAck replays");
+		rig.stop().await;
+	}
+
+	/// Cancel exits the loop promptly while ConnAck handling waits, and
+	/// the abandoned handler is aborted.
+	#[tokio::test(start_paused = true)]
+	async fn event_loop_exit_aborts_pending_connack_handler() {
+		let rig = LoopRig::spawn();
+		let cache = rig.cam.status_cache();
+		let guard = cache.lock_ai_publish().await;
+
+		rig.tx.send(connack_event()).unwrap();
+		rig.await_polls(2, "ConnAck consumed").await;
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		assert_eq!(rig.ai_publishes(), 0, "handler waits on the lock");
+		let mock = rig.mock.clone();
+		rig.stop().await;
+
+		drop(guard);
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		let ai = mock
+			.published_topics()
+			.into_iter()
+			.filter(|t| t.starts_with("bairelay/cam1/status/ai/"))
+			.count();
+		assert_eq!(ai, 0, "aborted handler must not replay");
+	}
+
+	/// Once global shutdown starts, a ConnAck neither republishes
+	/// discovery nor replays status, and the loop keeps polling until
+	/// its own cancel.
+	#[tokio::test(start_paused = true)]
+	async fn event_loop_ignores_connack_after_shutdown() {
+		let rig = LoopRig::spawn();
+		rig.shutdown.cancel();
+
+		rig.tx.send(connack_event()).unwrap();
+		rig.tx.send(pingresp_event()).unwrap();
+		rig.await_polls(3, "event loop keeps polling after shutdown")
+			.await;
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		assert_eq!(rig.discovery_publishes(), 0, "no discovery after shutdown");
+		assert_eq!(rig.ai_publishes(), 0, "no status replay after shutdown");
+		rig.stop().await;
+	}
+
+	/// Shutdown aborts a ConnAck run already in flight.
+	#[tokio::test(start_paused = true)]
+	async fn event_loop_shutdown_aborts_in_flight_connack_handler() {
+		let rig = LoopRig::spawn();
+		let cache = rig.cam.status_cache();
+		let guard = cache.lock_ai_publish().await;
+
+		rig.tx.send(connack_event()).unwrap();
+		rig.await_polls(2, "ConnAck consumed").await;
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		assert_eq!(rig.ai_publishes(), 0, "handler waits on the lock");
+
+		rig.shutdown.cancel();
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		drop(guard);
+		tokio::time::sleep(Duration::from_millis(10)).await;
+		assert_eq!(rig.ai_publishes(), 0, "aborted handler must not replay");
+		rig.stop().await;
+	}
+
+	/// A ConnAck run first polled after `stop` fired does nothing: the
+	/// stop arm wins even though `handle_connack` could finish in that
+	/// one poll. Repeated so an unbiased pick can't pass by chance.
+	#[tokio::test]
+	async fn connack_run_polled_after_stop_does_not_run() {
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cameras = Arc::new(HashMap::from([("cam1".to_string(), connack_camera(&mqtt))]));
+		for _ in 0..32 {
+			let stop = CancellationToken::new();
+			let mut connack = ConnAckTask::new(stop.clone());
+			connack.restart(&cameras, &mqtt, "bairelay");
+			stop.cancel();
+			let run = connack.run.take().expect("precondition: run spawned");
+			tokio::time::timeout(Duration::from_secs(1), run)
+				.await
+				.expect("run ends")
+				.unwrap();
+		}
+		assert_eq!(mock.count(), 0, "no ConnAck publishes after stop");
 	}
 }

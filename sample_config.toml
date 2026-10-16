@@ -48,7 +48,7 @@ bind = "0.0.0.0"
 # topic = "homeassistant"
 # features = [
 #     "floodlight", "camera", "motion", "led", "ir",
-#     "reboot", "pt", "battery", "siren",
+#     "reboot", "pt", "battery", "siren", "ai", "doorbell",
 # ]
 
 
@@ -94,7 +94,7 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 # debug = false               # trace-dump decrypted protocol payloads; logs credential hashes
 
 # [cameras.mqtt]
-# enable_motion     = true
+# enable_motion     = true    # also carries AI objects + doorbell presses
 # enable_light      = true    # status LED
 # enable_battery    = true    # false for mains-powered models (no battery)
 # battery_update    = 2000    # ms, min 500

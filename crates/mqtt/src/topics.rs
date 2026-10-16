@@ -6,6 +6,8 @@
 //! deployment). Every helper is a pure function of `(prefix, cam)` —
 //! no global state, no hidden defaults.
 
+use crate::ai::AiObject;
+
 // ── Status topics ──────────────────────────────────────────────────────
 
 /// Camera online/offline status: `{prefix}/{cam}/status`
@@ -56,6 +58,17 @@ pub fn status_ir(prefix: &str, cam: &str) -> String {
 /// Status LED on/off: `{prefix}/{cam}/status/led`
 pub fn status_led(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/status/led")
+}
+
+/// AI detection state of one object class:
+/// `{prefix}/{cam}/status/ai/{object}`
+pub fn status_ai(prefix: &str, cam: &str, object: AiObject) -> String {
+	format!("{prefix}/{cam}/status/ai/{}", object.topic_name())
+}
+
+/// Doorbell button press events: `{prefix}/{cam}/status/doorbell`
+pub fn status_doorbell(prefix: &str, cam: &str) -> String {
+	format!("{prefix}/{cam}/status/doorbell")
 }
 
 /// PTZ preset position: `{prefix}/{cam}/status/ptz/preset`

@@ -7,17 +7,17 @@ configuration:
     description: Set "debug" to see protocol-level traces, "trace" for per-packet detail. Leave at "info" unless troubleshooting.
   cameras:
     name: Cameras
-    description: One entry per camera. Fill in either an Address (LAN-direct connect) or a UID (Reolink P2P). Username and password are the camera's account credentials.
+    description: One entry per camera. Fill in an Address (LAN-direct connect), a UID (Reolink P2P), or both: the Address is tried first, then UID discovery. Username and password are the camera's account credentials.
     fields:
       name:
         name: Name
         description: Alphanumeric, underscore, or hyphen. Used as the camera's MQTT topic segment and Home Assistant entity name.
       address:
         name: Address
-        description: LAN IP or hostname of the camera, e.g. "192.168.1.50". Leave blank if using a UID.
+        description: LAN IP or hostname of the camera, e.g. "192.168.1.50". Tried first; UID discovery is the fallback when a UID is also set.
       uid:
         name: UID
-        description: Reolink P2P UID (16 alphanumeric characters). Leave blank if using an Address.
+        description: Reolink P2P UID (16 alphanumeric characters). Used for discovery when the Address is blank or fails.
       username:
         name: Username
         description: Camera account username. Defaults to "admin" (Reolink's stock account).

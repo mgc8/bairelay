@@ -21,6 +21,8 @@
 //! builders are pure — no I/O, no async — so the discovery publisher
 //! (Task 11) can test its topic set without a broker.
 
+use crate::ai::AiObject;
+use crate::topics;
 use serde::{Deserialize, Serialize, Serializer};
 
 pub mod publisher;
@@ -54,12 +56,14 @@ pub enum Feature {
 	Battery,
 	Siren,
 	Pir,
+	Ai,
+	Doorbell,
 }
 
 impl Feature {
 	/// Full set of features emitted when `[mqtt.discovery]` is
 	/// present and no explicit `features = [...]` list is supplied.
-	pub const ALL: [Feature; 11] = [
+	pub const ALL: [Feature; 13] = [
 		Feature::Floodlight,
 		Feature::Camera,
 		Feature::Motion,
@@ -71,6 +75,8 @@ impl Feature {
 		Feature::Battery,
 		Feature::Siren,
 		Feature::Pir,
+		Feature::Ai,
+		Feature::Doorbell,
 	];
 }
 
@@ -86,6 +92,41 @@ pub struct CameraCapabilitiesView {
 	pub status_led: Presence,
 	/// IR night-vision LEDs — gates the IR select.
 	pub ir_leds: Presence,
+	/// Per-object AI detection — gates the person/vehicle/animal
+	/// binary sensors (and, with `doorbell`, face/package).
+	pub ai: Presence,
+	/// Doorbell button — gates the press event entity and the
+	/// doorbell-only AI sensors (face, package).
+	pub doorbell: Presence,
+}
+
+impl CameraCapabilitiesView {
+	/// Whether discovery emits `object`'s entity: `ai` is not absent
+	/// and, for the doorbell-only objects, `doorbell` is present. Not
+	/// the inverse of [`Self::retracts_ai_object`]: an unknown
+	/// `doorbell` neither emits nor retracts face/package.
+	pub fn emits_ai_object(&self, object: AiObject) -> bool {
+		!self.ai.is_absent() && (!object.is_doorbell_only() || self.doorbell.is_present())
+	}
+
+	/// Copy with every `Unknown` presence read as `Present`: the
+	/// entity set that could exist once the unknowns resolve.
+	pub fn unknown_as_present(&self) -> Self {
+		Self {
+			has_ptz: self.has_ptz,
+			status_led: self.status_led.unknown_as_present(),
+			ir_leds: self.ir_leds.unknown_as_present(),
+			ai: self.ai.unknown_as_present(),
+			doorbell: self.doorbell.unknown_as_present(),
+		}
+	}
+
+	/// Whether discovery retracts `object`'s entity and status topic:
+	/// every object when `ai` is absent, and the doorbell-only objects
+	/// when `doorbell` is absent.
+	pub fn retracts_ai_object(&self, object: AiObject) -> bool {
+		self.ai.is_absent() || (object.is_doorbell_only() && self.doorbell.is_absent())
+	}
 }
 
 /// Whether a camera has a piece of optional hardware. `Unknown` when
@@ -107,6 +148,14 @@ impl Presence {
 			Some(true) => Presence::Present,
 			Some(false) => Presence::Absent,
 			None => Presence::Unknown,
+		}
+	}
+	/// `Unknown` read as `Present`; `Present` and `Absent` unchanged.
+	pub fn unknown_as_present(self) -> Self {
+		if self == Presence::Unknown {
+			Presence::Present
+		} else {
+			self
 		}
 	}
 	pub fn is_present(self) -> bool {
@@ -242,12 +291,28 @@ pub struct DiscoveryBinarySensor {
 	pub name: String,
 	pub unique_id: String,
 	#[serde(skip_serializing_if = "Option::is_none")]
+	pub device_class: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub icon: Option<String>,
 	pub device: DiscoveryDevice,
 	pub availability: DiscoveryAvailability,
 	pub payload_off: String,
 	pub payload_on: String,
 	pub state_topic: String,
+}
+
+/// HA MQTT `event` entity (doorbell press).
+#[derive(Serialize, Debug)]
+pub struct DiscoveryEvent {
+	pub name: String,
+	pub unique_id: String,
+	pub device_class: String,
+	pub icon: String,
+	pub device: DiscoveryDevice,
+	pub availability: DiscoveryAvailability,
+	pub event_types: Vec<String>,
+	pub state_topic: String,
+	pub value_template: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -450,6 +515,7 @@ pub fn build_motion(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let payload = DiscoveryBinarySensor {
 		name: format!("{friendly} MD"),
 		unique_id: unique_id.clone(),
+		device_class: None,
 		icon: Some("mdi:motion-sensor".to_string()),
 		device: device_block(ctx, &friendly),
 		availability: availability_block(ctx),
@@ -493,7 +559,81 @@ pub fn absent_hardware_retractions(ctx: &DiscoveryContext) -> Vec<String> {
 		out.push(ir_ids(ctx).1);
 		out.push(cam_topic(ctx, "status", "ir"));
 	}
+	let caps = ctx.capabilities;
+	if caps.doorbell.is_absent() {
+		out.push(doorbell_ids(ctx).1);
+	}
+	for object in AiObject::ALL {
+		if caps.retracts_ai_object(object) {
+			out.push(ai_ids(ctx, object).1);
+			out.push(topics::status_ai(ctx.topic_prefix, ctx.camera_name, object));
+		}
+	}
 	out
+}
+
+/// `(unique_id, config topic)` of the doorbell press event.
+fn doorbell_ids(ctx: &DiscoveryContext) -> (String, String) {
+	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "doorbell");
+	let topic = config_topic(ctx, "event", &unique_id);
+	(unique_id, topic)
+}
+
+/// `(unique_id, config topic)` of one AI object binary sensor.
+fn ai_ids(ctx: &DiscoveryContext, object: AiObject) -> (String, String) {
+	let suffix = format!("ai_{}", object.topic_name());
+	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, &suffix);
+	let topic = config_topic(ctx, "binary_sensor", &unique_id);
+	(unique_id, topic)
+}
+
+/// `binary_sensor` entities for the per-object AI detections. Person,
+/// vehicle and animal are emitted unless `ai` is absent; face and
+/// package additionally need `doorbell` present.
+pub fn build_ai_binary_sensors(ctx: &DiscoveryContext) -> Vec<(String, Vec<u8>)> {
+	let caps = ctx.capabilities;
+	let friendly = title_case(ctx.camera_name);
+	AiObject::ALL
+		.into_iter()
+		.filter(|&o| caps.emits_ai_object(o))
+		.map(|object| {
+			let (unique_id, topic) = ai_ids(ctx, object);
+			let payload = DiscoveryBinarySensor {
+				name: format!("{friendly} {}", object.display_name()),
+				unique_id,
+				device_class: Some(object.device_class().to_string()),
+				icon: Some(object.icon().to_string()),
+				device: device_block(ctx, &friendly),
+				availability: availability_block(ctx),
+				payload_off: "off".to_string(),
+				payload_on: "on".to_string(),
+				state_topic: topics::status_ai(ctx.topic_prefix, ctx.camera_name, object),
+			};
+			(topic, to_json(&payload))
+		})
+		.collect()
+}
+
+/// `event` entity firing on each doorbell button press. The plain
+/// `press` payload is wrapped into the JSON HA's event platform expects.
+pub fn build_doorbell(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
+	if ctx.capabilities.doorbell.is_absent() {
+		return None;
+	}
+	let friendly = title_case(ctx.camera_name);
+	let (unique_id, topic) = doorbell_ids(ctx);
+	let payload = DiscoveryEvent {
+		name: format!("{friendly} Doorbell"),
+		unique_id,
+		device_class: "doorbell".to_string(),
+		icon: "mdi:doorbell".to_string(),
+		device: device_block(ctx, &friendly),
+		availability: availability_block(ctx),
+		event_types: vec!["press".to_string()],
+		state_topic: topics::status_doorbell(ctx.topic_prefix, ctx.camera_name),
+		value_template: r#"{"event_type":"{{ value }}"}"#.to_string(),
+	};
+	Some((topic, to_json(&payload)))
 }
 
 /// `switch` entity driving the status LED. State mirrors the
@@ -761,13 +901,15 @@ mod tests {
 				| Feature::PtPreset
 				| Feature::Battery
 				| Feature::Siren
-				| Feature::Pir => {}
+				| Feature::Pir
+				| Feature::Ai
+				| Feature::Doorbell => {}
 			}
 		}
 		for f in Feature::ALL {
 			touch(f);
 		}
-		assert_eq!(Feature::ALL.len(), 11);
+		assert_eq!(Feature::ALL.len(), 13);
 	}
 
 	#[test]
@@ -802,6 +944,7 @@ mod tests {
 			has_ptz: true,
 			status_led: Presence::Present,
 			ir_leds: Presence::Present,
+			..Default::default()
 		};
 		let ctx = f.ctx(&caps);
 		let emitted = build_pt_buttons(&ctx);
@@ -829,6 +972,7 @@ mod tests {
 			has_ptz: false,
 			status_led: Presence::Present,
 			ir_leds: Presence::Present,
+			..Default::default()
 		};
 		let ctx = f.ctx(&caps);
 		assert!(build_pt_buttons(&ctx).is_empty());
@@ -887,6 +1031,7 @@ mod tests {
 			has_ptz: true,
 			status_led: Presence::Present,
 			ir_leds: Presence::Present,
+			..Default::default()
 		};
 		let presets: Vec<(u8, String)> = vec![(1, "Home".to_string()), (2, "Sky".to_string())];
 		let ctx = DiscoveryContext {
@@ -976,6 +1121,225 @@ mod tests {
 		);
 		// Unknown never retracts: a failed probe must not delete entities.
 		assert!(absent_hardware_retractions(&f.ctx(&caps(Unknown, Unknown))).is_empty());
+	}
+
+	fn ai_caps(ai: Presence, doorbell: Presence) -> CameraCapabilitiesView {
+		CameraCapabilitiesView {
+			ai,
+			doorbell,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn retracts_ai_object_table() {
+		use Presence::*;
+		let retracted = |ai, doorbell| -> Vec<&str> {
+			AiObject::ALL
+				.into_iter()
+				.filter(|&o| ai_caps(ai, doorbell).retracts_ai_object(o))
+				.map(AiObject::topic_name)
+				.collect()
+		};
+		let all = ["person", "vehicle", "animal", "face", "package"];
+		assert_eq!(retracted(Present, Absent), ["face", "package"]);
+		assert!(retracted(Present, Present).is_empty());
+		assert!(retracted(Present, Unknown).is_empty());
+		assert!(retracted(Unknown, Unknown).is_empty());
+		assert_eq!(retracted(Unknown, Absent), ["face", "package"]);
+		assert_eq!(retracted(Absent, Present), all);
+		assert_eq!(retracted(Absent, Unknown), all);
+	}
+
+	#[test]
+	fn emits_ai_object_table() {
+		use Presence::*;
+		let emitted = |ai, doorbell| -> Vec<&str> {
+			AiObject::ALL
+				.into_iter()
+				.filter(|&o| ai_caps(ai, doorbell).emits_ai_object(o))
+				.map(AiObject::topic_name)
+				.collect()
+		};
+		let base = ["person", "vehicle", "animal"];
+		let all = ["person", "vehicle", "animal", "face", "package"];
+		assert_eq!(emitted(Present, Present), all);
+		assert_eq!(emitted(Unknown, Present), all);
+		assert_eq!(emitted(Present, Unknown), base);
+		assert_eq!(emitted(Present, Absent), base);
+		assert_eq!(emitted(Unknown, Unknown), base);
+		assert!(emitted(Absent, Present).is_empty());
+		assert!(emitted(Absent, Unknown).is_empty());
+	}
+
+	#[test]
+	fn unknown_as_present_lifts_only_unknown() {
+		use Presence::*;
+		let c = CameraCapabilitiesView {
+			has_ptz: true,
+			status_led: Unknown,
+			ir_leds: Absent,
+			ai: Unknown,
+			doorbell: Present,
+		}
+		.unknown_as_present();
+		assert!(c.has_ptz);
+		assert_eq!(
+			(c.status_led, c.ir_leds, c.ai, c.doorbell),
+			(Present, Absent, Present, Present)
+		);
+	}
+
+	fn ai_unique_ids(caps: &CameraCapabilitiesView) -> Vec<String> {
+		let f = Fixture::new("bairelay");
+		build_ai_binary_sensors(&f.ctx(caps))
+			.iter()
+			.map(|(_, p)| parse(p)["unique_id"].as_str().unwrap().to_string())
+			.collect()
+	}
+
+	#[test]
+	fn feature_parses_ai_and_doorbell() {
+		let ai: Feature = serde_json::from_str("\"ai\"").unwrap();
+		let db: Feature = serde_json::from_str("\"doorbell\"").unwrap();
+		assert_eq!((ai, db), (Feature::Ai, Feature::Doorbell));
+		assert!(Feature::ALL.contains(&Feature::Ai));
+		assert!(Feature::ALL.contains(&Feature::Doorbell));
+	}
+
+	#[test]
+	fn ai_sensor_payload_shape() {
+		let f = Fixture::new("bairelay");
+		let caps = ai_caps(Presence::Present, Presence::Present);
+		let sensors = build_ai_binary_sensors(&f.ctx(&caps));
+		let (topic, payload) = &sensors[0];
+		assert_eq!(
+			topic,
+			"homeassistant/binary_sensor/bairelay_frontdoor_ai_person/config"
+		);
+		let v = parse(payload);
+		assert_eq!(v["name"], "Frontdoor Person");
+		assert_eq!(v["unique_id"], "bairelay_frontdoor_ai_person");
+		assert_eq!(v["device_class"], "motion");
+		assert_eq!(v["icon"], "mdi:account");
+		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/ai/person");
+		assert_eq!(v["payload_on"], "on");
+		assert_eq!(v["payload_off"], "off");
+		let (_, motion) = build_motion(&f.ctx(&caps)).unwrap();
+		let m = parse(&motion);
+		assert_eq!(v["availability"], m["availability"]);
+		assert_eq!(v["device"], m["device"]);
+	}
+
+	#[test]
+	fn ai_sensor_classes_and_icons() {
+		let f = Fixture::new("bairelay");
+		let caps = ai_caps(Presence::Present, Presence::Present);
+		let got: Vec<_> = build_ai_binary_sensors(&f.ctx(&caps))
+			.iter()
+			.map(|(_, p)| {
+				let v = parse(p);
+				(
+					v["name"].as_str().unwrap().to_string(),
+					v["device_class"].as_str().unwrap().to_string(),
+					v["icon"].as_str().unwrap().to_string(),
+				)
+			})
+			.collect();
+		let expect = [
+			("Frontdoor Person", "motion", "mdi:account"),
+			("Frontdoor Vehicle", "motion", "mdi:car"),
+			("Frontdoor Animal", "motion", "mdi:paw"),
+			("Frontdoor Face", "motion", "mdi:face-recognition"),
+			(
+				"Frontdoor Package",
+				"presence",
+				"mdi:package-variant-closed",
+			),
+		];
+		assert_eq!(got.len(), 5);
+		for (g, e) in got.iter().zip(expect) {
+			assert_eq!((g.0.as_str(), g.1.as_str(), g.2.as_str()), e);
+		}
+	}
+
+	#[test]
+	fn ai_sensor_gating_by_presence() {
+		use Presence::*;
+		let base = |o: &str| format!("bairelay_frontdoor_ai_{o}");
+		let three = vec![base("person"), base("vehicle"), base("animal")];
+		let mut five = three.clone();
+		five.push(base("face"));
+		five.push(base("package"));
+		assert_eq!(ai_unique_ids(&ai_caps(Present, Present)), five);
+		assert_eq!(ai_unique_ids(&ai_caps(Present, Unknown)), three);
+		assert_eq!(ai_unique_ids(&ai_caps(Present, Absent)), three);
+		assert_eq!(ai_unique_ids(&ai_caps(Unknown, Unknown)), three);
+		assert_eq!(ai_unique_ids(&ai_caps(Unknown, Present)), five);
+		assert!(ai_unique_ids(&ai_caps(Absent, Present)).is_empty());
+		assert!(ai_unique_ids(&ai_caps(Absent, Unknown)).is_empty());
+	}
+
+	#[test]
+	fn doorbell_event_payload_and_gating() {
+		use Presence::*;
+		let f = Fixture::new("bairelay");
+		let caps = ai_caps(Unknown, Present);
+		let (topic, payload) = build_doorbell(&f.ctx(&caps)).expect("emitted");
+		assert_eq!(
+			topic,
+			"homeassistant/event/bairelay_frontdoor_doorbell/config"
+		);
+		let v = parse(&payload);
+		assert_eq!(v["name"], "Frontdoor Doorbell");
+		assert_eq!(v["unique_id"], "bairelay_frontdoor_doorbell");
+		assert_eq!(v["device_class"], "doorbell");
+		assert_eq!(v["event_types"], serde_json::json!(["press"]));
+		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/doorbell");
+		assert_eq!(v["value_template"], r#"{"event_type":"{{ value }}"}"#);
+		assert_eq!(v["icon"], "mdi:doorbell");
+		assert!(v.get("availability").is_some());
+		assert!(v.get("device").is_some());
+		assert!(build_doorbell(&f.ctx(&ai_caps(Unknown, Unknown))).is_some());
+		assert!(build_doorbell(&f.ctx(&ai_caps(Present, Absent))).is_none());
+	}
+
+	#[test]
+	fn ai_and_doorbell_retractions() {
+		use Presence::*;
+		let f = Fixture::new("bairelay");
+		let cfg = |o: &str| format!("homeassistant/binary_sensor/bairelay_frontdoor_ai_{o}/config");
+		let st = |o: &str| format!("bairelay/frontdoor/status/ai/{o}");
+		let door_cfg = "homeassistant/event/bairelay_frontdoor_doorbell/config".to_string();
+		let r = |a, d| absent_hardware_retractions(&f.ctx(&ai_caps(a, d)));
+		assert!(r(Present, Present).is_empty());
+		assert!(r(Unknown, Unknown).is_empty());
+		assert!(r(Present, Unknown).is_empty());
+		// Doorbell absent: doorbell entity + face/package only.
+		assert_eq!(
+			r(Present, Absent),
+			vec![
+				door_cfg.clone(),
+				cfg("face"),
+				st("face"),
+				cfg("package"),
+				st("package"),
+			]
+		);
+		// AI absent: all five objects, doorbell untouched.
+		let all_ai: Vec<String> = ["person", "vehicle", "animal", "face", "package"]
+			.iter()
+			.flat_map(|o| [cfg(o), st(o)])
+			.collect();
+		assert_eq!(r(Absent, Present), all_ai);
+		// Both absent: no duplicates.
+		let both = r(Absent, Absent);
+		assert_eq!(both.len(), all_ai.len() + 1);
+		assert!(both.contains(&door_cfg));
+		let mut dedup = both.clone();
+		dedup.sort();
+		dedup.dedup();
+		assert_eq!(dedup.len(), both.len());
 	}
 
 	#[test]

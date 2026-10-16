@@ -499,6 +499,49 @@ fn xml_device_info_tolerates_missing_resolution() {
 }
 
 #[test]
+fn xml_device_info_roundtrip_preserves_device_type() {
+	for device_type in ["smart_bell", "wifi_solo_ipc"] {
+		let xml = format!(
+			r#"<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<DeviceInfo version="1.1">
+		<type>{device_type}</type>
+		<resolution>
+		<resolutionName>2560*1920</resolutionName>
+		<width>2560</width>
+		<height>1920</height>
+		</resolution>
+		</DeviceInfo>
+		</body>"#
+		);
+		let parsed = assert_xml_roundtrip_via_bcxml(&xml);
+		let di = parsed.device_info.as_ref().unwrap();
+		assert_eq!(di.device_type.as_deref(), Some(device_type));
+	}
+}
+
+#[test]
+fn xml_device_info_missing_type_is_none_and_not_serialized() {
+	let xml = indoc!(
+		r#"
+		<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<DeviceInfo version="1.1">
+		<resolution>
+		<resolutionName>2560*1920</resolutionName>
+		<width>2560</width>
+		<height>1920</height>
+		</resolution>
+		</DeviceInfo>
+		</body>"#
+	);
+	let parsed = assert_xml_roundtrip_via_bcxml(xml);
+	assert!(parsed.device_info.as_ref().unwrap().device_type.is_none());
+	let out = parsed.serialize(vec![]).unwrap();
+	assert!(!String::from_utf8(out).unwrap().contains("<type>"));
+}
+
+#[test]
 fn xml_preview_roundtrip_preserves_stream_type() {
 	let xml = indoc!(
 		r#"
@@ -1603,6 +1646,48 @@ fn xml_support_item_roundtrip_preserves_common_flags() {
 	assert_eq!(it.battery, Some(1));
 	assert_eq!(it.ptz_preset, Some(1));
 	assert_eq!(it.h264_profile, Some(7));
+}
+
+#[test]
+fn xml_support_item_roundtrip_preserves_doorbell_version() {
+	let xml = indoc!(
+		r#"
+		<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<Support version="1.1">
+		<item>
+		<chnID>0</chnID>
+		<aitype>1</aitype>
+		<doorbellVersion>16</doorbellVersion>
+		</item>
+		</Support>
+		</body>"#
+	);
+	let parsed = assert_xml_roundtrip_via_bcxml(xml);
+	let it = &parsed.support.as_ref().unwrap().items[0];
+	assert_eq!(it.doorbell_version, Some(16));
+	assert_eq!(it.ai_type, Some(1));
+}
+
+#[test]
+fn xml_support_item_missing_doorbell_version_is_none_and_not_serialized() {
+	let xml = indoc!(
+		r#"
+		<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<Support version="1.1">
+		<item>
+		<chnID>0</chnID>
+		<battery>1</battery>
+		</item>
+		</Support>
+		</body>"#
+	);
+	let parsed = assert_xml_roundtrip_via_bcxml(xml);
+	let it = &parsed.support.as_ref().unwrap().items[0];
+	assert_eq!(it.doorbell_version, None);
+	let out = parsed.serialize(vec![]).unwrap();
+	assert!(!String::from_utf8(out).unwrap().contains("doorbellVersion"));
 }
 
 #[test]

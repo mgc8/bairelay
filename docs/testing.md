@@ -377,7 +377,7 @@ broker_addr = "127.0.0.1"
 [mqtt.discovery]
 topic = "homeassistant"        # HA's own discovery prefix (required)
 # features = ["floodlight", "camera", "motion", "led", "ir",
-#             "reboot", "pt", "battery", "siren"]   # default: all 9
+#             "reboot", "pt", "battery", "siren", "ai", "doorbell"]   # default: all
 ```
 
 Per camera, bairelay publishes a single HA device named after the camera (underscores → spaces, title-cased: `front_door` → `Front Door`). Entities per feature:
@@ -393,6 +393,8 @@ Per camera, bairelay publishes a single HA device named after the camera (unders
 | PT         | 4 × `button`                      | Only when camera reports PTZ support         |
 | Battery    | `sensor`                          | HA long-term-statistics fields               |
 | Siren      | `button`                          |                                              |
+| AI         | `binary_sensor` × 3 (5 on doorbells) | person / vehicle / animal; face / package need a doorbell; `status/ai/<object>`; `unique_id` suffix `_ai_<object>` |
+| Doorbell   | `event`                           | `device_class: doorbell`, event type `press`; `status/doorbell`; suffix `_doorbell` |
 
 PT buttons are gated on live capability detection via `BcCamera::get_support()` — no model-class guessing. If `get_support()` fails at connect (transient protocol error, mid-wake), bairelay leaves the cache empty and re-probes on the next reconnect.
 
@@ -598,7 +600,7 @@ If you don't have hardware, say so on the PR — a maintainer with cameras will 
 `crates/core/src/xml_corpus_tests.rs` is a snapshot harness over a directory of real camera XML payloads. It is dormant unless `BAIRELAY_XML_CORPUS=<dir>` is set. Each `<dir>/*.xml` is parsed with the production parser chosen by its root element (`<body>` → `BcXml`, `<Extension>` → `Extension`, `<P2P>` → `UdpXml`) and re-serialised; the parsed structure plus the outbound bytes form the snapshot, stored beside the file as `<name>.xml.snap`.
 
 - `BAIRELAY_XML_CORPUS=<dir>` — enables the test.
-- `BAIRELAY_XML_CORPUS_BLESS=1` — writes or refreshes the `.snap` files. Without it the test fails listing every file whose snapshot changed, and writes the new output as `<name>.xml.snap.new` beside the `.snap`.
+- `BAIRELAY_XML_CORPUS_BLESS` — when set, writes or refreshes the `.snap` files. Any value (including an empty one) blesses. Without it the test fails listing every file whose snapshot changed and, separately, every `.xml` that has no snapshot ("no snapshot"), and writes the new output as `<name>.xml.snap.new` beside the `.snap`.
 
 The corpus lives in `tests/logs/xml-corpus/` (git-ignored). It holds decrypted camera payloads, including credential hashes and UIDs, so it stays local and is never committed or shared.
 

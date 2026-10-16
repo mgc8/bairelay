@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use bairelay::bcmedia_dump::BcMediaDumpConfig;
-use bairelay::camera::CameraHandle;
 use bairelay::cli::{Cli, Command};
 use bairelay::cli_convert::{should_emit_ansi, verbosity_env_filter};
 use bairelay::config::{
@@ -16,21 +14,22 @@ use bairelay::config::{
 	warn_wire_debug_enabled,
 };
 use bairelay::local_time::LocalTimer;
-use bairelay::mqtt_dispatch::dispatch_control;
 use bairelay::mqtt_loop::{
-	build_broker_config, build_rtsp_users, classify_event, handle_connack, publish_shutdown_fanout,
-	resolve_topic_prefix, EventAction, MqttBackoff, SHUTDOWN_FANOUT_TIMEOUT,
+	build_broker_config, build_rtsp_users, publish_shutdown_fanout, resolve_topic_prefix,
+	run_event_loop, SHUTDOWN_FANOUT_TIMEOUT,
 };
 use bairelay::orchestrator::Orchestrator;
 use bairelay::run_support::{camera_names, load_validated_config};
 use bairelay::watchdog::Watchdog;
-use bairelay_mqtt::{parse_control_message, MqttEventLoop, SharedMqttClient};
 
 /// Concurrent-RTSP-connection cap. Picked an order of magnitude above
 /// realistic deployments (a handful of clients × a handful of cameras)
 /// while still bounded enough that a fork-bomb client can't exhaust
 /// file descriptors.
 const DEFAULT_MAX_RTSP_CONNECTIONS: usize = 256;
+
+/// Upper bound on runtime teardown after `async_main` returns.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 
 fn main() -> Result<()> {
 	// Capture the host's local UTC offset BEFORE tokio's worker pool
@@ -39,10 +38,15 @@ fn main() -> Result<()> {
 	// log timestamp formatter and the `set-time` one-shot.
 	bairelay::local_time::init();
 
-	tokio::runtime::Builder::new_multi_thread()
+	let rt = tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
-		.build()?
-		.block_on(async_main())
+		.build()?;
+	let result = rt.block_on(async_main());
+	// Bounded runtime teardown: a plain drop waits for blocking-pool
+	// threads, and a hung `getaddrinfo` (hostname `address`) would hold
+	// process exit until the resolver gives up.
+	rt.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+	result
 }
 
 async fn async_main() -> Result<()> {
@@ -255,6 +259,8 @@ async fn async_main() -> Result<()> {
 	// event loop.
 	//
 	// Shutdown order on a shutdown signal:
+	// 0. `connack_stop` fires: the MQTT event loop stops ConnAck handling and aborts a run in flight.
+	// 0b. Seal HA discovery (`DiscoveryPublisher::seal`): in-flight publishes finish, later ones are no-ops.
 	// 1. Publish "disconnected" availability per camera (HA sees the outage).
 	// 2. Unpublish HA discovery config topics (retained empty → HA deletes entities).
 	// 3. 200 ms flush pause so the event loop drains the retained writes.
@@ -265,8 +271,14 @@ async fn async_main() -> Result<()> {
 	// 5. After orchestrator.run() returns, main() cancels mqtt_cancel
 	//    and awaits the event-loop task with a 2 s guard. That's when
 	//    MQTT actually stops.
+	// Stops ConnAck handling in the MQTT event loop (no discovery
+	// republish, no status replay) from the moment shutdown starts, so
+	// a reconnect can't re-create the entities step 2 deletes. A child
+	// of the global token, so any global cancel stops it too.
+	let connack_stop = token.child_token();
 	{
 		let shutdown_token = token.clone();
+		let shutdown_connack_stop = connack_stop.clone();
 		let shutdown_mqtt = mqtt_shared.clone();
 		let shutdown_prefix = topic_prefix.clone();
 		let shutdown_cameras = orchestrator.cameras_arc();
@@ -277,14 +289,17 @@ async fn async_main() -> Result<()> {
 			bairelay::shutdown_signal::force_exit_on_next(
 				bairelay::oneshot::classify::EXIT_INTERRUPTED,
 			);
+			shutdown_connack_stop.cancel();
 
+			// 0b. Seal HA discovery so no post-connect or
+			//     `query/ptz/preset` publish re-creates an entity.
 			// 1. Publish "disconnected" while MQTT is still running.
 			// 2. Unpublish HA discovery so HA clears the Bairelay
 			//    device cards. Safe on cameras without a publisher
 			//    attached (no-op) and on cameras whose caps are
 			//    `None` (no-op — nothing was ever published for them).
 			//
-			// Both steps are wrapped in a 2-second hard timeout.
+			// All three steps are wrapped in a 2-second hard timeout.
 			// rumqttc's per-AsyncClient Request queue (256 slots) can
 			// saturate if the broker was already flapping when the signal
 			// fired; without this guard, `publish().await` can block
@@ -340,12 +355,13 @@ async fn async_main() -> Result<()> {
 		let cancel = mqtt_cancel.clone();
 		let prefix = topic_prefix.clone();
 		Some(tokio::spawn(async move {
-			run_mqtt_event_loop(
+			run_event_loop(
 				event_loop,
 				cameras_for_mqtt,
 				mqtt_for_dispatch,
 				prefix,
 				cancel,
+				connack_stop,
 			)
 			.await;
 		}))
@@ -611,57 +627,4 @@ async fn async_main() -> Result<()> {
 	info!("Shutdown complete");
 
 	Ok(())
-}
-
-async fn run_mqtt_event_loop(
-	mut event_loop: MqttEventLoop,
-	cameras: Arc<HashMap<String, Arc<CameraHandle>>>,
-	mqtt: SharedMqttClient,
-	topic_prefix: String,
-	cancel: CancellationToken,
-) {
-	let mut backoff = MqttBackoff::new();
-	loop {
-		tokio::select! {
-			_ = cancel.cancelled() => break,
-			event = event_loop.poll() => {
-				match classify_event(&event) {
-					EventAction::Publish { topic, payload } => {
-						backoff.reset();
-						let payload_str = String::from_utf8_lossy(payload);
-						tracing::debug!(topic = %topic, payload = %payload_str, "MQTT message received");
-						if let Some(cmd) = parse_control_message(&topic_prefix, topic, payload) {
-							let cameras = Arc::clone(&cameras);
-							let mqtt = mqtt.clone();
-							let prefix = topic_prefix.clone();
-							tokio::spawn(async move {
-								dispatch_control(cmd, &cameras, &mqtt, &prefix).await;
-							});
-						}
-					}
-					EventAction::ConnAck => {
-						backoff.reset();
-						handle_connack(&cameras, &mqtt, &topic_prefix).await;
-					}
-					EventAction::LogError => {
-						// `rumqttc::EventLoop::poll()` returns errors with
-						// no internal pacing — without our own backoff, a
-						// missing broker produces hundreds of identical
-						// "Connection refused" warnings per second.
-						if let Err(ref e) = event {
-							let msg = e.to_string();
-							let (delay, should_log) = backoff.record_error(&msg);
-							if should_log {
-								tracing::warn!(error = %msg, "MQTT event loop error; retrying with backoff");
-							}
-							if !bairelay::run_support::sleep_or_cancel(delay, &cancel).await {
-								break;
-							}
-						}
-					}
-					EventAction::Ignore => {}
-				}
-			}
-		}
-	}
 }

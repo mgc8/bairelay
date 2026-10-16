@@ -2,6 +2,7 @@ use bairelay::config::{
 	parse_config, resolve_idle_disconnect_timeout, test_helpers, validate_config, CameraConfig,
 	Config, DiscoveryMethod, MaxEncryption, MqttConfig, PauseConfig, StreamConfig, TlsClientAuth,
 };
+use bairelay_mqtt::discovery::Feature;
 
 // ── Enum variant deserialization ──────────────────────────────────────
 
@@ -1133,8 +1134,8 @@ fn discovery_present_defaults_to_all_features() {
 	validate_config(&config).expect("valid");
 	let d = config.mqtt.unwrap().discovery.unwrap();
 	assert_eq!(d.topic, "homeassistant");
-	// Feature::ALL has 11 entries — full default set.
-	assert_eq!(d.features.len(), 11);
+	// Full default set.
+	assert_eq!(d.features.len(), Feature::ALL.len());
 }
 
 #[test]

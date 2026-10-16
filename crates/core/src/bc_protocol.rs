@@ -13,6 +13,7 @@ use tokio::sync::RwLock;
 use Md5Trunc::*;
 
 mod abilityinfo;
+mod alarm;
 mod battery;
 mod camera_driver;
 pub mod connection;
@@ -49,6 +50,7 @@ mod uid;
 mod users;
 mod version;
 
+pub use alarm::{classify_alarm, classify_alarm_events, AiObject, AiObjects, AlarmUpdate};
 pub use camera_driver::CameraDriver;
 pub(crate) use connection::*;
 pub use credentials::*;

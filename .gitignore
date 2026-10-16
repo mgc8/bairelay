@@ -67,11 +67,6 @@ tests/scripts/ha-config/.storage/core.device_registry
 tests/scripts/ha-config/.storage/core.entity_registry
 tests/scripts/ha-config/.storage/http
 
-# Isolated-workspace worktrees used by the subagent-driven-development
-# flow. Each worktree lives on its own branch and fast-forwards into
-# main once the work is verified; the checkout itself is never tracked.
-/.worktrees/
-
 # `cargo tarpaulin --out xml`/`--out html` writes these at the project
 # root when run locally. Regenerated on every coverage run; in CI the
 # Cobertura XML is uploaded as a workflow artifact instead.

@@ -226,6 +226,7 @@ async fn publish_discovery_with_capabilities_emits_ok() {
 		has_ptz: true,
 		status_led: bairelay_mqtt::discovery::Presence::Present,
 		ir_leds: bairelay_mqtt::discovery::Presence::Present,
+		..Default::default()
 	});
 	assert!(cam.capabilities().is_some());
 	if let Err(e) = cam.publish_discovery().await {
@@ -255,6 +256,7 @@ async fn unpublish_discovery_without_prior_publish_is_ok() {
 		has_ptz: false,
 		status_led: bairelay_mqtt::discovery::Presence::Present,
 		ir_leds: bairelay_mqtt::discovery::Presence::Present,
+		..Default::default()
 	});
 	if let Err(e) = cam.unpublish_discovery().await {
 		panic!("unpublish_discovery failed: {e}");

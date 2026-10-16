@@ -80,7 +80,6 @@ bairelay-neolink-core = { path = "crates/core", version = "1.1.2" }
 bairelay-mqtt = { path = "crates/mqtt", version = "1.1.2" }
 bairelay-rtsp = { path = "crates/rtsp", version = "1.1.2" }
 bairelay-wake-server = { path = "crates/wake-server", version = "1.1.2" }
-# Shared by core, wake-server and the binary; bump all three together.
 quick-xml = { version = "0.42", features = ["serialize"] }
 
 [dependencies]

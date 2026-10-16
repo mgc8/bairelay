@@ -858,7 +858,7 @@ mod tests {
 					BcXml {
 						device_info: Some(DeviceInfo {
 							version: Some("1".into()),
-							resolution: None,
+							..Default::default()
 						}),
 						..Default::default()
 					},
@@ -911,7 +911,7 @@ mod tests {
 					BcXml {
 						device_info: Some(DeviceInfo {
 							version: Some("7".into()),
-							resolution: None,
+							..Default::default()
 						}),
 						..Default::default()
 					},
@@ -975,7 +975,7 @@ mod tests {
 					BcXml {
 						device_info: Some(DeviceInfo {
 							version: Some("9".into()),
-							resolution: None,
+							..Default::default()
 						}),
 						..Default::default()
 					},
@@ -1125,7 +1125,7 @@ mod tests {
 					BcXml {
 						device_info: Some(DeviceInfo {
 							version: Some("9".into()),
-							resolution: None,
+							..Default::default()
 						}),
 						..Default::default()
 					},
@@ -1224,7 +1224,7 @@ mod tests {
 					BcXml {
 						device_info: Some(DeviceInfo {
 							version: Some("5".into()),
-							resolution: None,
+							..Default::default()
 						}),
 						..Default::default()
 					},
@@ -1310,7 +1310,7 @@ mod tests {
 					BcXml {
 						device_info: Some(DeviceInfo {
 							version: Some("5".into()),
-							resolution: None,
+							..Default::default()
 						}),
 						..Default::default()
 					},
@@ -1395,7 +1395,7 @@ mod tests {
 					BcXml {
 						device_info: Some(DeviceInfo {
 							version: Some("7".into()),
-							resolution: None,
+							..Default::default()
 						}),
 						..Default::default()
 					},
