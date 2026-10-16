@@ -24,7 +24,7 @@ on:
       - '.github/ISSUE_TEMPLATE/**'
       - '.github/PULL_REQUEST_TEMPLATE.md'
 
-# Workflow-level default. No CI job needs write — fmt/clippy/test/
+# Workflow-level default. No CI job needs write — fmt/clippy/rustdoc/test/
 # coverage only read code; Codecov uploads use CODECOV_TOKEN.
 permissions:
   contents: read
@@ -63,6 +63,19 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked --all-targets -- -D warnings
+
+  rustdoc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --locked --workspace --no-deps
 
   hassio-lint:
     name: hassio lint

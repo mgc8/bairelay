@@ -78,7 +78,7 @@ fn is_safe_camera_name(s: &str) -> bool {
 /// on graceful teardown.
 ///
 /// The underlying writer is boxed behind `dyn Write + Send` so tests can
-/// inject a failing writer through [`FrameDumper::from_parts`] without
+/// inject a failing writer through `FrameDumper::from_parts` without
 /// spinning up a real file. The virtual call per packet is negligible
 /// compared to the serializer cost already on the path.
 pub struct FrameDumper {

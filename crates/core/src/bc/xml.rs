@@ -74,6 +74,10 @@ pub struct BcXml {
 	/// Received as part of the LEDState info request
 	#[serde(default, rename = "LedState", skip_serializing_if = "Option::is_none")]
 	pub led_state: Option<LedState>,
+	/// HTTP webhook configuration carried by `MSG_ID_GET_HA_CFG` /
+	/// `MSG_ID_SET_HA_CFG`
+	#[serde(default, rename = "HaCfg", skip_serializing_if = "Option::is_none")]
+	pub ha_cfg: Option<HaCfg>,
 	/// Sent as part of the TalkConfig to prepare the camera for audio talk-back
 	#[serde(
 		default,
@@ -852,6 +856,23 @@ pub struct LedState {
 	/// State of the LED status light (blue on light), values are "open", "close"
 	#[serde(default, rename = "lightState")]
 	pub light_state: String,
+}
+
+/// HaCfg xml: the camera's HTTP webhook target
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct HaCfg {
+	/// XML Version, observed value is "1.1"
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Webhook enabled (0=off, 1=on)
+	#[serde(default)]
+	pub enable: u8,
+	/// Target URL; empty when disabled
+	#[serde(default)]
+	pub url: String,
+	/// Verify the target's TLS certificate (0=off, 1=on)
+	#[serde(default)]
+	pub verify_cert: u8,
 }
 
 /// FloodlightStatus xml
@@ -2545,7 +2566,7 @@ fn test_deviceinfo_partial_deser() {
 
 #[test]
 fn test_binary_deser() {
-	let _ = env_logger::builder().is_test(true).try_init();
+	crate::test_logs::init();
 
 	let sample = indoc!(
 		r#"
@@ -2567,7 +2588,7 @@ fn test_binary_deser() {
 
 #[test]
 fn test_enc3_extension() {
-	let _ = env_logger::builder().is_test(true).try_init();
+	crate::test_logs::init();
 	let sample = indoc!(
 		r#"<?xml version="1.0" encoding="UTF-8" ?>
         <Extension version="1.1">
@@ -2631,7 +2652,7 @@ fn test_enc3_extension() {
 
 #[test]
 fn test_empty_floodlight_status_list() {
-	let _ = env_logger::builder().is_test(true).try_init();
+	crate::test_logs::init();
 	let sample = indoc!(
 		r#"<?xml version="1.0" encoding="UTF-8" ?>
         <body>

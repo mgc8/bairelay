@@ -92,7 +92,7 @@ pub struct SessionEntry {
 	/// RTSP re-publishers (observed live: HA's go2rtc `ffmpeg:` wrap
 	/// broke its downstream RECORD pipe after the first flushed
 	/// video packet because RTP arrived between the two SETUPs).
-	/// Fired once by the PLAY handler via [`mark_playing`].
+	/// Fired once by the PLAY handler via `mark_playing`.
 	pub play_signal: Arc<tokio::sync::Notify>,
 	/// Has PLAY been issued for this session? Paired with
 	/// `play_signal` so the session task can skip the wait if PLAY

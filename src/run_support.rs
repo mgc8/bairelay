@@ -77,6 +77,36 @@ pub async fn sleep_or_cancel(delay: Duration, cancel: &CancellationToken) -> boo
 	}
 }
 
+/// A service listener's bind IP: its own `key` (e.g. `webhook_addr`)
+/// when set, else the top-level `bind`.
+pub fn resolve_bind_ip(
+	key: &str,
+	explicit: Option<&str>,
+	top_level: &str,
+) -> Result<std::net::IpAddr> {
+	match explicit {
+		Some(addr) => addr
+			.parse()
+			.with_context(|| format!("Invalid {key} {addr}")),
+		None => top_level
+			.parse()
+			.with_context(|| format!("Invalid bind address {top_level}")),
+	}
+}
+
+/// Bind a service's TCP listener at startup, so a port conflict halts
+/// the daemon before any "started" log line.
+pub async fn bind_service_listener(
+	name: &str,
+	ip: std::net::IpAddr,
+	port: u16,
+) -> Result<tokio::net::TcpListener> {
+	let addr = std::net::SocketAddr::new(ip, port);
+	tokio::net::TcpListener::bind(addr)
+		.await
+		.with_context(|| format!("{name} bind failed on {addr}"))
+}
+
 /// The post-signal body: log + cancel the token. Extracted so tests
 /// can exercise the cancel side effect without driving a real signal.
 pub fn on_shutdown_signal(token: &CancellationToken, signal: &str) {
@@ -233,6 +263,7 @@ pub fn run_check_config_to<W1: std::io::Write, W2: std::io::Write>(
 	crate::config::warn_deprecated_pause_fields(&config);
 	crate::config::warn_neolink_compat_fields(&config);
 	crate::config::warn_wire_debug_enabled(&config);
+	crate::config::warn_loopback_webhook_advertise(&config);
 	crate::config::warn_idle_timeout_below_prune_floor(&config);
 	// Success — short summary so operators get a quick affirmation.
 	let summary = format!(
@@ -619,6 +650,40 @@ cameras = []
 		let res = sleep_or_cancel(Duration::from_secs(60), &tok).await;
 		assert!(!res, "cancel firing during sleep must return false");
 		let _ = canceller.await;
+	}
+
+	#[test]
+	fn resolve_bind_ip_prefers_the_listener_key() {
+		let top = "0.0.0.0";
+		assert_eq!(
+			resolve_bind_ip("webhook_addr", Some("127.0.0.1"), top).unwrap(),
+			std::net::IpAddr::from([127, 0, 0, 1])
+		);
+		assert_eq!(
+			resolve_bind_ip("webhook_addr", None, top).unwrap(),
+			std::net::IpAddr::from([0, 0, 0, 0])
+		);
+		let err = resolve_bind_ip("webhook_addr", Some("nope"), top).unwrap_err();
+		assert!(format!("{err:#}").contains("webhook_addr"), "{err:#}");
+		let err = resolve_bind_ip("webhook_addr", None, "nope").unwrap_err();
+		assert!(format!("{err:#}").contains("nope"), "{err:#}");
+	}
+
+	#[tokio::test]
+	async fn bind_service_listener_binds_and_names_a_port_conflict() {
+		let ip = std::net::IpAddr::from([127, 0, 0, 1]);
+		let listener = bind_service_listener("webhook listener", ip, 0)
+			.await
+			.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let err = bind_service_listener("webhook listener", ip, port)
+			.await
+			.unwrap_err();
+		let msg = format!("{err:#}");
+		assert!(
+			msg.contains("webhook listener") && msg.contains(&port.to_string()),
+			"{msg}"
+		);
 	}
 
 	// `snapshot --json` without `--output` is a usage error. The

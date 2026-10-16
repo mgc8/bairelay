@@ -75,6 +75,8 @@ pub mod bcmedia;
 pub mod bcudp;
 /// Cloud bundle minting for account ("cloud") cameras (apis.reolink.com).
 pub mod cloud;
+/// Parsers for the HTTP webhook a camera's `<HaCfg>` setting points at.
+pub mod ha_webhook;
 /// Log-safe renderings of identifiers (camera UIDs) for info-level logs.
 pub mod redact;
 
@@ -86,6 +88,10 @@ pub use bc_protocol::Error;
 pub(crate) use bc_protocol::{Credentials, Result};
 
 pub(crate) type NomErrorType<'a> = nom::error::VerboseError<&'a [u8]>;
+
+/// The unit tests' capturing `log` logger.
+#[cfg(test)]
+mod test_logs;
 
 /// Snapshot harness over a directory of real camera XML payloads.
 #[cfg(test)]
@@ -115,6 +121,10 @@ pub mod fuzz_api {
 
 	pub use crate::bc_protocol::connection::udpsource::{UdpFlowState, REORDER_CAP};
 	pub use crate::bcudp::model::{UdpAck, UdpData};
+	pub use crate::ha_webhook::{
+		alarm_events_from_xml, parse_http_request, parse_webhook_body, HttpRequestError,
+		WebhookEvent, MAX_BODY_BYTES, MAX_HEADER_BYTES,
+	};
 
 	/// Drive a sequence of `UdpFlowState` operations parsed from
 	/// arbitrary bytes. Asserts the bounded-state invariants

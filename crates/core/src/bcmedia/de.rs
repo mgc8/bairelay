@@ -400,14 +400,11 @@ mod tests {
 	use super::Error;
 	use crate::bcmedia::model::*;
 	use bytes::BytesMut;
-	use env_logger::Env;
 	use log::*;
 	use std::io::ErrorKind;
 
 	fn init() {
-		let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-			.is_test(true)
-			.try_init();
+		crate::test_logs::init();
 	}
 
 	#[test]

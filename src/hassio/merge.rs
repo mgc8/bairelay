@@ -81,6 +81,7 @@ pub fn merge_cameras(base: Vec<CameraConfig>, overlay: Vec<CameraConfig>) -> Vec
 			overlay_field!(entry, over, idle_disconnect_timeout_secs @opt);
 			overlay_field!(entry, over, defs, motion_wake_hold_secs);
 			overlay_field!(entry, over, defs, enabled);
+			overlay_field!(entry, over, defs, webhook);
 			// Whole-struct override: relies on build_base_config leaving
 			// per-camera mqtt + pause at default. If HA options ever start
 			// populating these, switch to a field-level deep merge or this
@@ -179,6 +180,9 @@ pub fn merge_top_level(mut base: Config, overlay: Config) -> Config {
 	}
 	if overlay.push_listener.is_some() {
 		base.push_listener = overlay.push_listener;
+	}
+	if overlay.webhook.is_some() {
+		base.webhook = overlay.webhook;
 	}
 	if overlay.stream_prune_grace_secs != defaults.stream_prune_grace_secs {
 		base.stream_prune_grace_secs = overlay.stream_prune_grace_secs;
@@ -304,6 +308,36 @@ mod tests {
 		let driveway = merged.iter().find(|c| c.name == "Driveway").unwrap();
 		assert_eq!(driveway.address.as_deref(), Some("192.168.1.50"));
 		assert_eq!(driveway.username, "operator");
+	}
+
+	#[test]
+	fn webhook_overlay_applies_block_and_camera_opt_in() {
+		let base = parse_overlay(
+			r#"
+			[[cameras]]
+			name = "cam1"
+			username = "admin"
+			password = "x"
+			address = "192.0.2.10"
+		"#,
+		)
+		.unwrap();
+		let overlay = parse_overlay(
+			r#"
+			[webhook]
+			enable = true
+			webhook_port = 9090
+
+			[[cameras]]
+			name = "cam1"
+			webhook = true
+		"#,
+		)
+		.unwrap();
+		let merged = merge(base, overlay);
+		assert_eq!(merged.webhook.as_ref().unwrap().webhook_port, 9090);
+		assert!(merged.cameras[0].webhook, "per-camera opt-in merges");
+		crate::config::validate_config(&merged).expect("merged config validates");
 	}
 
 	#[test]

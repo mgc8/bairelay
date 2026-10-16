@@ -1,4 +1,3 @@
-use super::alarm::VisitorEdge;
 use super::{classify_alarm_events, AlarmUpdate, BcCamera, Error, Result};
 use crate::bc::{model::*, xml::*};
 use std::time::{Duration, Instant};
@@ -295,9 +294,9 @@ impl BcCamera {
 	/// This returns a data structure which can be used to
 	/// query motion events
 	///
-	/// Each update's `doorbell_press` is the rising edge of the
-	/// doorbell's `visitor` state, tracked from this call onward: the
-	/// first `visitor` push a new listener sees is a press.
+	/// Each update carries the push's raw `visitor` state and leaves
+	/// `doorbell_press` `false`: a caller that publishes presses tracks
+	/// them across pushes with a [`VisitorEdge`](super::VisitorEdge).
 	pub async fn listen_on_motion(&self) -> Result<MotionData> {
 		self.start_motion_query().await?;
 
@@ -316,30 +315,26 @@ impl BcCamera {
 				_ = thread_cancel.cancelled() => Result::Ok(()),
 				v = async {
 					let mut sub = connection.subscribe_to_id(MSG_ID_MOTION).await?;
-					let mut visitor_edge = VisitorEdge::default();
 
 					loop {
 						tokio::task::yield_now().await;
 						let msg = sub.recv().await;
 						// On connection drop the error is forwarded and the
 						// receiver surfaces it.
-						let update = msg.map(|motion_msg| {
-							let update = match motion_msg.body {
-								BcBody::ModernMsg(ModernMsg {
-									payload:
-										Some(BcPayloads::BcXml(BcXml {
-											alarm_event_list: Some(alarm_event_list),
-											..
-										})),
-									..
-								}) => classify_alarm_events(
-									&alarm_event_list.alarm_events,
-									channel_id,
-									Instant::now(),
-								),
-								_ => AlarmUpdate::no_change(Instant::now()),
-							};
-							visitor_edge.apply(update)
+						let update = msg.map(|motion_msg| match motion_msg.body {
+							BcBody::ModernMsg(ModernMsg {
+								payload:
+									Some(BcPayloads::BcXml(BcXml {
+										alarm_event_list: Some(alarm_event_list),
+										..
+									})),
+								..
+							}) => classify_alarm_events(
+								&alarm_event_list.alarm_events,
+								channel_id,
+								Instant::now(),
+							),
+							_ => AlarmUpdate::no_change(Instant::now()),
 						});
 
 						if tx.send(update).await.is_err() {
@@ -996,11 +991,12 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn listen_on_motion_visitor_push_is_doorbell_press_without_motion_change() {
+	async fn listen_on_motion_visitor_push_reports_visitor_without_motion_change() {
 		let (mut md, injector, _cam) = listening_camera().await;
 		push_alarm(&injector, 0, "visitor", None).await.unwrap();
 		let update = next_alarm_update_within(&mut md).await;
-		assert!(update.doorbell_press);
+		assert_eq!(update.visitor, Some(true));
+		assert!(!update.doorbell_press, "the caller owns the press edge");
 		assert!(matches!(update.motion, MotionStatus::NoChange(_)));
 		assert_eq!(update.objects, None);
 		// The motion view reports no motion state from a press alone.
@@ -1008,10 +1004,10 @@ mod tests {
 	}
 
 	/// `visitor` is a state the doorbell repeats in every push for
-	/// seconds after one press; a press is only its rising edge. Two
-	/// physical presses yield exactly two `doorbell_press` updates.
+	/// seconds after one press. The listener reports it raw, push by
+	/// push, and leaves `doorbell_press` to the caller's `VisitorEdge`.
 	#[tokio::test]
-	async fn listen_on_motion_doorbell_press_is_visitor_rising_edge() {
+	async fn listen_on_motion_reports_the_raw_visitor_state_per_push() {
 		let (mut md, injector, _cam) = listening_camera().await;
 		let pushes: [(&str, &str); 12] = [
 			("MD", "none"),
@@ -1032,42 +1028,14 @@ mod tests {
 				.await
 				.unwrap();
 		}
-		let mut presses = vec![];
-		for index in 1..=pushes.len() {
-			if next_alarm_update_within(&mut md).await.doorbell_press {
-				presses.push(index);
-			}
-		}
-		assert_eq!(presses, vec![3, 8], "presses at the visitor rising edges");
-	}
-
-	/// The visitor state resets on resubscribe: the first `visitor`
-	/// push a fresh listener sees is a press.
-	#[tokio::test]
-	async fn listen_on_motion_resubscribe_resets_visitor_state() {
-		let mock = MockConnection::new()
-			.expect_msg(MSG_ID_MOTION_REQUEST)
-			.reply_with(reply_200_empty)
-			.expect_msg(MSG_ID_MOTION_REQUEST)
-			.reply_with(reply_200_empty)
-			.build()
-			.await;
-		let injector = mock.injector();
-		let cam = BcCamera::from_mock_connection(mock).await;
-		cam.test_set_ability("motion", true).await;
-		for listener in 1..=2 {
-			let mut md = cam.listen_on_motion().await.expect("ok");
-			tokio::time::sleep(Duration::from_millis(30)).await;
-			push_alarm(&injector, 0, "visitor", None).await.unwrap();
+		let mut visitor = vec![];
+		for _ in 0..pushes.len() {
 			let update = next_alarm_update_within(&mut md).await;
-			assert!(
-				update.doorbell_press,
-				"first visitor on listener {listener}"
-			);
-			drop(md);
-			// Let the dropped listener's task release its subscription.
-			tokio::time::sleep(Duration::from_millis(30)).await;
+			assert!(!update.doorbell_press);
+			visitor.push(update.visitor == Some(true));
 		}
+		let held: Vec<bool> = pushes.iter().map(|(s, _)| s.contains("visitor")).collect();
+		assert_eq!(visitor, held);
 	}
 
 	#[tokio::test]

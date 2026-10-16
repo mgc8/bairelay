@@ -11,7 +11,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use bairelay_neolink_core::bc_protocol::{
-	AiObject as CoreAiObject, AiObjects, CameraDriver, Error as CoreError, MotionStatus,
+	AiObject as CoreAiObject, AiObjects, AlarmUpdate, CameraDriver, Error as CoreError,
+	MotionStatus, VisitorEdge,
 };
 
 use bairelay_mqtt::control::IrMode;
@@ -26,6 +27,7 @@ use crate::capabilities::Presence;
 use crate::preview_overlay::OverlayCache;
 use crate::preview_state::PreviewState;
 use crate::status_cache::StatusCache;
+use crate::stream_source::MutexPoisonRecover as _;
 use crate::wake_lock::{WakeLockCounter, WakeLockGuard};
 
 // ── Motion Detection ─────────────────────────────────────────────────
@@ -63,20 +65,41 @@ pub(crate) fn ai_object_publishes(
 		.map(|(_, object, detected)| (object, detected))
 }
 
+/// The AI object set an update diffs against.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AiBaseline {
+	/// This set; `None` publishes every class.
+	Known(Option<AiObjects>),
+	/// Whatever the status cache holds, read under the AI publish lock:
+	/// the set the last session or forwarded alarm published.
+	Cache,
+}
+
+impl Default for AiBaseline {
+	fn default() -> Self {
+		AiBaseline::Known(None)
+	}
+}
+
 /// Cache `next` for broker-reconnect replay, publish the AI object
-/// states that changed since `prev`, and record the objects published
-/// `on` in `seen_on`. Holds [`StatusCache::lock_ai_publish`] while it
-/// caches and publishes, so a replay emits either the set before this
-/// one or this one, never a stale set after it.
+/// states that changed since `baseline`, and record the objects
+/// published `on` in `seen_on`. Holds [`StatusCache::lock_ai_publish`]
+/// while it reads the baseline, caches and publishes, so a replay emits
+/// either the set before this one or this one, never a stale set after
+/// it.
 async fn publish_ai_objects(
 	publisher: &StatusPublisher<'_>,
 	cache: &StatusCache,
 	caps: CameraCapabilitiesView,
-	prev: Option<AiObjects>,
+	baseline: AiBaseline,
 	seen_on: &mut AiObjects,
 	next: AiObjects,
 ) {
 	let _serial = cache.lock_ai_publish().await;
+	let prev = match baseline {
+		AiBaseline::Known(prev) => prev,
+		AiBaseline::Cache => cache.ai_objects(),
+	};
 	cache.set_ai_objects(next);
 	for (object, detected) in ai_object_publishes(caps, prev, next, *seen_on) {
 		let _ = publisher.publish_ai_object(object, detected).await;
@@ -100,7 +123,15 @@ async fn reset_ai_objects(
 ) -> (AiObjects, AiObjects) {
 	let reset = AiObjects::default();
 	let mut seen_on = AiObjects::default();
-	publish_ai_objects(publisher, cache, caps, None, &mut seen_on, reset).await;
+	publish_ai_objects(
+		publisher,
+		cache,
+		caps,
+		AiBaseline::Known(None),
+		&mut seen_on,
+		reset,
+	)
+	.await;
 	(reset, seen_on)
 }
 
@@ -156,6 +187,18 @@ impl EventWakeHold {
 		}
 	}
 
+	/// Apply one alarm update: its motion transition, then its press.
+	fn apply(&mut self, update: &AlarmUpdate) {
+		match update.motion {
+			MotionStatus::Start(_) => self.motion_start(),
+			MotionStatus::Stop(_) => self.motion_stop(),
+			MotionStatus::NoChange(_) => {}
+		}
+		if update.doorbell_press {
+			self.doorbell_press();
+		}
+	}
+
 	/// Hold window expired: drop the lock.
 	fn release(&mut self) {
 		self.guard = None;
@@ -194,6 +237,96 @@ async fn report_motion(
 	}
 }
 
+/// What one cmd 33 alarm stream has reported so far: the motion state
+/// (`None` is unknown), the AI objects the next update diffs against
+/// and the objects published `on`.
+#[derive(Debug, Default)]
+pub(crate) struct AlarmReport {
+	pub(crate) motion_on: Option<bool>,
+	pub(crate) ai_baseline: AiBaseline,
+	pub(crate) seen_on: AiObjects,
+}
+
+/// Publish a doorbell press, unless another source (the session, the
+/// webhook or a forwarded alarm) published one within
+/// [`crate::status_cache::DOORBELL_PRESS_DEDUPE_WINDOW`].
+pub(crate) async fn report_doorbell_press(
+	camera_name: &str,
+	publisher: &StatusPublisher<'_>,
+	status_cache: &StatusCache,
+) {
+	if !status_cache.claim_doorbell_press(tokio::time::Instant::now()) {
+		tracing::debug!(camera = %camera_name, "Doorbell press already reported");
+		return;
+	}
+	tracing::info!(camera = %camera_name, "Doorbell pressed");
+	if let Err(e) = publisher.publish_doorbell_press().await {
+		tracing::warn!(camera = %camera_name, error = %e, "publish_doorbell_press failed");
+	}
+}
+
+/// Publish one alarm update: its motion transition through
+/// [`report_motion`], its AI objects through [`publish_ai_objects`]
+/// and its doorbell press. Cameras repeat Start in every push while
+/// motion lasts; `report_motion` publishes transitions or a stale cache.
+///
+/// The publishes run one after another so each topic's on/off order
+/// holds. They stay bounded: a publish only enqueues into rumqttc's
+/// 256-slot request channel, one update touches at most seven topics
+/// (motion, five AI objects, doorbell), and the AI publishes wait on
+/// the AI publish lock, which the broker-reconnect replay holds only
+/// for its five enqueues.
+pub(crate) async fn report_alarm_update(
+	camera_name: &str,
+	publisher: &StatusPublisher<'_>,
+	status_cache: &StatusCache,
+	ai_caps: CameraCapabilitiesView,
+	report: &mut AlarmReport,
+	update: &AlarmUpdate,
+) {
+	match update.motion {
+		MotionStatus::Start(_) => {
+			report_motion(
+				camera_name,
+				publisher,
+				status_cache,
+				&mut report.motion_on,
+				true,
+			)
+			.await;
+		}
+		MotionStatus::Stop(_) => {
+			report_motion(
+				camera_name,
+				publisher,
+				status_cache,
+				&mut report.motion_on,
+				false,
+			)
+			.await;
+		}
+		MotionStatus::NoChange(_) => {}
+	}
+	if let Some(objects) = update.objects {
+		tracing::debug!(camera = %camera_name, ?objects, "AI objects");
+		publish_ai_objects(
+			publisher,
+			status_cache,
+			ai_caps,
+			report.ai_baseline,
+			&mut report.seen_on,
+			objects,
+		)
+		.await;
+		if let AiBaseline::Known(last) = &mut report.ai_baseline {
+			*last = Some(objects);
+		}
+	}
+	if update.doorbell_press {
+		report_doorbell_press(camera_name, publisher, status_cache).await;
+	}
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn motion_listener(
 	camera_name: String,
@@ -205,6 +338,7 @@ pub async fn motion_listener(
 	motion_wake_hold: Duration,
 	status_cache: Arc<StatusCache>,
 	caps: CameraCapabilities,
+	held_press_window: Option<Duration>,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	// Sustained network flap with N cameras × M retries/min produces a
@@ -216,9 +350,13 @@ pub async fn motion_listener(
 	// Last reported AI object states and the objects published `on`
 	// this session, both starting from the session-start reset.
 	let ai_caps = CameraCapabilitiesView::from(caps);
-	let (mut last_objects, mut seen_on) = tokio::select! {
+	let mut report = tokio::select! {
 		_ = cancel.cancelled() => return,
-		start = reset_ai_objects(&publisher, &status_cache, ai_caps) => start,
+		(last, seen_on) = reset_ai_objects(&publisher, &status_cache, ai_caps) => AlarmReport {
+			motion_on: None,
+			ai_baseline: AiBaseline::Known(Some(last)),
+			seen_on,
+		},
 	};
 
 	loop {
@@ -234,6 +372,18 @@ pub async fn motion_listener(
 		};
 		// Subscribed cleanly — fast retries again on the next failure.
 		backoff.reset();
+		// This listener owns the press edge: `listen_on_motion` reports
+		// the raw `visitor` state. The edge starts again on each
+		// subscribe. A press published within `held_press_window` (e.g.
+		// the webhook's, whose wake brought this session up) is the
+		// `visitor` state the camera may still report: held.
+		let mut visitor_edge = if held_press_window.is_some_and(|window| {
+			status_cache.doorbell_pressed_within(window, tokio::time::Instant::now())
+		}) {
+			VisitorEdge::held()
+		} else {
+			VisitorEdge::default()
+		};
 
 		// The pending release deadline is polled inline via the
 		// select! arm below — no detached `tokio::spawn`, so at most
@@ -242,7 +392,7 @@ pub async fn motion_listener(
 		let mut wake_hold = EventWakeHold::new(wake_lock.clone(), motion_wake_hold);
 		// Last published motion state; unknown on each subscribe, so the
 		// first Start or Stop publishes.
-		let mut motion_on: Option<bool> = None;
+		report.motion_on = None;
 
 		loop {
 			// `sleep_until` requires a concrete deadline. When no
@@ -263,58 +413,26 @@ pub async fn motion_listener(
 				}
 				// Every update is consumed in order: `next_motion()`
 				// would coalesce a buffered Start behind a press.
-				//
-				// The arm's publishes run one after another so each
-				// topic's on/off order holds. They stay bounded: a
-				// publish only enqueues into rumqttc's 256-slot request
-				// channel, one update touches at most seven topics
-				// (motion, five AI objects, doorbell), the AI publishes
-				// wait on the AI publish lock, which the broker-reconnect
-				// replay holds only for its five enqueues, and session
-				// teardown aborts a listener still busy after 2 s.
+				// Session teardown aborts a listener still busy
+				// publishing after 2 s.
 				result = motion_data.next_alarm_update() => {
 					let update = match result {
-						Ok(update) => update,
+						Ok(update) => visitor_edge.apply(update),
 						Err(e) => {
 							tracing::warn!(camera = %camera_name, error = %e, "Motion listener error");
 							break;
 						}
 					};
-					// Cameras repeat Start in every push while motion
-					// lasts: `report_motion` logs transitions and
-					// publishes transitions or a stale cache. The wake
-					// hold sees every Start and Stop.
-					match update.motion {
-						MotionStatus::Start(_) => {
-							wake_hold.motion_start();
-							report_motion(&camera_name, &publisher, &status_cache, &mut motion_on, true)
-								.await;
-						}
-						MotionStatus::Stop(_) => {
-							report_motion(&camera_name, &publisher, &status_cache, &mut motion_on, false)
-								.await;
-							wake_hold.motion_stop();
-						}
-						MotionStatus::NoChange(_) => {}
-					}
-					if let Some(objects) = update.objects {
-						tracing::debug!(camera = %camera_name, ?objects, "AI objects");
-						publish_ai_objects(
-							&publisher,
-							&status_cache,
-							ai_caps,
-							Some(last_objects),
-							&mut seen_on,
-							objects,
-						)
-						.await;
-						last_objects = objects;
-					}
-					if update.doorbell_press {
-						tracing::info!(camera = %camera_name, "Doorbell pressed");
-						let _ = publisher.publish_doorbell_press().await;
-						wake_hold.doorbell_press();
-					}
+					report_alarm_update(
+						&camera_name,
+						&publisher,
+						&status_cache,
+						ai_caps,
+						&mut report,
+						&update,
+					)
+					.await;
+					wake_hold.apply(&update);
 				}
 			}
 		}
@@ -380,7 +498,7 @@ pub(crate) fn classify_battery_tick<T>(outcome: &TickResult<T>) -> BatteryTickOu
 ///
 /// Pure, so the decision table can be unit-tested without a camera.
 /// Anything that is not a refusal clears the streak — see the doc on
-/// [`classify_battery_tick`] for why a transient error must not count.
+/// `classify_battery_tick` for why a transient error must not count.
 pub(crate) fn advance_battery_counter(
 	consecutive_unsupported: u32,
 	outcome: BatteryTickOutcome,
@@ -398,7 +516,7 @@ pub(crate) fn advance_battery_counter(
 /// Poll `battery_info()` and publish `status/battery_level`.
 ///
 /// Gives up once the camera has refused the command
-/// [`BATTERY_MAX_UNSUPPORTED`] times in a row **and has never once
+/// `BATTERY_MAX_UNSUPPORTED` times in a row **and has never once
 /// answered it**, setting `battery_unsupported` so `spawn_session_tasks`
 /// doesn't re-probe on the next reconnect. Mains-powered models have no
 /// battery and refuse every probe; without the give-up they are re-asked
@@ -407,7 +525,7 @@ pub(crate) fn advance_battery_counter(
 /// The never-answered condition is what makes the latch safe. A camera
 /// that has produced even one battery level has proven the hardware is
 /// there, so a later run of malformed replies — which
-/// [`classify_battery_tick`] cannot distinguish from a refusal — can
+/// `classify_battery_tick` cannot distinguish from a refusal — can
 /// never silence a real battery.
 #[allow(clippy::too_many_arguments)]
 pub async fn battery_poller(
@@ -736,56 +854,63 @@ fn log_preview_failure(failing: &mut bool, camera: &str, why: &dyn std::fmt::Dis
 	*failing = true;
 }
 
-// ── Snapshot with wake-time retry ────────────────────────────────────
+// ── Wake-time retry ──────────────────────────────────────────────────
 
 /// Per-attempt bound for a snapshot request.
 pub(crate) const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-attempt bound for a webhook configuration read.
+const HA_CFG_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound on a webhook write, which is a set plus a read-back.
+const HA_CFG_SET_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long after the first attempt a retry may still start.
-const SNAPSHOT_NOT_READY_WINDOW: Duration = Duration::from_secs(12);
+const NOT_READY_WINDOW: Duration = Duration::from_secs(12);
 /// Wait between attempts after a wake-time "service unavailable" reply.
-const SNAPSHOT_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+const NOT_READY_BACKOFF: Duration = Duration::from_secs(2);
 /// Message id of the snapshot request.
 const SNAPSHOT_MSG_ID: u32 = 109;
+/// Message id of the webhook configuration read.
+const HA_CFG_MSG_ID: u32 = 806;
 /// Reply code an Argus returns while it finishes waking ("not yet ready").
-const SNAPSHOT_NOT_READY_CODE: u16 = 400;
+const NOT_READY_CODE: u16 = 400;
 
-/// Whether `e` is the camera's 400 "service unavailable" reply to the
-/// snapshot request, which an Argus returns while it finishes waking.
-fn is_snapshot_not_ready(e: &bairelay_neolink_core::Error) -> bool {
+/// Whether `e` is the camera's 400 "service unavailable" reply to
+/// request `msg_id`, which an Argus returns while it finishes waking.
+fn is_not_ready(e: &bairelay_neolink_core::Error, msg_id: u32) -> bool {
 	matches!(
 		e,
-		bairelay_neolink_core::Error::CameraServiceUnavailable {
-			id: SNAPSHOT_MSG_ID,
-			code: SNAPSHOT_NOT_READY_CODE,
-		}
+		bairelay_neolink_core::Error::CameraServiceUnavailable { id, code }
+			if *id == msg_id && *code == NOT_READY_CODE
 	)
 }
 
-/// Request a snapshot, retrying the wake-time 400 "service unavailable"
-/// reply every [`SNAPSHOT_RETRY_BACKOFF`] for as long as the next
-/// attempt would start no later than [`SNAPSHOT_NOT_READY_WINDOW`] after
-/// the first one (attempts at 0, 2, ... 12 s; the last may run its full
-/// [`SNAPSHOT_TIMEOUT`], so the sequence ends within 22 s). Any other
-/// error or a timeout returns immediately. `None` when `cancel` fires,
-/// during an attempt or a backoff. Retried replies log at debug; the
-/// caller reports the final failure.
-pub(crate) async fn snapshot_with_retry(
-	camera: &dyn bairelay_neolink_core::bc_protocol::CameraDriver,
+/// Run `attempt` (bounded by `limit` each), retrying the wake-time 400
+/// reply for `msg_id` every [`NOT_READY_BACKOFF`] for as long as the
+/// next attempt would start no later than [`NOT_READY_WINDOW`] after the
+/// first one. Any other error or a timeout returns immediately. `None`
+/// when `cancel` fires, during an attempt or a backoff. Retried replies
+/// log at debug; the caller reports the final failure.
+async fn retry_while_waking<T, Fut>(
+	msg_id: u32,
 	name: &str,
 	cancel: &CancellationToken,
-) -> Option<Result<Result<Vec<u8>, bairelay_neolink_core::Error>, tokio::time::error::Elapsed>> {
+	limit: Duration,
+	mut attempt_fn: impl FnMut() -> Fut,
+) -> Option<Result<Result<T, bairelay_neolink_core::Error>, tokio::time::error::Elapsed>>
+where
+	Fut: std::future::Future<Output = Result<T, bairelay_neolink_core::Error>>,
+{
 	let started = tokio::time::Instant::now();
 	let mut attempt = 1;
 	loop {
-		let result = cancellable(cancel, SNAPSHOT_TIMEOUT, camera.get_snapshot()).await?;
+		let result = cancellable(cancel, limit, attempt_fn()).await?;
 		match &result {
 			Ok(Err(e))
-				if is_snapshot_not_ready(e)
-					&& started.elapsed() + SNAPSHOT_RETRY_BACKOFF <= SNAPSHOT_NOT_READY_WINDOW =>
+				if is_not_ready(e, msg_id)
+					&& started.elapsed() + NOT_READY_BACKOFF <= NOT_READY_WINDOW =>
 			{
 				tracing::debug!(
-					camera = %name, attempt, error = %e,
-					"snapshot not ready, retrying"
+					camera = %name, msg_id, attempt, error = %e,
+					"camera not ready, retrying"
 				);
 			}
 			_ => return Some(result),
@@ -793,10 +918,283 @@ pub(crate) async fn snapshot_with_retry(
 		tokio::select! {
 			biased;
 			_ = cancel.cancelled() => return None,
-			_ = tokio::time::sleep(SNAPSHOT_RETRY_BACKOFF) => {}
+			_ = tokio::time::sleep(NOT_READY_BACKOFF) => {}
 		}
 		attempt += 1;
 	}
+}
+
+/// Request a snapshot, retrying the wake-time 400 reply (attempts at 0,
+/// 2, ... 12 s; the last may run its full [`SNAPSHOT_TIMEOUT`], so the
+/// sequence ends within 22 s). See [`retry_while_waking`].
+pub(crate) async fn snapshot_with_retry(
+	camera: &dyn bairelay_neolink_core::bc_protocol::CameraDriver,
+	name: &str,
+	cancel: &CancellationToken,
+) -> Option<Result<Result<Vec<u8>, bairelay_neolink_core::Error>, tokio::time::error::Elapsed>> {
+	retry_while_waking(SNAPSHOT_MSG_ID, name, cancel, SNAPSHOT_TIMEOUT, || {
+		camera.get_snapshot()
+	})
+	.await
+}
+
+/// What a webhook (`HaCfg`) probe found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HaCfgSupport {
+	/// The firmware has HaCfg; its stored configuration.
+	Supported(bairelay_neolink_core::bc::xml::HaCfg),
+	/// A 200 reply without `<HaCfg>`: no support.
+	EmptyReply,
+	/// A persistent error reply with this code: no support.
+	ErrorReply(u16),
+}
+
+impl HaCfgSupport {
+	/// The camera's error reply code, when that is why HaCfg is
+	/// unsupported.
+	pub(crate) fn error_code(&self) -> Option<u16> {
+		match self {
+			Self::ErrorReply(code) => Some(*code),
+			Self::Supported(_) | Self::EmptyReply => None,
+		}
+	}
+}
+
+/// Probe the camera's webhook (`HaCfg`) support. Retries the wake-time
+/// 400 through [`retry_while_waking`]; a persistent error reply (any
+/// non-200 code) means the firmware lacks the feature, as does an empty
+/// reply. Transport errors, timeouts and cancellation are errors.
+pub(crate) async fn ha_cfg_support(
+	camera: &dyn bairelay_neolink_core::bc_protocol::CameraDriver,
+	name: &str,
+	cancel: &CancellationToken,
+) -> anyhow::Result<HaCfgSupport> {
+	use bairelay_neolink_core::Error;
+	let outcome = retry_while_waking(HA_CFG_MSG_ID, name, cancel, HA_CFG_TIMEOUT, || {
+		camera.get_ha_cfg()
+	})
+	.await
+	.ok_or_else(|| anyhow::anyhow!("cancelled"))?;
+	match outcome {
+		Ok(Ok(Some(cfg))) => Ok(HaCfgSupport::Supported(cfg)),
+		Ok(Ok(None)) => Ok(HaCfgSupport::EmptyReply),
+		Ok(Err(Error::CameraServiceUnavailable { code, .. })) => Ok(HaCfgSupport::ErrorReply(code)),
+		Ok(Err(e)) => Err(anyhow::Error::new(e).context("get_ha_cfg failed")),
+		Err(_) => Err(anyhow::anyhow!(
+			"get_ha_cfg failed: timed out after {}s",
+			HA_CFG_TIMEOUT.as_secs()
+		)),
+	}
+}
+
+// ── Webhook arming ───────────────────────────────────────────────────
+
+/// What one webhook arming pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArmOutcome {
+	/// The firmware has no HaCfg.
+	Unsupported,
+	/// The camera already POSTs to the URL; nothing is written.
+	AlreadyArmed,
+	/// Written, and the read-back matches.
+	Armed,
+	/// Written, but the read-back differs from what was written.
+	Unconfirmed,
+	/// The read or the write failed or timed out.
+	Failed,
+	/// The session ended first.
+	Cancelled,
+}
+
+/// What webhook arming remembers across one camera's sessions.
+#[derive(Debug, Default)]
+pub(crate) struct ArmMemo {
+	/// Set once "firmware lacks HaCfg" is logged.
+	unsupported_logged: AtomicBool,
+	/// Set once a skip for an unknown camera address is warned.
+	unknown_camera_warned: AtomicBool,
+	/// Set once a skip for a loopback-only host is warned.
+	loopback_only_warned: AtomicBool,
+	/// `(desired, stored)` from the last write whose read-back differed:
+	/// the URL written and the URL the camera kept instead. A later pass
+	/// with the same pair is left alone, so such a camera is not
+	/// rewritten on every session; a new desired URL is still written.
+	unconfirmed: std::sync::Mutex<Option<(String, String)>>,
+}
+
+impl ArmMemo {
+	/// Log that arming is skipped for `reason`: a warning the first time
+	/// for each reason, debug after.
+	pub(crate) fn report_no_host(
+		&self,
+		name: &str,
+		reason: crate::webhook_listener::NoWebhookHost,
+	) {
+		use crate::webhook_listener::NoWebhookHost;
+		let warned = match reason {
+			NoWebhookHost::UnknownCamera => &self.unknown_camera_warned,
+			NoWebhookHost::LoopbackOnly => &self.loopback_only_warned,
+		};
+		if warned.swap(true, Ordering::Relaxed) {
+			tracing::debug!(camera = %name, "Webhook not armed: {reason}");
+		} else {
+			tracing::warn!(camera = %name, "Webhook not armed: {reason}");
+		}
+	}
+}
+
+/// `version` attribute written when the camera's own read has none.
+const HA_CFG_VERSION: &str = "1.1";
+/// Longest host [`url_host`] returns: a DNS name's limit.
+const MAX_LOGGED_HOST: usize = 253;
+
+/// Point the camera's HaCfg webhook at `url`: read it through
+/// [`ha_cfg_support`], then write `enable=1`, `url`, `verify_cert=0`
+/// unless it is already enabled on `url`. Replacing a different
+/// non-empty URL logs that URL's host only, since its path or query
+/// can hold another system's secret; `url` itself is never logged, as
+/// its path holds this camera's token; a URL bairelay wrote on an
+/// earlier run (see `is_own_stale_url`) is refreshed without a
+/// warning. Missing HaCfg logs once per `memo`, and a URL the camera
+/// stored instead of `url` on the last write of the same `url` is not
+/// rewritten. Bounded and cancel-aware.
+pub(crate) async fn arm_webhook(
+	camera: &dyn CameraDriver,
+	name: &str,
+	url: &str,
+	memo: &ArmMemo,
+	cancel: &CancellationToken,
+) -> ArmOutcome {
+	use bairelay_neolink_core::bc::xml::HaCfg;
+	let stored = match ha_cfg_support(camera, name, cancel).await {
+		Ok(HaCfgSupport::Supported(cfg)) => cfg,
+		Ok(unsupported) => {
+			if !memo.unsupported_logged.swap(true, Ordering::Relaxed) {
+				tracing::info!(camera = %name, code = unsupported.error_code(), "Camera firmware lacks HaCfg; webhook not armed");
+			}
+			return ArmOutcome::Unsupported;
+		}
+		Err(_) if cancel.is_cancelled() => return ArmOutcome::Cancelled,
+		Err(e) => {
+			tracing::warn!(camera = %name, error = %format!("{e:#}"), "Webhook not armed: HaCfg read failed");
+			return ArmOutcome::Failed;
+		}
+	};
+	if stored.enable == 1 && stored.url == url {
+		*memo.unconfirmed.lock_recover() = None;
+		tracing::debug!(camera = %name, "Webhook already armed");
+		return ArmOutcome::AlreadyArmed;
+	}
+	let remembered = memo
+		.unconfirmed
+		.lock_recover()
+		.as_ref()
+		.is_some_and(|(desired, kept)| desired == url && *kept == stored.url);
+	if remembered {
+		tracing::debug!(camera = %name, "Webhook left as the camera stored it after the last write");
+		return ArmOutcome::Unconfirmed;
+	}
+	if stored.url != url && is_own_stale_url(&stored.url, url) {
+		tracing::info!(camera = %name, "Refreshing webhook token");
+	} else if !stored.url.is_empty() && stored.url != url {
+		tracing::warn!(
+			camera = %name,
+			other_host = url_host(&stored.url).unwrap_or("<unparseable>"),
+			"Replacing another webhook URL on the camera"
+		);
+	}
+	let want = HaCfg {
+		version: if stored.version.is_empty() {
+			HA_CFG_VERSION.to_string()
+		} else {
+			stored.version
+		},
+		enable: 1,
+		url: url.to_string(),
+		verify_cert: 0,
+	};
+	let back = match cancellable(cancel, HA_CFG_SET_TIMEOUT, camera.set_ha_cfg(&want)).await {
+		None => return ArmOutcome::Cancelled,
+		Some(Err(_)) => {
+			tracing::warn!(
+				camera = %name,
+				"Webhook not armed: HaCfg write timed out after {}s",
+				HA_CFG_SET_TIMEOUT.as_secs()
+			);
+			return ArmOutcome::Failed;
+		}
+		Some(Ok(Err(e))) => {
+			tracing::warn!(camera = %name, error = %e, "Webhook not armed: HaCfg write failed");
+			return ArmOutcome::Failed;
+		}
+		Some(Ok(Ok(back))) => back,
+	};
+	let confirmed = back.as_ref().is_some_and(|b| {
+		(b.enable, b.url.as_str(), b.verify_cert) == (want.enable, url, want.verify_cert)
+	});
+	*memo.unconfirmed.lock_recover() = if confirmed {
+		None
+	} else {
+		back.as_ref().map(|b| (url.to_string(), b.url.clone()))
+	};
+	if confirmed {
+		tracing::info!(camera = %name, host = url_host(url).unwrap_or("<unparseable>"), "Webhook armed");
+		ArmOutcome::Armed
+	} else {
+		tracing::warn!(
+			camera = %name,
+			enable = ?back.as_ref().map(|b| b.enable),
+			url_matches = back.as_ref().is_some_and(|b| b.url == url),
+			verify_cert = ?back.as_ref().map(|b| b.verify_cert),
+			"Webhook read-back differs from what was written"
+		);
+		ArmOutcome::Unconfirmed
+	}
+}
+
+/// The host of an `http` or `https` webhook URL, for logging: no
+/// scheme, user info, port, path, query or fragment. `None` for any
+/// other scheme, an `@` after the authority (where user info could end
+/// up logged as the host), an empty host, a host longer than
+/// [`MAX_LOGGED_HOST`], or one holding a byte outside letters, digits
+/// and `.-_:[]`.
+pub(crate) fn url_host(url: &str) -> Option<&str> {
+	let (scheme, rest) = url.split_once("://")?;
+	if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+		return None;
+	}
+	let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+	if tail.contains('@') {
+		return None;
+	}
+	let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+	let host = if host_port.starts_with('[') {
+		&host_port[..=host_port.find(']')?]
+	} else {
+		host_port.split(':').next().unwrap_or_default()
+	};
+	let safe =
+		|b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']');
+	(!host.is_empty() && host.len() <= MAX_LOGGED_HOST && host.bytes().all(safe)).then_some(host)
+}
+
+/// Whether `stored` is a URL bairelay wrote, as left by an earlier run:
+/// one that shares `url`'s prefix up to and including the hook path
+/// prefix, or one on any host whose path is exactly a hook path (after
+/// a config or host change).
+fn is_own_stale_url(stored: &str, url: &str) -> bool {
+	use crate::webhook_listener::{is_hook_path, HOOK_PATH_PREFIX};
+	let same_listener = url
+		.find(HOOK_PATH_PREFIX)
+		.map(|i| &url[..i + HOOK_PATH_PREFIX.len()])
+		.is_some_and(|prefix| stored.starts_with(prefix));
+	// The authority ends at the first `/`, `?` or `#`; only a `/` there
+	// starts a path.
+	let hook_path = stored
+		.split_once("://")
+		.map(|(_, rest)| &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..])
+		.is_some_and(|path| path.starts_with('/') && is_hook_path(path));
+	same_listener || hook_path
 }
 
 // ── LED / IR Initial Publish ─────────────────────────────────────────
@@ -986,6 +1384,7 @@ mod tests {
 			Duration::from_secs(30),
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 		));
 
 		// Push a Start event and wait briefly for the publish to
@@ -1665,6 +2064,7 @@ mod tests {
 			Duration::from_secs(30),
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 		));
 
 		// Start then Stop in quick succession.
@@ -1726,6 +2126,7 @@ mod tests {
 			hold,
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 		));
 
 		// Start → wake lock acquired.
@@ -1797,6 +2198,7 @@ mod tests {
 			hold,
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 		));
 
 		// Start → Stop → Start, all within the hold-down window.
@@ -1864,6 +2266,7 @@ mod tests {
 			Duration::from_secs(30),
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 		));
 
 		motion_tx
@@ -1923,6 +2326,7 @@ mod tests {
 			Duration::from_secs(30),
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 		));
 
 		// Push one Err into the motion channel. The listener will log
@@ -1979,6 +2383,22 @@ mod tests {
 			cache: Arc<StatusCache>,
 			streams: usize,
 		) -> Self {
+			Self::spawn_full(hold, caps, cache, streams, None)
+		}
+
+		/// A rig whose listener treats a press within `window` as a
+		/// held visitor state.
+		fn spawn_held(hold: Duration, cache: Arc<StatusCache>, window: Duration) -> Self {
+			Self::spawn_full(hold, CameraCapabilities::default(), cache, 1, Some(window))
+		}
+
+		fn spawn_full(
+			hold: Duration,
+			caps: CameraCapabilities,
+			cache: Arc<StatusCache>,
+			streams: usize,
+			held_press_window: Option<Duration>,
+		) -> Self {
 			let mut builder = FakeCameraBuilder::new();
 			let mut txs = Vec::with_capacity(streams);
 			for _ in 0..streams {
@@ -2002,6 +2422,7 @@ mod tests {
 				hold,
 				Arc::clone(&cache),
 				caps,
+				held_press_window,
 			));
 			Self {
 				txs,
@@ -2014,14 +2435,20 @@ mod tests {
 			}
 		}
 
-		/// Queue one update without letting the listener run.
-		async fn queue(&self, motion: MotionStatus, objects: Option<AiObjects>, press: bool) {
-			let update = bairelay_neolink_core::bc_protocol::AlarmUpdate {
+		/// Queue one update without letting the listener run. `visitor`
+		/// is the raw state, as `listen_on_motion` reports it; the
+		/// listener derives presses from it.
+		async fn queue(&self, motion: MotionStatus, objects: Option<AiObjects>, visitor: bool) {
+			self.queue_update(bairelay_neolink_core::bc_protocol::AlarmUpdate {
 				motion,
 				objects,
-				visitor: Some(press),
-				doorbell_press: press,
-			};
+				visitor: Some(visitor),
+				doorbell_press: false,
+			})
+			.await;
+		}
+
+		async fn queue_update(&self, update: bairelay_neolink_core::bc_protocol::AlarmUpdate) {
 			self.txs[self.stream].send(Ok(update)).await.unwrap();
 		}
 
@@ -2035,8 +2462,8 @@ mod tests {
 		}
 
 		/// Queue one update and let the listener process it.
-		async fn send(&self, motion: MotionStatus, objects: Option<AiObjects>, press: bool) {
-			self.queue(motion, objects, press).await;
+		async fn send(&self, motion: MotionStatus, objects: Option<AiObjects>, visitor: bool) {
+			self.queue(motion, objects, visitor).await;
 			settle().await;
 		}
 
@@ -2278,6 +2705,115 @@ mod tests {
 		tokio::time::sleep(Duration::from_secs(2)).await;
 		assert_eq!(rig.wake_lock.count(), 0);
 		rig.stop().await;
+	}
+
+	/// `visitor` is a state the doorbell repeats in every push for
+	/// seconds after one press; a press is only its rising edge. Two
+	/// physical presses in this live sequence publish exactly two.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_presses_at_visitor_rising_edges() {
+		use bairelay_neolink_core::bc_protocol::classify_alarm;
+		let rig = AlarmRig::spawn(Duration::from_secs(30));
+		let pushes: [(&str, &str); 12] = [
+			("MD", "none"),
+			("MD", "people"),
+			("MD,visitor", "people"),
+			("visitor", "people"),
+			("none", "people"),
+			("none", "none"),
+			("MD", "people"),
+			("MD,visitor", "people"),
+			("MD,visitor", "none"),
+			("MD,visitor", "people"),
+			("visitor", "people"),
+			("none", "none"),
+		];
+		let mut presses = vec![];
+		for (index, (status, ai_type)) in pushes.into_iter().enumerate() {
+			let before = rig.rows("doorbell").len();
+			rig.queue_update(classify_alarm(
+				status,
+				Some(ai_type),
+				std::time::Instant::now(),
+			))
+			.await;
+			settle().await;
+			if rig.rows("doorbell").len() > before {
+				presses.push(index + 1);
+			}
+			// Space every push beyond the press dedupe window, so only
+			// the edge decides which pushes are presses.
+			tokio::time::sleep(
+				crate::status_cache::DOORBELL_PRESS_DEDUPE_WINDOW + Duration::from_secs(1),
+			)
+			.await;
+		}
+		assert_eq!(presses, vec![3, 8], "presses at the visitor rising edges");
+		rig.stop().await;
+	}
+
+	/// The press edge starts again on each subscribe: the first
+	/// `visitor` push a new subscription sees is a press.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_press_edge_resets_on_resubscribe() {
+		let mut rig = AlarmRig::spawn_streams(
+			Duration::from_secs(30),
+			CameraCapabilities::default(),
+			empty_cache(),
+			2,
+		);
+		rig.send(no_change(), None, true).await;
+		rig.send(no_change(), None, true).await;
+		assert_eq!(rig.rows("doorbell").len(), 1, "held: one press");
+		rig.fail_stream().await;
+		tokio::time::sleep(crate::status_cache::DOORBELL_PRESS_DEDUPE_WINDOW).await;
+		rig.send(no_change(), None, true).await;
+		assert_eq!(
+			rig.rows("doorbell").len(),
+			2,
+			"first visitor after resubscribe"
+		);
+		rig.stop().await;
+	}
+
+	/// A session that comes up while the camera still reports the
+	/// `visitor` state of a press already published (e.g. by the
+	/// webhook) publishes no second press, even past the dedupe window.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_skips_the_held_visitor_of_a_recent_press() {
+		let cache = empty_cache();
+		assert!(cache.claim_doorbell_press(tokio::time::Instant::now()));
+		tokio::time::sleep(Duration::from_secs(15)).await;
+		let rig = AlarmRig::spawn_held(Duration::from_secs(30), cache, Duration::from_secs(30));
+		rig.send(no_change(), None, true).await;
+		rig.send(no_change(), None, true).await;
+		assert!(rig.rows("doorbell").is_empty(), "the held visitor state");
+		// Cleared, then pressed again: a new press.
+		rig.send(no_change(), None, false).await;
+		rig.send(no_change(), None, true).await;
+		assert_eq!(rig.rows("doorbell"), vec![("press".to_string(), false)]);
+		rig.stop().await;
+	}
+
+	/// A press older than the window, or no window, leaves the first
+	/// `visitor` push a press.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_presses_on_a_visitor_outside_the_window() {
+		for window in [Some(Duration::from_secs(30)), None] {
+			let cache = empty_cache();
+			assert!(cache.claim_doorbell_press(tokio::time::Instant::now()));
+			tokio::time::sleep(Duration::from_secs(31)).await;
+			let rig = AlarmRig::spawn_full(
+				Duration::from_secs(30),
+				CameraCapabilities::default(),
+				cache,
+				1,
+				window,
+			);
+			rig.send(no_change(), None, true).await;
+			assert_eq!(rig.rows("doorbell").len(), 1, "{window:?}");
+			rig.stop().await;
+		}
 	}
 
 	/// A press inside the post-motion hold re-arms it from the press.
@@ -2701,6 +3237,7 @@ mod tests {
 			Duration::from_secs(30),
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 		));
 
 		// Give the listener enough wall time to invoke
@@ -3073,6 +3610,507 @@ mod tests {
 			.any(|(t, _, _)| t == "bairelay/cam-pst/status/pir"));
 	}
 
+	// ── ha_cfg_support ───────────────────────────────────────────────
+
+	fn ha_cfg_sample() -> bairelay_neolink_core::bc::xml::HaCfg {
+		bairelay_neolink_core::bc::xml::HaCfg {
+			version: "1.1".into(),
+			enable: 1,
+			url: "http://192.0.2.10/h".into(),
+			verify_cert: 0,
+		}
+	}
+
+	/// Fake whose HaCfg read fails with `errs` in order, then succeeds.
+	fn scripted_ha_cfg(
+		errs: Vec<fn() -> bairelay_neolink_core::Error>,
+	) -> (Arc<dyn CameraDriver>, Arc<std::sync::atomic::AtomicUsize>) {
+		let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let c = Arc::clone(&calls);
+		let fake = FakeCameraBuilder::new()
+			.with_ha_cfg(move || {
+				let n = c.fetch_add(1, Ordering::SeqCst);
+				match errs.get(n) {
+					Some(f) => Err(f()),
+					None => Ok(Some(ha_cfg_sample())),
+				}
+			})
+			.build();
+		(fake, calls)
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ha_cfg_support_retries_wake_400_then_some() {
+		let (cam, calls) = scripted_ha_cfg(vec![|| unavailable(806)]);
+		let got = ha_cfg_support(cam.as_ref(), "cam1", &CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(got, HaCfgSupport::Supported(ha_cfg_sample()));
+		assert_eq!(calls.load(Ordering::SeqCst), 2);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ha_cfg_support_persistent_400_is_none_after_window() {
+		let (cam, calls) = scripted_ha_cfg(vec![|| unavailable(806); 30]);
+		let t0 = tokio::time::Instant::now();
+		let got = ha_cfg_support(cam.as_ref(), "cam1", &CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(got, HaCfgSupport::ErrorReply(400));
+		assert_eq!(calls.load(Ordering::SeqCst), 7);
+		assert_eq!(t0.elapsed(), NOT_READY_WINDOW);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ha_cfg_support_other_error_code_is_none_immediately() {
+		let (cam, calls) = scripted_ha_cfg(vec![|| {
+			bairelay_neolink_core::Error::CameraServiceUnavailable { id: 806, code: 404 }
+		}]);
+		let t0 = tokio::time::Instant::now();
+		let got = ha_cfg_support(cam.as_ref(), "cam1", &CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(got, HaCfgSupport::ErrorReply(404));
+		assert_eq!(got.error_code(), Some(404));
+		assert_eq!(calls.load(Ordering::SeqCst), 1);
+		assert_eq!(t0.elapsed(), Duration::ZERO);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ha_cfg_support_empty_reply_has_no_code() {
+		let fake = FakeCameraBuilder::new().with_ha_cfg(|| Ok(None)).build();
+		let got = ha_cfg_support(fake.as_ref(), "cam1", &CancellationToken::new())
+			.await
+			.unwrap();
+		assert_eq!(got, HaCfgSupport::EmptyReply);
+		assert_eq!(got.error_code(), None);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ha_cfg_support_transport_error_is_err() {
+		let (cam, calls) = scripted_ha_cfg(vec![|| bairelay_neolink_core::Error::Other("boom")]);
+		let err = ha_cfg_support(cam.as_ref(), "cam1", &CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert!(format!("{err:#}").contains("get_ha_cfg failed"));
+		assert_eq!(calls.load(Ordering::SeqCst), 1);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ha_cfg_support_timeout_is_err() {
+		let fake = FakeCameraBuilder::new().with_ha_cfg_pending().build();
+		let err = ha_cfg_support(fake.as_ref(), "cam1", &CancellationToken::new())
+			.await
+			.unwrap_err();
+		assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn ha_cfg_support_cancelled_is_err() {
+		let fake = FakeCameraBuilder::new().with_ha_cfg_pending().build();
+		let cancel = CancellationToken::new();
+		cancel.cancel();
+		let err = ha_cfg_support(fake.as_ref(), "cam1", &cancel)
+			.await
+			.unwrap_err();
+		assert!(format!("{err:#}").contains("cancelled"));
+	}
+
+	// ── arm_webhook ──────────────────────────────────────────────────
+
+	const ARM_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+	const ARM_URL: &str = "http://192.0.2.5:8780/hook/0123456789abcdef0123456789abcdef";
+	const FOREIGN_URL: &str =
+		"http://user:pw@ha.example.com:8123/api/webhook/SECRETID?key=QUERYSECRET";
+
+	fn ha_cfg(enable: u8, url: &str, verify_cert: u8) -> bairelay_neolink_core::bc::xml::HaCfg {
+		bairelay_neolink_core::bc::xml::HaCfg {
+			version: "1.1".into(),
+			enable,
+			url: url.into(),
+			verify_cert,
+		}
+	}
+
+	/// What [`arm_webhook`] writes for [`ARM_URL`].
+	fn armed_cfg() -> bairelay_neolink_core::bc::xml::HaCfg {
+		ha_cfg(1, ARM_URL, 0)
+	}
+
+	/// Fake whose first HaCfg read returns `stored`; the read-back after
+	/// a write returns `back`.
+	fn ha_cfg_camera(
+		stored: bairelay_neolink_core::bc::xml::HaCfg,
+		back: Option<bairelay_neolink_core::bc::xml::HaCfg>,
+	) -> Arc<bairelay_neolink_core::bc_protocol::FakeCamera> {
+		let reads = std::sync::atomic::AtomicUsize::new(0);
+		FakeCameraBuilder::new()
+			.with_ha_cfg(move || match reads.fetch_add(1, Ordering::SeqCst) {
+				0 => Ok(Some(stored.clone())),
+				_ => Ok(back.clone()),
+			})
+			.build()
+	}
+
+	async fn arm(camera: &bairelay_neolink_core::bc_protocol::FakeCamera) -> ArmOutcome {
+		arm_webhook(
+			camera,
+			"cam1",
+			ARM_URL,
+			&ArmMemo::default(),
+			&CancellationToken::new(),
+		)
+		.await
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_unsupported_logs_once_per_flag_and_never_writes() {
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let fake = FakeCameraBuilder::new().with_ha_cfg(|| Ok(None)).build();
+		let memo = ArmMemo::default();
+		for _ in 0..3 {
+			let got = arm_webhook(
+				fake.as_ref(),
+				"cam1",
+				ARM_URL,
+				&memo,
+				&CancellationToken::new(),
+			)
+			.await;
+			assert_eq!(got, ArmOutcome::Unsupported);
+		}
+		assert_eq!(
+			logs.text().matches("lacks HaCfg").count(),
+			1,
+			"{}",
+			logs.text()
+		);
+		assert!(!logs.text().contains("code="), "{}", logs.text());
+		assert!(fake.calls().set_ha_cfg.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_unsupported_logs_the_error_reply_code() {
+		let logs = crate::test_logs::capture_at(tracing::Level::INFO);
+		let fake = FakeCameraBuilder::new()
+			.with_ha_cfg(|| {
+				Err(bairelay_neolink_core::Error::CameraServiceUnavailable { id: 806, code: 404 })
+			})
+			.build();
+		assert_eq!(arm(&fake).await, ArmOutcome::Unsupported);
+		let out = logs.text();
+		assert!(
+			out.lines()
+				.any(|l| l.contains("lacks HaCfg") && l.contains("code=404")),
+			"{out}"
+		);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_already_armed_writes_nothing() {
+		for stored in [armed_cfg(), ha_cfg(1, ARM_URL, 1)] {
+			let fake = ha_cfg_camera(stored, None);
+			assert_eq!(arm(&fake).await, ArmOutcome::AlreadyArmed);
+			assert!(fake.calls().set_ha_cfg.lock().unwrap().is_empty());
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_replaces_a_foreign_url_and_logs_only_its_host() {
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let fake = ha_cfg_camera(ha_cfg(1, FOREIGN_URL, 1), Some(armed_cfg()));
+		assert_eq!(arm(&fake).await, ArmOutcome::Armed);
+		assert_eq!(*fake.calls().set_ha_cfg.lock().unwrap(), vec![armed_cfg()]);
+		let out = logs.text();
+		let warning = out
+			.lines()
+			.find(|l| l.contains("WARN") && l.contains("another webhook"))
+			.unwrap_or_else(|| panic!("no replace warning in {out}"));
+		assert!(warning.contains("cam1"), "{warning}");
+		assert!(warning.contains("ha.example.com"), "{warning}");
+		for secret in [
+			"SECRETID",
+			"QUERYSECRET",
+			"/api/",
+			"user:pw",
+			"8123",
+			ARM_TOKEN,
+		] {
+			assert!(!out.contains(secret), "{secret} leaked into {out}");
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_writes_an_empty_or_disabled_config_without_a_foreign_warning() {
+		let mut unversioned = ha_cfg(0, "", 1);
+		unversioned.version.clear();
+		for stored in [unversioned, ha_cfg(0, ARM_URL, 0)] {
+			let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+			let fake = ha_cfg_camera(stored.clone(), Some(armed_cfg()));
+			assert_eq!(arm(&fake).await, ArmOutcome::Armed, "{stored:?}");
+			assert_eq!(*fake.calls().set_ha_cfg.lock().unwrap(), vec![armed_cfg()]);
+			let out = logs.text();
+			assert!(!out.contains("WARN"), "{out}");
+			assert!(!out.contains(ARM_TOKEN), "{out}");
+		}
+	}
+
+	/// A URL from an earlier run differs from ours only in its token.
+	#[tokio::test(start_paused = true)]
+	async fn arm_refreshes_our_own_stale_token_without_a_warning() {
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let stale = "http://192.0.2.5:8780/hook/ffffffffffffffffffffffffffffffff";
+		let fake = ha_cfg_camera(ha_cfg(1, stale, 0), Some(armed_cfg()));
+		assert_eq!(arm(&fake).await, ArmOutcome::Armed);
+		assert_eq!(*fake.calls().set_ha_cfg.lock().unwrap(), vec![armed_cfg()]);
+		let out = logs.text();
+		assert!(!out.contains("WARN"), "{out}");
+		assert!(
+			out.lines()
+				.any(|l| l.contains("INFO") && l.contains("Refreshing webhook token")),
+			"{out}"
+		);
+		for secret in ["ffffffff", ARM_TOKEN] {
+			assert!(!out.contains(secret), "{secret} leaked into {out}");
+		}
+	}
+
+	/// A hook URL of bairelay's on another host or port (the config or
+	/// this host changed) is bairelay's own, refreshed without a warning.
+	#[tokio::test(start_paused = true)]
+	async fn arm_refreshes_our_own_url_from_another_host_without_a_warning() {
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let moved = "http://198.51.100.7:9999/hook/ffffffffffffffffffffffffffffffff";
+		let fake = ha_cfg_camera(ha_cfg(1, moved, 0), Some(armed_cfg()));
+		assert_eq!(arm(&fake).await, ArmOutcome::Armed);
+		let out = logs.text();
+		assert!(!out.contains("WARN"), "{out}");
+		assert!(out.contains("Refreshing webhook token"), "{out}");
+	}
+
+	#[test]
+	fn own_stale_url_table() {
+		let token = "ffffffffffffffffffffffffffffffff";
+		let cases = [
+			(format!("http://192.0.2.5:8780/hook/{token}"), true),
+			(format!("http://example.com/hook/{token}"), true),
+			(format!("https://[2001:db8::1]:1/hook/{token}"), true),
+			// The same listener with any token.
+			("http://192.0.2.5:8780/hook/x".to_string(), true),
+			// Elsewhere, only a path of exactly `/hook/` + 32 lowercase hex.
+			(format!("http://example.com/hook/{}", &token[..31]), false),
+			(format!("http://example.com/hook/{token}0"), false),
+			(
+				format!("http://example.com/hook/{}", token.to_uppercase()),
+				false,
+			),
+			(format!("http://example.com/hook/{token}?a=1"), false),
+			(format!("http://example.com/x/hook/{token}"), false),
+			(format!("http://example.com/hook/{token}/"), false),
+			("http://example.com/api/webhook/abc".to_string(), false),
+			// A `/hook/…` inside a query or fragment is no path.
+			(format!("http://example.com?/hook/{token}"), false),
+			(format!("http://example.com#/hook/{token}"), false),
+			(format!("http://example.com:8780?x/hook/{token}"), false),
+			(String::new(), false),
+		];
+		for (stored, want) in cases {
+			assert_eq!(is_own_stale_url(&stored, ARM_URL), want, "{stored}");
+		}
+	}
+
+	/// A new desired URL (the camera's IP changed) is written even
+	/// though the camera still stores what it stored last time.
+	#[tokio::test(start_paused = true)]
+	async fn arm_writes_a_new_desired_url_over_a_remembered_mismatch() {
+		let truncated = ha_cfg(1, &ARM_URL[..40], 0);
+		let fake = ha_cfg_camera(ha_cfg(0, "", 0), Some(truncated));
+		let memo = ArmMemo::default();
+		let moved = ARM_URL.replace("192.0.2.5", "192.0.2.6");
+		for (url, writes) in [
+			(ARM_URL, 1),
+			(ARM_URL, 1),
+			(moved.as_str(), 2),
+			(moved.as_str(), 2),
+		] {
+			let got =
+				arm_webhook(fake.as_ref(), "cam1", url, &memo, &CancellationToken::new()).await;
+			assert_eq!(got, ArmOutcome::Unconfirmed, "{url}");
+			assert_eq!(
+				fake.calls().set_ha_cfg.lock().unwrap().len(),
+				writes,
+				"{url}"
+			);
+		}
+	}
+
+	/// Each skip reason warns once; repeats of a reason log at debug.
+	#[test]
+	fn report_no_host_warns_once_per_reason() {
+		use crate::webhook_listener::NoWebhookHost::{LoopbackOnly, UnknownCamera};
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let memo = ArmMemo::default();
+		for reason in [
+			UnknownCamera,
+			UnknownCamera,
+			LoopbackOnly,
+			LoopbackOnly,
+			UnknownCamera,
+		] {
+			memo.report_no_host("cam1", reason);
+		}
+		let out = logs.text();
+		let warns: Vec<&str> = out.lines().filter(|l| l.contains("WARN")).collect();
+		assert_eq!(warns.len(), 2, "{out}");
+		assert!(warns[0].contains("address is unknown"), "{out}");
+		assert!(warns[1].contains("loopback"), "{out}");
+		assert_eq!(out.matches("DEBUG").count(), 3, "{out}");
+	}
+
+	/// A camera that keeps storing something other than what was
+	/// written (here a truncated URL) is written once, not every pass.
+	#[tokio::test(start_paused = true)]
+	async fn arm_does_not_rewrite_what_the_camera_keeps_storing() {
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let truncated = ha_cfg(1, &ARM_URL[..40], 0);
+		let fake = ha_cfg_camera(ha_cfg(0, "", 0), Some(truncated));
+		let memo = ArmMemo::default();
+		for _ in 0..3 {
+			let got = arm_webhook(
+				fake.as_ref(),
+				"cam1",
+				ARM_URL,
+				&memo,
+				&CancellationToken::new(),
+			)
+			.await;
+			assert_eq!(got, ArmOutcome::Unconfirmed);
+		}
+		assert_eq!(fake.calls().set_ha_cfg.lock().unwrap().len(), 1);
+		let out = logs.text();
+		assert_eq!(out.matches("WARN").count(), 1, "{out}");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_warns_when_the_read_back_differs() {
+		for back in [
+			None,
+			Some(ha_cfg(0, ARM_URL, 0)),
+			Some(ha_cfg(1, FOREIGN_URL, 0)),
+			Some(ha_cfg(1, ARM_URL, 1)),
+		] {
+			let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+			let fake = ha_cfg_camera(ha_cfg(0, "", 0), back.clone());
+			assert_eq!(arm(&fake).await, ArmOutcome::Unconfirmed, "{back:?}");
+			let out = logs.text();
+			assert!(
+				out.lines()
+					.any(|l| l.contains("WARN") && l.contains("read-back")),
+				"{out}"
+			);
+			for secret in ["SECRETID", "QUERYSECRET", ARM_TOKEN] {
+				assert!(!out.contains(secret), "{secret} leaked into {out}");
+			}
+		}
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_cancel_during_the_write_returns_at_once() {
+		let fake = FakeCameraBuilder::new()
+			.with_ha_cfg(|| Ok(Some(ha_cfg(0, "", 0))))
+			.with_set_ha_cfg_pending()
+			.build();
+		let cancel = CancellationToken::new();
+		let task = {
+			let fake = Arc::clone(&fake);
+			let cancel = cancel.clone();
+			tokio::spawn(async move {
+				arm_webhook(fake.as_ref(), "cam1", ARM_URL, &ArmMemo::default(), &cancel).await
+			})
+		};
+		for _ in 0..1000 {
+			if !fake.calls().set_ha_cfg.lock().unwrap().is_empty() {
+				break;
+			}
+			tokio::task::yield_now().await;
+		}
+		assert_eq!(
+			fake.calls().set_ha_cfg.lock().unwrap().len(),
+			1,
+			"write issued"
+		);
+		let t0 = tokio::time::Instant::now();
+		cancel.cancel();
+		assert_eq!(task.await.unwrap(), ArmOutcome::Cancelled);
+		assert_eq!(t0.elapsed(), Duration::ZERO);
+		assert_eq!(*fake.calls().set_ha_cfg.lock().unwrap(), vec![armed_cfg()]);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_write_is_bounded() {
+		let fake = FakeCameraBuilder::new()
+			.with_ha_cfg(|| Ok(Some(ha_cfg(0, "", 0))))
+			.with_set_ha_cfg_pending()
+			.build();
+		let t0 = tokio::time::Instant::now();
+		assert_eq!(arm(&fake).await, ArmOutcome::Failed);
+		assert_eq!(t0.elapsed(), HA_CFG_SET_TIMEOUT);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_read_failure_writes_nothing() {
+		let fake = FakeCameraBuilder::new()
+			.with_ha_cfg(|| Err(bairelay_neolink_core::Error::Other("boom")))
+			.build();
+		assert_eq!(arm(&fake).await, ArmOutcome::Failed);
+		assert!(fake.calls().set_ha_cfg.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn arm_cancelled_read_writes_nothing() {
+		let fake = FakeCameraBuilder::new().with_ha_cfg_pending().build();
+		let cancel = CancellationToken::new();
+		cancel.cancel();
+		let got = arm_webhook(fake.as_ref(), "cam1", ARM_URL, &ArmMemo::default(), &cancel).await;
+		assert_eq!(got, ArmOutcome::Cancelled);
+		assert!(fake.calls().set_ha_cfg.lock().unwrap().is_empty());
+	}
+
+	#[test]
+	fn url_host_keeps_only_the_host() {
+		for (url, want) in [
+			(FOREIGN_URL, Some("ha.example.com")),
+			("http://192.0.2.7:8123/api/webhook/x", Some("192.0.2.7")),
+			("https://example.com", Some("example.com")),
+			("http://example.com?k=v", Some("example.com")),
+			("http://example.com#frag", Some("example.com")),
+			("HTTPS://example.com/x", Some("example.com")),
+			("example.com/path", None),
+			("SECRET", None),
+			("SECRET/path", None),
+			("ftp://example.com/x", None),
+			("http://u/ser:pw@host/x", None),
+			("http://TOKEN/x@host/", None),
+			("http://TOKEN?x@host/", None),
+			("http://[2001:db8::1]:8123/x", Some("[2001:db8::1]")),
+			("http://u@[2001:db8::1]/x", Some("[2001:db8::1]")),
+			("http://a@b@example.com/x", Some("example.com")),
+			("", None),
+			("http://", None),
+			("http:///path", None),
+			("http://:8123/x", None),
+			("http://[2001:db8::1/x", None),
+			("http://exa mple.com/x", None),
+			("http://example.com\u{1b}[31m/x", None),
+			("http://ex\nample.com/x", None),
+			("http://éxample.com/x", None),
+		] {
+			assert_eq!(url_host(url), want, "{url:?}");
+		}
+		let long = format!("http://{}/x", "a".repeat(300));
+		assert_eq!(url_host(&long), None);
+	}
+
 	// ── snapshot_with_retry ──────────────────────────────────────────
 
 	fn unavailable(id: u32) -> bairelay_neolink_core::Error {
@@ -3138,7 +4176,7 @@ mod tests {
 			.expect("not cancelled");
 		assert!(got.unwrap().is_err());
 		assert_eq!(calls.load(Ordering::SeqCst), 7);
-		assert_eq!(t0.elapsed(), SNAPSHOT_NOT_READY_WINDOW);
+		assert_eq!(t0.elapsed(), NOT_READY_WINDOW);
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -3189,36 +4227,16 @@ mod tests {
 		assert_eq!(calls.load(Ordering::SeqCst), 1);
 	}
 
-	#[derive(Clone, Default)]
-	struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
-
-	impl std::io::Write for LogSink {
-		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-			self.0.lock().unwrap().extend_from_slice(buf);
-			Ok(buf.len())
-		}
-		fn flush(&mut self) -> std::io::Result<()> {
-			Ok(())
-		}
-	}
-
 	/// Failure, failure, success, failure: warn, debug, (reset), warn.
 	#[test]
 	fn preview_failure_warns_once_per_streak() {
-		let sink = LogSink::default();
-		let writer = sink.clone();
-		let subscriber = tracing_subscriber::fmt()
-			.with_max_level(tracing::Level::DEBUG)
-			.with_ansi(false)
-			.with_writer(move || writer.clone())
-			.finish();
-		let _guard = tracing::subscriber::set_default(subscriber);
+		let captured = crate::test_logs::capture_at(tracing::Level::DEBUG);
 		let mut failing = false;
 		log_preview_failure(&mut failing, "cam1", &"boom");
 		log_preview_failure(&mut failing, "cam1", &"boom");
 		failing = false; // a success resets the streak
 		log_preview_failure(&mut failing, "cam1", &"boom");
-		let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+		let logs = captured.text();
 		assert_eq!(logs.matches("WARN").count(), 2, "{logs}");
 		assert_eq!(logs.matches("DEBUG").count(), 1, "{logs}");
 	}

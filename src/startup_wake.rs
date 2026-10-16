@@ -2,7 +2,7 @@
 //!
 //! For every configured camera we briefly hold a wake lock, pull the Main
 //! stream long enough to capture an I-frame, then ask the camera for a JPEG
-//! snapshot and stash it in the shared [`LastFrameBuffer`]. When the wake
+//! snapshot and stash it in the shared [`LastFrameBuffer`](bairelay_rtsp::buffer::LastFrameBuffer). When the wake
 //! lock guard drops at the end of the per-camera task the normal grace
 //! period kicks in, so battery cameras can return to sleep without any
 //! special-casing.
@@ -43,7 +43,7 @@ const AUDIO_OBSERVE_WINDOW: Duration = Duration::from_secs(2);
 /// Warm the last-frame buffer for every camera in `cameras`.
 ///
 /// Each camera is processed concurrently in its own spawned task and capped
-/// by [`PER_CAMERA_TIMEOUT`]. Returns once every per-camera task has
+/// by `PER_CAMERA_TIMEOUT`. Returns once every per-camera task has
 /// finished (success or failure). This is a mandatory part of boot: the
 /// last-frame buffer backs the RTSP placeholder during wake, the MQTT
 /// preview topic, and HA discovery's capability-gated entities (PTZ
@@ -51,7 +51,7 @@ const AUDIO_OBSERVE_WINDOW: Duration = Duration::from_secs(2);
 ///
 /// `cancel` is the global shutdown token. If it fires during the warm cycle
 /// each in-flight camera task bails out on the next poll so Ctrl+C during
-/// startup doesn't stall up to [`PER_CAMERA_TIMEOUT`] per camera waiting on
+/// startup doesn't stall up to `PER_CAMERA_TIMEOUT` per camera waiting on
 /// a dead network.
 pub async fn warm_last_frame_buffers(
 	cameras: &Arc<HashMap<String, Arc<CameraHandle>>>,

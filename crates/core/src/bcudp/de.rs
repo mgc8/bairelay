@@ -191,14 +191,11 @@ mod tests {
 	use crate::bcudp::xml::*;
 	use assert_matches::assert_matches;
 	use bytes::BytesMut;
-	use env_logger::Env;
 	use log::*;
 	use std::io::ErrorKind;
 
 	fn init() {
-		let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-			.is_test(true)
-			.try_init();
+		crate::test_logs::init();
 	}
 
 	#[test]

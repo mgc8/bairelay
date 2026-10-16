@@ -107,7 +107,6 @@ mod tests {
 	use super::len_as_u32;
 	use crate::bcudp::model::*;
 	use bytes::BytesMut;
-	use env_logger::Env;
 
 	#[test]
 	fn len_as_u32_passes_in_range_values() {
@@ -125,9 +124,7 @@ mod tests {
 	}
 
 	fn init() {
-		let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-			.is_test(true)
-			.try_init();
+		crate::test_logs::init();
 	}
 
 	#[test]

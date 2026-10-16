@@ -1779,3 +1779,59 @@ mod proptest_arbitrary_xml {
 		}
 	}
 }
+
+#[test]
+fn xml_ha_cfg_roundtrip_preserves_all_fields() {
+	let xml = indoc!(
+		r#"
+		<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<HaCfg version="1.1">
+		<enable>1</enable>
+		<url>http://192.0.2.10:8080/hook/cam1</url>
+		<verify_cert>0</verify_cert>
+		</HaCfg>
+		</body>"#
+	);
+	let parsed = assert_xml_roundtrip_via_bcxml(xml);
+	let cfg = parsed.ha_cfg.as_ref().expect("ha_cfg present");
+	assert_eq!(cfg.version, "1.1");
+	assert_eq!(cfg.enable, 1);
+	assert_eq!(cfg.url, "http://192.0.2.10:8080/hook/cam1");
+	assert_eq!(cfg.verify_cert, 0);
+}
+
+#[test]
+fn xml_ha_cfg_tolerates_missing_fields() {
+	let xml = indoc!(
+		r#"
+		<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<HaCfg version="1.1">
+		</HaCfg>
+		</body>"#
+	);
+	let parsed = BcXml::try_parse(xml.as_bytes()).unwrap();
+	let cfg = parsed.ha_cfg.as_ref().unwrap();
+	assert_eq!(cfg.enable, 0);
+	assert_eq!(cfg.url, "");
+	assert_eq!(cfg.verify_cert, 0);
+}
+
+#[test]
+fn xml_ha_cfg_serializes_with_element_names() {
+	let body = BcXml {
+		ha_cfg: Some(HaCfg {
+			version: "1.1".into(),
+			enable: 1,
+			url: "http://192.0.2.10/h".into(),
+			verify_cert: 1,
+		}),
+		..Default::default()
+	};
+	let out = String::from_utf8(body.serialize(vec![]).unwrap()).unwrap();
+	assert!(out.contains("<HaCfg version=\"1.1\">"), "{out}");
+	assert!(out.contains("<enable>1</enable>"), "{out}");
+	assert!(out.contains("<url>http://192.0.2.10/h</url>"), "{out}");
+	assert!(out.contains("<verify_cert>1</verify_cert>"), "{out}");
+}

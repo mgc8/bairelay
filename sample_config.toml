@@ -73,6 +73,16 @@ bind = "0.0.0.0"
 # motion_wake_hold_secs = 30           # wake-lock window per push event
 
 
+# HaCfg webhook listener for cameras with webhook = true (battery doorbells).
+# Arming replaces any other webhook URL on the camera (e.g. HA's Reolink integration).
+# [webhook]
+# enable = false                       # opt-in
+# webhook_addr = "0.0.0.0"             # default: top-level bind
+# webhook_port = 8780
+# webhook_advertise = "10.0.0.5:8780"  # host:port cameras POST to
+# motion_wake_hold_secs = 30           # wake-lock window per webhook event
+
+
 # ── Cameras ──
 # Name must match [A-Za-z0-9_-]+. Address OR uid is required.
 
@@ -92,6 +102,7 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 # enabled = true
 # permitted_users = ["me"]
 # debug = false               # trace-dump decrypted protocol payloads; logs credential hashes
+# webhook = false             # report wake reasons via [webhook]; needs [webhook] enable
 
 # [cameras.mqtt]
 # enable_motion     = true    # also carries AI objects + doorbell presses

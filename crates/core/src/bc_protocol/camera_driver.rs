@@ -7,11 +7,12 @@
 //! can hold `Arc<dyn CameraDriver>`.
 
 use async_trait::async_trait;
+use std::net::IpAddr;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::Receiver;
 
 use crate::bc::xml::{
-	AbilityInfo, BatteryInfo, FloodlightStatusList, HttpPort, HttpsPort, LedState, LinkType,
+	AbilityInfo, BatteryInfo, FloodlightStatusList, HaCfg, HttpPort, HttpsPort, LedState, LinkType,
 	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, UserList,
 	VersionInfo,
 };
@@ -71,10 +72,24 @@ pub trait CameraDriver: Send + Sync {
 	/// hardware the camera lacks are placeholders.
 	async fn get_ledstate(&self) -> Result<LedState>;
 
+	/// Read the HTTP webhook configuration (`<HaCfg>`). `None` for an empty
+	/// or `<HaCfg>`-less 200 reply; an error reply is an `Err` (the
+	/// binary's `ha_cfg_support` maps it to "unsupported").
+	async fn get_ha_cfg(&self) -> Result<Option<HaCfg>>;
+
+	/// Write the HTTP webhook configuration, then read it back. `None`
+	/// when the read-back finds no `<HaCfg>`.
+	async fn set_ha_cfg(&self, cfg: &HaCfg) -> Result<Option<HaCfg>>;
+
 	/// Whether the login-time `abilityInfo` lists `name` (any
 	/// permission); `None` when that report was never received. Cached;
 	/// no camera round trip.
 	async fn ability_advertised(&self, name: &str) -> Option<bool>;
+
+	/// The IP of the camera this session is connected to, when the
+	/// session reaches the camera itself (direct TCP or local discovery);
+	/// `None` through remote, map or relay discovery.
+	fn camera_ip(&self) -> Option<IpAddr>;
 
 	/// Read the camera's PTZ preset list.
 	async fn get_ptz_preset(&self) -> Result<PtzPreset>;
@@ -222,8 +237,20 @@ impl CameraDriver for BcCamera {
 		BcCamera::get_ledstate(self).await
 	}
 
+	async fn get_ha_cfg(&self) -> Result<Option<HaCfg>> {
+		BcCamera::get_ha_cfg(self).await
+	}
+
+	async fn set_ha_cfg(&self, cfg: &HaCfg) -> Result<Option<HaCfg>> {
+		BcCamera::set_ha_cfg(self, cfg).await
+	}
+
 	async fn ability_advertised(&self, name: &str) -> Option<bool> {
 		BcCamera::ability_advertised(self, name).await
+	}
+
+	fn camera_ip(&self) -> Option<IpAddr> {
+		BcCamera::camera_ip(self)
 	}
 
 	async fn get_ptz_preset(&self) -> Result<PtzPreset> {
@@ -473,6 +500,13 @@ mod tests {
 			let dr: &dyn CameraDriver = &cam;
 			let _ = run(dr.get_ledstate()).await;
 		}
+		// get_ha_cfg / set_ha_cfg: no reply → timeout.
+		{
+			let cam = err_camera().await;
+			let dr: &dyn CameraDriver = &cam;
+			let _ = run(dr.get_ha_cfg()).await;
+			let _ = run(dr.set_ha_cfg(&HaCfg::default())).await;
+		}
 		// ability_advertised: empty cache → unknown; populated → yes/no.
 		{
 			let cam = err_camera().await;
@@ -481,6 +515,12 @@ mod tests {
 			cam.test_set_ability("ledState", false).await;
 			assert_eq!(dr.ability_advertised("ledState").await, Some(true));
 			assert_eq!(dr.ability_advertised("floodlight").await, Some(false));
+		}
+		// camera_ip: a mock connection has no camera address.
+		{
+			let cam = err_camera().await;
+			let dr: &dyn CameraDriver = &cam;
+			assert_eq!(dr.camera_ip(), None);
 		}
 		// get_ptz_preset: ability fail.
 		{

@@ -14,6 +14,7 @@ pub struct Orchestrator {
 	cancel: CancellationToken,
 	wake_server_config: Option<bairelay_wake_server::WakeServerConfig>,
 	push_listener_config: Option<crate::config::PushListenerConfig>,
+	webhook_config: Option<crate::config::WebhookConfig>,
 	mqtt_client: Option<bairelay_mqtt::SharedMqttClient>,
 	topic_prefix: String,
 }
@@ -72,6 +73,15 @@ impl Orchestrator {
 		// spawn time (in main.rs), not at orchestrator construction.
 		let wake_server_config = config.wake_server.clone();
 		let push_listener_config = config.push_listener.clone();
+		let webhook_config = config.webhook.clone();
+		// Where opted-in cameras' webhooks point; resolved once here.
+		// An unparseable address leaves arming off; startup halts on
+		// it anyway when main.rs binds the listener.
+		let webhook_target = webhook_config.as_ref().filter(|w| w.enable).and_then(|w| {
+			crate::webhook_listener::WebhookTarget::from_config(w, &config.bind_addr)
+				.map_err(|e| tracing::warn!(error = %format!("{e:#}"), "Webhook arming disabled"))
+				.ok()
+		});
 
 		let cameras = config
 			.cameras
@@ -87,6 +97,9 @@ impl Orchestrator {
 					bcmedia_dump.clone(),
 				)
 				.with_prune_grace(prune_grace);
+				if let Some(ref target) = webhook_target {
+					handle = handle.with_webhook_target(target.clone());
+				}
 				if let Some(ref publisher) = discovery_publisher {
 					handle = handle.with_discovery_publisher(publisher.clone());
 				}
@@ -99,6 +112,7 @@ impl Orchestrator {
 			cancel,
 			wake_server_config,
 			push_listener_config,
+			webhook_config,
 			mqtt_client,
 			topic_prefix,
 		}
@@ -110,6 +124,10 @@ impl Orchestrator {
 
 	pub fn push_listener_config(&self) -> Option<&crate::config::PushListenerConfig> {
 		self.push_listener_config.as_ref()
+	}
+
+	pub fn webhook_config(&self) -> Option<&crate::config::WebhookConfig> {
+		self.webhook_config.as_ref()
 	}
 
 	pub fn mqtt_client(&self) -> Option<&bairelay_mqtt::SharedMqttClient> {
@@ -243,8 +261,14 @@ mod tests {
 			push_listener_port: 443,
 			motion_wake_hold_secs: 30.0,
 		});
+		cfg.webhook = Some(crate::config::WebhookConfig {
+			enable: true,
+			webhook_port: 9090,
+			..Default::default()
+		});
 		let cancel = CancellationToken::new();
 		let orch = Orchestrator::new(cfg, cancel, None);
+		assert_eq!(orch.webhook_config().unwrap().webhook_port, 9090);
 		assert!(orch.wake_server_config().is_some());
 		assert!(orch.wake_server_config().unwrap().enable);
 		assert!(orch.push_listener_config().is_some());
@@ -252,6 +276,28 @@ mod tests {
 		// mqtt_client stays None: orchestrator is built without one.
 		assert!(orch.mqtt_client().is_none());
 		assert_eq!(orch.topic_prefix(), "myprefix");
+	}
+
+	#[tokio::test]
+	async fn webhook_target_follows_the_enabled_block() {
+		let block = |enable: bool, addr: &str| crate::config::WebhookConfig {
+			enable,
+			webhook_addr: Some(addr.to_string()),
+			..Default::default()
+		};
+		for (webhook, want) in [
+			(Some(block(true, "192.0.2.5")), true),
+			(Some(block(false, "192.0.2.5")), false),
+			(Some(block(true, "nope")), false),
+			(None, false),
+		] {
+			let mut cfg = crate::config::test_helpers::two_camera_config();
+			cfg.webhook = webhook.clone();
+			let orch = Orchestrator::new(cfg, CancellationToken::new(), None);
+			for cam in orch.cameras() {
+				assert_eq!(cam.webhook_target().is_some(), want, "{webhook:?}");
+			}
+		}
 	}
 
 	#[tokio::test]

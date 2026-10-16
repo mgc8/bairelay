@@ -32,7 +32,7 @@ Owns the application lifecycle:
 - Camera orchestrator: spawns per-camera task trees, manages connections.
 - Wake-lock counter with dual `Notify` and Drop-based RAII guards.
 - Watchdog: 30 s sweep reconciling camera state vs. active wake locks.
-- `Supervisor` (`src/supervisor.rs`) — named-spawn + cancel-on-shutdown for the long-running services (RTSP plain, RTSPS, wake server, push listener, watchdog, startup-wake). MQTT lives outside the supervisor: its event loop has a distinct cancel token because per-camera teardown publishes its final `disconnected` status via MQTT, so MQTT must outlive the orchestrator.
+- `Supervisor` (`src/supervisor.rs`) — named-spawn + cancel-on-shutdown for the long-running services (RTSP plain, RTSPS, wake server, push listener, webhook listener, watchdog, startup-wake). MQTT lives outside the supervisor: its event loop has a distinct cancel token because per-camera teardown publishes its final `disconnected` status via MQTT, so MQTT must outlive the orchestrator.
 - `MqttBackoff` (`src/mqtt_loop.rs`) — exponential backoff (1, 2, 4, 8, 16, 30 s) with log dedupe + 60 s relog window for the broker reconnect path.
 - `sleep_or_cancel` (`src/run_support.rs`) — shared sleep+cancel primitive used by every retry / backoff path.
 - All listener sockets bind synchronously in `main.rs` before any "started" log line; bind failures halt startup.
@@ -163,6 +163,7 @@ global CancellationToken
             ├── floodlight event listener (real-time)
             ├── PIR state poller (one-shot on connect, re-publish on set)
             ├── preview poller (camera-lifetime — see Last-frame buffer)
+            ├── webhook arming (one-shot on connect, `webhook = true` only)
             └── grace period (countdown after last wake-lock release)
 ```
 

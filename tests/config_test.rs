@@ -1995,3 +1995,284 @@ fn validate_accepts_disabled_push_listener_without_wake_server() {
 	});
 	validate_config(&cfg).expect("disabled push_listener must pass");
 }
+
+// ── [webhook] ─────────────────────────────────────────────────────────
+
+const WEBHOOK_CAMERA: &str = r#"
+	[[cameras]]
+	name = "cam1"
+	username = "admin"
+	password = "x"
+	address = "192.0.2.10:9000"
+	webhook = true
+"#;
+
+fn webhook_cfg(block: &str) -> Result<Config, String> {
+	parse_config(&format!("{block}\n{WEBHOOK_CAMERA}"))
+}
+
+#[test]
+fn webhook_block_parses_defaults() {
+	let cfg = webhook_cfg("[webhook]\nenable = true").expect("parse");
+	let wh = cfg.webhook.clone().expect("webhook present");
+	assert!(wh.enable);
+	assert_eq!(wh.webhook_port, 8780);
+	assert_eq!(wh.webhook_port, bairelay::config::DEFAULT_WEBHOOK_PORT);
+	assert!(wh.webhook_addr.is_none());
+	assert!(wh.webhook_advertise.is_none());
+	assert!((wh.motion_wake_hold_secs - 30.0).abs() < f64::EPSILON);
+	assert!(cfg.cameras[0].webhook);
+	validate_config(&cfg).expect("valid");
+}
+
+#[test]
+fn webhook_block_overrides_every_key() {
+	let cfg = webhook_cfg(
+		r#"
+		[webhook]
+		enable = true
+		webhook_addr = "192.0.2.1"
+		webhook_port = 9090
+		webhook_advertise = "bairelay.example.com:8080"
+		motion_wake_hold_secs = 12.5
+	"#,
+	)
+	.expect("parse");
+	let wh = cfg.webhook.clone().expect("webhook present");
+	assert_eq!(wh.webhook_addr.as_deref(), Some("192.0.2.1"));
+	assert_eq!(wh.webhook_port, 9090);
+	assert_eq!(
+		wh.webhook_advertise.as_deref(),
+		Some("bairelay.example.com:8080")
+	);
+	assert!((wh.motion_wake_hold_secs - 12.5).abs() < f64::EPSILON);
+	validate_config(&cfg).expect("valid");
+}
+
+#[test]
+fn webhook_defaults_off_for_block_and_camera() {
+	let cfg = parse_config(
+		r#"
+		[webhook]
+
+		[[cameras]]
+		name = "cam1"
+		username = "admin"
+		password = "x"
+		address = "192.0.2.10"
+	"#,
+	)
+	.expect("parse");
+	assert!(!cfg.webhook.expect("present").enable);
+	assert!(!cfg.cameras[0].webhook);
+	assert!(Config::default().webhook.is_none());
+}
+
+#[test]
+fn webhook_rejects_unknown_field() {
+	let err = webhook_cfg("[webhook]\nenable = true\nbind_port_typo = 1").expect_err("must reject");
+	assert!(err.contains("bind_port_typo"), "error: {err}");
+}
+
+#[test]
+fn validate_rejects_camera_webhook_without_block() {
+	let cfg = parse_config(WEBHOOK_CAMERA).expect("parse");
+	let err = validate_config(&cfg).expect_err("must reject");
+	assert!(
+		err.contains("cam1") && err.contains("[webhook] enable"),
+		"error: {err}"
+	);
+}
+
+#[test]
+fn validate_rejects_camera_webhook_with_disabled_block() {
+	let cfg = webhook_cfg("[webhook]\nenable = false").expect("parse");
+	let err = validate_config(&cfg).expect_err("must reject");
+	assert!(
+		err.contains("cam1") && err.contains("[webhook] enable"),
+		"error: {err}"
+	);
+}
+
+#[test]
+fn validate_accepts_enabled_webhook_without_opted_in_cameras() {
+	let cfg = parse_config(
+		r#"
+		[webhook]
+		enable = true
+
+		[[cameras]]
+		name = "cam1"
+		username = "admin"
+		password = "x"
+		address = "192.0.2.10"
+	"#,
+	)
+	.expect("parse");
+	validate_config(&cfg).expect("valid");
+}
+
+#[test]
+fn validate_rejects_webhook_port_zero() {
+	let cfg = webhook_cfg("[webhook]\nenable = true\nwebhook_port = 0").expect("parse");
+	let err = validate_config(&cfg).expect_err("must reject");
+	assert!(err.contains("webhook_port"), "error: {err}");
+}
+
+#[test]
+fn validate_rejects_unparseable_webhook_addr() {
+	let cfg = webhook_cfg("[webhook]\nenable = true\nwebhook_addr = \"not-an-ip\"").expect("parse");
+	let err = validate_config(&cfg).expect_err("must reject");
+	assert!(err.contains("webhook_addr"), "error: {err}");
+}
+
+#[test]
+fn validate_rejects_unparseable_webhook_advertise() {
+	for bad in [
+		"",
+		"bairelay.example.com",
+		"192.0.2.1",
+		"192.0.2.1:0",
+		"192.0.2.1:http",
+		":8780",
+		"[2001:db8::1]",
+		"2001:db8::1",
+		"bad host:8780",
+		"host/path:8780",
+		"192.0.2.1:8780/hook",
+		"192.0.2.1:65536",
+		"0.0.0.0:8780",
+		"[::]:8780",
+		"224.0.0.1:8780",
+		"[ff02::1]:8780",
+	] {
+		let cfg = webhook_cfg(&format!(
+			"[webhook]\nenable = true\nwebhook_advertise = \"{bad}\""
+		))
+		.expect("parse");
+		let err = validate_config(&cfg).expect_err(&format!("{bad:?} must reject"));
+		assert!(err.contains("webhook_advertise"), "{bad:?}: {err}");
+	}
+}
+
+#[test]
+fn webhook_advertise_parses_host_and_port() {
+	use bairelay::config::parse_webhook_advertise;
+	for (raw, host, port, shown) in [
+		("192.0.2.1:8780", "192.0.2.1", 8780, "192.0.2.1:8780"),
+		(
+			"bairelay.example.com:80",
+			"bairelay.example.com",
+			80,
+			"bairelay.example.com:80",
+		),
+		(
+			"[2001:db8::1]:8780",
+			"2001:db8::1",
+			8780,
+			"[2001:db8::1]:8780",
+		),
+		(" 192.0.2.1:8780 ", "192.0.2.1", 8780, "192.0.2.1:8780"),
+	] {
+		let adv = parse_webhook_advertise(raw).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+		assert_eq!(adv.host, host, "{raw:?}");
+		assert_eq!(adv.port, port, "{raw:?}");
+		assert_eq!(adv.to_string(), shown, "{raw:?}");
+	}
+}
+
+#[test]
+fn webhook_advertise_loopback_hosts() {
+	use bairelay::config::parse_webhook_advertise;
+	for (raw, loopback) in [
+		("127.0.0.1:8780", true),
+		("127.1.2.3:8780", true),
+		("[::1]:8780", true),
+		("[::ffff:127.0.0.1]:8780", true),
+		("localhost:8780", true),
+		("LocalHost:8780", true),
+		("localhost.:8780", true),
+		("192.0.2.1:8780", false),
+		("[2001:db8::1]:8780", false),
+		("example.com:8780", false),
+		("localhost.example.com:8780", false),
+	] {
+		let adv = parse_webhook_advertise(raw).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+		assert_eq!(adv.is_loopback(), loopback, "{raw:?}");
+	}
+}
+
+#[test]
+fn validate_rejects_bad_webhook_hold() {
+	for bad in ["nan", "inf", "-1.0"] {
+		let cfg = webhook_cfg(&format!(
+			"[webhook]\nenable = true\nmotion_wake_hold_secs = {bad}"
+		))
+		.expect("parse");
+		let err = validate_config(&cfg).expect_err(&format!("{bad} must reject"));
+		assert!(err.contains("motion_wake_hold_secs"), "{bad}: {err}");
+	}
+	let zero = webhook_cfg("[webhook]\nenable = true\nmotion_wake_hold_secs = 0").expect("parse");
+	validate_config(&zero).expect("0 releases at once");
+}
+
+#[test]
+fn validate_rejects_webhook_port_collisions() {
+	let rtsp = webhook_cfg("bind_port = 8780\n[webhook]\nenable = true").expect("parse");
+	let err = validate_config(&rtsp).expect_err("RTSP port clash");
+	assert!(
+		err.contains("webhook_port") && err.contains("bind_port"),
+		"{err}"
+	);
+
+	let tls = webhook_cfg(
+		"certificate = \"/x.pem\"\ntls_bind_port = 9443\n[webhook]\nenable = true\nwebhook_port = 9443",
+	)
+	.expect("parse");
+	let err = validate_config(&tls).expect_err("TLS port clash");
+	assert!(
+		err.contains("webhook_port") && err.contains("tls_bind_port"),
+		"{err}"
+	);
+
+	let default_tls =
+		webhook_cfg("certificate = \"/x.pem\"\n[webhook]\nenable = true\nwebhook_port = 8555")
+			.expect("parse");
+	assert!(
+		validate_config(&default_tls).is_err(),
+		"default TLS port clash"
+	);
+
+	let push = webhook_cfg(
+		"[wake_server]\nenable = true\n[push_listener]\nenable = true\npush_listener_port = 8780\n[webhook]\nenable = true",
+	)
+	.expect("parse");
+	let err = validate_config(&push).expect_err("push port clash");
+	assert!(
+		err.contains("webhook_port") && err.contains("push_listener_port"),
+		"{err}"
+	);
+}
+
+#[test]
+fn validate_ignores_webhook_port_clash_with_disabled_listeners() {
+	// No certificate: the TLS port is unused. Disabled push listener and
+	// plain RTSP off (TLS-only) leave their ports free too.
+	let no_tls = webhook_cfg("tls_bind_port = 8780\n[webhook]\nenable = true").expect("parse");
+	validate_config(&no_tls).expect("TLS off");
+	let push_off = webhook_cfg(
+		"[push_listener]\nenable = false\npush_listener_port = 8780\n[webhook]\nenable = true",
+	)
+	.expect("parse");
+	validate_config(&push_off).expect("push listener off");
+	let rtsp_off = webhook_cfg(
+		"bind_port = 0\ncertificate = \"/x.pem\"\n[webhook]\nenable = true\nwebhook_port = 8554",
+	)
+	.expect("parse");
+	validate_config(&rtsp_off).expect("plain RTSP off");
+	let webhook_off = parse_config(
+		"bind_port = 8780\n[webhook]\nenable = false\n[[cameras]]\nname = \"cam1\"\nusername = \"a\"\npassword = \"x\"\naddress = \"192.0.2.10\"",
+	)
+	.expect("parse");
+	validate_config(&webhook_off).expect("webhook off");
+}

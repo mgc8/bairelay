@@ -1,4 +1,4 @@
-//! Load and parse the TLS PEMs referenced by [`Config`]: the RTSPS
+//! Load and parse the TLS PEMs referenced by [`Config`](crate::config::Config): the RTSPS
 //! server certificate (+ optional client CA) and the MQTT broker CA /
 //! client certificate.
 //!

@@ -18,7 +18,10 @@
 //! Baichuan session is up, the existing `motion_listener` subscribes
 //! and publishes the eventual `motion=off` from the camera itself.
 //! We publish a fallback `motion=off` after `motion_wake_hold_secs` so
-//! HA never gets stuck on "motion=on" if reconnect failed.
+//! HA never gets stuck on "motion=on" if reconnect failed. A push that
+//! lands within `WAKE_DEDUPE_WINDOW` of a webhook wake from the same
+//! camera is that wake, already reported, and is dropped
+//! (`wake_events::push_edge`).
 //!
 //! **Threat model — source-IP trust.** A peer IP that resolves through
 //! the wake-server registry is treated as authentic; we have no further
@@ -32,14 +35,13 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
+use bairelay_mqtt::SharedMqttClient;
 use bairelay_wake_server::registry::CameraRegistry;
 
 use crate::camera::CameraHandle;
@@ -156,28 +158,19 @@ fn handle_push(
 		return;
 	};
 
-	tracing::info!(
-		camera = %handle.name(),
-		peer_ip = %peer_ip,
-		"Motion push from camera (treating TCP-accept as motion edge)"
-	);
-
-	let handle = Arc::clone(handle);
-	let seq = handle.push_seq().fetch_add(1, Ordering::SeqCst) + 1;
-	let Some(mqtt_client) = mqtt.cloned() else {
-		// MQTT disabled in config — wake-lock alone still drives the
-		// connect loop, so observability suffers but the wake-on-motion
-		// behaviour is intact.
-		spawn_wake_only(handle, cfg.motion_wake_hold, cancel.clone());
-		return;
-	};
-
-	let prefix = topic_prefix.to_string();
-	let hold = cfg.motion_wake_hold;
-	let cancel = cancel.clone();
-	tokio::spawn(async move {
-		fire_motion(handle, mqtt_client, prefix, hold, seq, cancel).await;
-	});
+	if crate::wake_events::push_edge(
+		Arc::clone(handle),
+		mqtt,
+		topic_prefix,
+		cfg.motion_wake_hold,
+		cancel,
+	) {
+		tracing::info!(
+			camera = %handle.name(),
+			peer_ip = %peer_ip,
+			"Motion push from camera (treating TCP-accept as motion edge)"
+		);
+	}
 }
 
 /// Resolve a `(name → CameraHandle)` map entry from a registry-side UID.
@@ -207,66 +200,6 @@ pub(crate) fn match_camera_by_uid<'a>(
 				.is_some_and(|cfg_uid| registry_uid.starts_with(cfg_uid))
 		})
 		.max_by_key(|h| h.config().uid.as_deref().map_or(0, str::len))
-}
-
-/// Fire the motion event: publish `status/motion=on`, hold a wake-lock
-/// for `hold`, then publish a fallback `status/motion=off` so HA never
-/// gets stuck on `on` if the in-session `motion_listener` never picks
-/// up the live `Stop`. Idempotent w.r.t. the in-session publisher —
-/// duplicate `motion=off` is harmless (HA dedups). `seq` is this push's
-/// [`CameraHandle::push_seq`]; a later push takes over the clear.
-async fn fire_motion(
-	handle: Arc<CameraHandle>,
-	mqtt: SharedMqttClient,
-	topic_prefix: String,
-	hold: Duration,
-	seq: u64,
-	cancel: CancellationToken,
-) {
-	let _guard = handle.wake_lock().acquire();
-	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, handle.name());
-	if let Err(e) = publisher.publish_motion(true).await {
-		tracing::warn!(camera = %handle.name(), error = %e, "push motion: publish_motion(true) failed");
-	}
-	handle.status_cache().set_motion(true);
-
-	// Hold for `hold`, bailing on cancel — same primitive used by the
-	// camera reconnect path so the contract lives in one place.
-	crate::run_support::sleep_or_cancel(hold, &cancel).await;
-
-	if handle.push_seq().load(Ordering::SeqCst) != seq {
-		tracing::debug!(camera = %handle.name(), "push motion: a later push owns the fallback clear");
-		return;
-	}
-
-	// Cap the fallback publish so a wedged broker (Ctrl+C race against
-	// detached fire_motion tasks) can't hold the runtime open during
-	// shutdown. 1 s is generous for an alive broker; on shutdown, a
-	// dead broker hits the timeout and we move on quietly.
-	const FALLBACK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
-	match tokio::time::timeout(FALLBACK_PUBLISH_TIMEOUT, publisher.publish_motion(false)).await {
-		Ok(Ok(())) => {
-			handle.status_cache().set_motion(false);
-		}
-		Ok(Err(e)) => {
-			tracing::warn!(camera = %handle.name(), error = %e, "push motion: fallback publish_motion(false) failed");
-		}
-		Err(_) => {
-			tracing::debug!(
-				camera = %handle.name(),
-				"push motion: fallback publish_motion(false) timed out (likely shutdown)"
-			);
-		}
-	}
-}
-
-/// Wake-lock-only path used when no MQTT client is configured. Holds
-/// the lock for the same window so the connect loop has time to land.
-fn spawn_wake_only(handle: Arc<CameraHandle>, hold: Duration, cancel: CancellationToken) {
-	tokio::spawn(async move {
-		let _guard = handle.wake_lock().acquire();
-		crate::run_support::sleep_or_cancel(hold, &cancel).await;
-	});
 }
 
 #[cfg(test)]
@@ -454,7 +387,7 @@ mod tests {
 	#[tokio::test]
 	async fn end_to_end_tcp_connect_no_mqtt_takes_wake_only_path() {
 		// MQTT-disabled deployments still drive the wake-lock path —
-		// that's the `spawn_wake_only` branch. Connect from a
+		// that is the wake-lock-only path of `motion_edge`. Connect from a
 		// matching peer IP, observe the wake-lock count rises, then
 		// the hold expires.
 		let registry = bairelay_wake_server::make_registry();
@@ -486,7 +419,7 @@ mod tests {
 				cfg,
 				registry,
 				cameras,
-				None, // no MQTT — drives spawn_wake_only
+				None, // no MQTT — drives the wake-lock-only path
 				"bairelay".into(),
 				cancel_for_run,
 			)
@@ -507,7 +440,7 @@ mod tests {
 		}
 		assert!(
 			handle.wake_lock().count() >= 1,
-			"spawn_wake_only must acquire a wake-lock"
+			"the wake-lock-only path must acquire a wake-lock"
 		);
 
 		// Wait through hold, then the lock falls back to 0.
@@ -647,7 +580,7 @@ mod tests {
 			.await
 			.expect("connect");
 
-		// Allow the spawned fire_motion task to run publish_motion(true).
+		// Allow the spawned motion-edge task to run publish_motion(true).
 		let saw_on = poll_published(&mock, Duration::from_secs(2), |t, p| {
 			t == "bairelay/front/status/motion" && p == b"on"
 		})
@@ -740,6 +673,67 @@ mod tests {
 			[b"on".to_vec(), b"on".to_vec(), b"off".to_vec()]
 		);
 		assert_eq!(handle.status_cache().motion(), Some(false));
+
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+	}
+
+	#[tokio::test]
+	async fn a_push_inside_a_webhook_wake_is_absorbed() {
+		let registry = bairelay_wake_server::make_registry();
+		registry.upsert(
+			"GATEUID01234",
+			"127.0.0.1:55005".parse().unwrap(),
+			0xC0DE_CAFE,
+			Instant::now(),
+		);
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		let handle = handle_with_uid("gate", Some("GATEUID0"));
+		cameras.insert("gate".into(), Arc::clone(&handle));
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let cfg = RuntimeConfig {
+			bind_addr: "127.0.0.1".parse().unwrap(),
+			bind_port: port,
+			motion_wake_hold: Duration::from_secs(5),
+			stale_after: Duration::from_secs(80),
+		};
+		let server = tokio::spawn(run_with_listener(
+			listener,
+			cfg,
+			registry,
+			Arc::new(cameras),
+			Some(mqtt),
+			"bairelay".into(),
+			cancel.clone(),
+		));
+
+		// The webhook reported this wake first.
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		assert!(crate::wake_events::claim_wake(
+			&handle,
+			crate::status_cache::WakeSource::Webhook
+		));
+		let _conn = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		// The listener reached the camera and dropped the edge.
+		let absorbed = tokio::time::timeout(Duration::from_secs(2), async {
+			while !logs
+				.text()
+				.contains("Wake already reported by the other source")
+			{
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await;
+		assert!(absorbed.is_ok(), "{}", logs.text());
+		// An absorbed edge spawns nothing, so its outcome is final here.
+		assert!(mock.published().is_empty(), "{:?}", mock.published_topics());
+		assert_eq!(handle.wake_lock().count(), 0);
+		assert!(!logs.text().contains("Motion push from camera"));
 
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

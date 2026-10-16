@@ -84,6 +84,8 @@ The add-on uses host networking. By default it binds:
 
 The push listener (a separate motion-detection mechanism that intercepts the camera's `pushx.reolink.com` connection) is opt-in and configurable to any port. Configure it in the overlay only if you need it.
 
+The webhook listener (`8780/tcp` by default) is opt-in through `[webhook]` in the overlay plus `webhook = true` on a battery doorbell. It lets a sleeping doorbell report button presses. The doorbell holds one webhook URL, which Home Assistant's Reolink integration also uses, so enable it only for a doorbell that integration doesn't manage. See the bairelay README's "Battery doorbell webhook" section.
+
 ## Repository
 
 Source code, issue tracker, full sample config, and deeper docs: <https://github.com/mgc8/bairelay>.

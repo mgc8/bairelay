@@ -179,6 +179,7 @@ pub fn clone_command(cmd: &cli::Command) -> cli::Command {
 		Command::Version(a) => Command::Version(clone_oneshot_args(a)),
 		Command::Siren(a) => Command::Siren(clone_oneshot_args(a)),
 		Command::Abilities(a) => Command::Abilities(clone_oneshot_args(a)),
+		Command::Webhook(a) => Command::Webhook(clone_oneshot_args(a)),
 		Command::Snapshot {
 			common,
 			output,
@@ -683,6 +684,10 @@ mod tests {
 		}
 		match clone_command(&cli::Command::Abilities(args("c7"))) {
 			cli::Command::Abilities(a) => assert_eq!(a.camera, "c7"),
+			_ => panic!(),
+		}
+		match clone_command(&cli::Command::Webhook(args("c8"))) {
+			cli::Command::Webhook(a) => assert_eq!(a.camera, "c8"),
 			_ => panic!(),
 		}
 	}

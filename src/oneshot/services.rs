@@ -78,7 +78,7 @@ const PER_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// with no positional service argument. Each failed service becomes an
 /// entry with `enabled = None` rather than failing the whole call —
 /// older firmwares don't expose all six on every channel, and any
-/// individual RPC that exceeds [`PER_RPC_TIMEOUT`] degrades to the
+/// individual RPC that exceeds `PER_RPC_TIMEOUT` degrades to the
 /// same "unknown" entry instead of starving the remaining reads.
 pub async fn run_all(cam: &dyn CameraDriver) -> Result<Outcome> {
 	const ALL: [Service; 6] = [

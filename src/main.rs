@@ -10,8 +10,8 @@ use bairelay::bcmedia_dump::BcMediaDumpConfig;
 use bairelay::cli::{Cli, Command};
 use bairelay::cli_convert::{should_emit_ansi, verbosity_env_filter};
 use bairelay::config::{
-	warn_deprecated_pause_fields, warn_idle_timeout_below_prune_floor, warn_neolink_compat_fields,
-	warn_wire_debug_enabled,
+	warn_deprecated_pause_fields, warn_idle_timeout_below_prune_floor,
+	warn_loopback_webhook_advertise, warn_neolink_compat_fields, warn_wire_debug_enabled,
 };
 use bairelay::local_time::LocalTimer;
 use bairelay::mqtt_loop::{
@@ -19,7 +19,9 @@ use bairelay::mqtt_loop::{
 	run_event_loop, SHUTDOWN_FANOUT_TIMEOUT,
 };
 use bairelay::orchestrator::Orchestrator;
-use bairelay::run_support::{camera_names, load_validated_config};
+use bairelay::run_support::{
+	bind_service_listener, camera_names, load_validated_config, resolve_bind_ip,
+};
 use bairelay::watchdog::Watchdog;
 
 /// Concurrent-RTSP-connection cap. Picked an order of magnitude above
@@ -122,6 +124,8 @@ async fn async_main() -> Result<()> {
 	// Surface any camera with wire-level protocol debugging live —
 	// the trace dumps it unlocks contain credential hashes.
 	warn_wire_debug_enabled(&config);
+	// A loopback webhook_advertise is reachable by a simulator only.
+	warn_loopback_webhook_advertise(&config);
 	// Surface any per-camera `idle_disconnect_timeout_secs` shorter
 	// than the global `stream_prune_grace_secs`; the runtime clamps
 	// silently, this warning makes the override visible.
@@ -371,10 +375,11 @@ async fn async_main() -> Result<()> {
 
 	// Centralised supervisor for every long-running service that
 	// shares the global cancel token (watchdog, startup-wake, RTSP
-	// listeners, wake server, push listener). MQTT lives outside the
-	// supervisor: its event loop has a distinct cancel token because
-	// per-camera teardown publishes its final `disconnected` status
-	// via MQTT, so MQTT must outlive the orchestrator.
+	// listeners, wake server, push and webhook listeners). MQTT lives
+	// outside the supervisor: its event loop has a distinct cancel
+	// token because per-camera teardown publishes its final
+	// `disconnected` status via MQTT, so MQTT must outlive the
+	// orchestrator.
 	let mut sup = bairelay::supervisor::Supervisor::new(token.clone());
 
 	// Start watchdog (30s interval).
@@ -494,8 +499,10 @@ async fn async_main() -> Result<()> {
 	// `Arc<CameraRegistry>` is shared with the push-listener so a TCP
 	// connect from a registered camera's IP fires a motion event.
 	//
-	// Both subsystems pre-bind synchronously below, so a UDP / TCP port
-	// conflict halts startup before either subsystem logs "started".
+	// The webhook listener, when [webhook] enable=true, runs alongside.
+	//
+	// All three subsystems pre-bind synchronously below, so a UDP / TCP
+	// port conflict halts startup before any of them logs "started".
 	{
 		let registry = bairelay_wake_server::make_registry();
 
@@ -547,16 +554,11 @@ async fn async_main() -> Result<()> {
 			.cloned()
 			.filter(|p| p.enable)
 		{
-			// Resolve the bind chain: explicit > wake-server bind > top-level
-			// bind. Fall through to the top-level so a push-listener-only
-			// deployment still has a valid address.
-			let bind_str = pl_block
-				.push_listener_addr
-				.clone()
-				.unwrap_or_else(|| rtsp_bind_addr.to_string());
-			let bind_addr: std::net::IpAddr = bind_str
-				.parse()
-				.with_context(|| format!("Invalid push_listener_addr {bind_str}"))?;
+			let bind_addr = resolve_bind_ip(
+				"push_listener_addr",
+				pl_block.push_listener_addr.as_deref(),
+				&rtsp_bind_addr,
+			)?;
 			// Mirror the wake server's stale_after when configured, else
 			// keep the wake-server crate default of 80 s.
 			let stale_after = orchestrator
@@ -571,10 +573,9 @@ async fn async_main() -> Result<()> {
 				),
 				stale_after,
 			};
-			let listener_addr = std::net::SocketAddr::new(bind_addr, pl_block.push_listener_port);
-			let listener = tokio::net::TcpListener::bind(listener_addr)
-				.await
-				.with_context(|| format!("push listener bind failed on {}", listener_addr))?;
+			let listener =
+				bind_service_listener("push listener", bind_addr, pl_block.push_listener_port)
+					.await?;
 			let registry_for_pl = registry.clone();
 			let cameras_for_pl = orchestrator.cameras_arc();
 			let mqtt_for_pl = orchestrator.mqtt_client().cloned();
@@ -596,9 +597,40 @@ async fn async_main() -> Result<()> {
 				}
 			});
 			info!(
-				bind = %bind_str,
+				bind = %bind_addr,
 				port = bind_port_log,
 				"Push listener started"
+			);
+		}
+
+		// The webhook listener serves cameras with `webhook = true`.
+		if let Some(wh_block) = orchestrator.webhook_config().cloned().filter(|w| w.enable) {
+			let bind_addr = resolve_bind_ip(
+				"webhook_addr",
+				wh_block.webhook_addr.as_deref(),
+				&rtsp_bind_addr,
+			)?;
+			let listener =
+				bind_service_listener("webhook listener", bind_addr, wh_block.webhook_port).await?;
+			let cameras_for_wh = orchestrator.cameras_arc();
+			let mqtt_for_wh = orchestrator.mqtt_client().cloned();
+			let prefix_for_wh = orchestrator.topic_prefix().to_string();
+			let hold = std::time::Duration::from_secs_f64(wh_block.motion_wake_hold_secs);
+			sup.spawn("webhook_listener", move |cancel| async move {
+				bairelay::webhook_listener::run_with_listener(
+					listener,
+					cameras_for_wh,
+					mqtt_for_wh,
+					prefix_for_wh,
+					hold,
+					cancel,
+				)
+				.await;
+			});
+			info!(
+				bind = %bind_addr,
+				port = wh_block.webhook_port,
+				"Webhook listener started"
 			);
 		}
 	}
@@ -610,8 +642,8 @@ async fn async_main() -> Result<()> {
 	orchestrator.run().await;
 
 	// Cameras are drained; gracefully shut down every supervisor-managed
-	// service (RTSP listeners, wake server, push listener, watchdog,
-	// startup-wake). Each service holds the global cancel token; the
+	// service (RTSP listeners, wake server, push and webhook listeners,
+	// watchdog, startup-wake). Each service holds the global cancel token; the
 	// supervisor cancels it (idempotent — the shutdown signal already fired it) and
 	// joins each task with a 2 s budget so a wedged subsystem can't
 	// hold the process open.

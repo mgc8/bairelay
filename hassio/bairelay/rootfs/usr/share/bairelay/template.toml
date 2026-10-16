@@ -74,6 +74,16 @@ bind = "0.0.0.0"
 # motion_wake_hold_secs = 30           # wake-lock window per push event
 
 
+# HaCfg webhook listener for cameras with webhook = true (battery doorbells).
+# Arming replaces any other webhook URL on the camera (e.g. HA's Reolink integration).
+# [webhook]
+# enable = false                       # opt-in
+# webhook_addr = "0.0.0.0"             # default: top-level bind
+# webhook_port = 8780
+# webhook_advertise = "10.0.0.5:8780"  # host:port cameras POST to
+# motion_wake_hold_secs = 30           # wake-lock window per webhook event
+
+
 # ── Cameras ──
 # Cameras come from the bairelay app's options form. Add a [[cameras]]
 # block here only when you need to override per-camera fields the form
@@ -90,6 +100,7 @@ bind = "0.0.0.0"
 # idle_disconnect_timeout_secs = 45  # grace period before sleep
 # motion_wake_hold_secs = 30         # wake-lock hold after motion stops
 # permitted_users = ["me"]
+# webhook = false                    # report wake reasons via [webhook]; needs [webhook] enable
 #
 # [cameras.mqtt]
 # enable_motion     = true

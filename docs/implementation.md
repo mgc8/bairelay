@@ -25,6 +25,9 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `is_floodlight_tasks_enabled()`      | Polls schedule state — distinct from on/off.              |
 | `get_pirstate()`                      | Returns `RfAlarmCfg`. One-shot query, NOT a stream.       |
 | `pir_set(bool)`                       | Toggle PIR sensor.                                        |
+| `get_ha_cfg()`                        | Returns `Option<HaCfg>` (cmd 806). `None` = empty 200 body or no `<HaCfg>`; an error reply code is an `Err`. Only a successful read proves support (`Support.webhook` does not advertise it). The binary's `camera_tasks::ha_cfg_support` wraps it: it retries the wake-time 400 (`retry_while_waking`, shared with the snapshot path) and maps a persistent error reply to "unsupported" with its code (`HaCfgSupport::ErrorReply(code)`, beside `EmptyReply` and `Supported`); transport errors and timeouts stay errors. |
+| `set_ha_cfg(&HaCfg)`                  | Writes `<HaCfg>` (cmd 807), then reads back via `get_ha_cfg()` and returns the stored value. |
+| `camera_ip()`                         | The camera's own IP (canonical form) when the session reaches it directly: TCP or local discovery. `None` through remote, map or relay discovery. `CameraHandle::camera_ip()` keeps the last such IP across sessions. |
 | `send_ptz(Direction, f32)`            | Always pair with `Direction::Stop` (see Control commands). |
 | `set_floodlight_manual(bool, u16)`    | Second arg is duration **seconds**. Use 30.               |
 | `zoom_to(u32)`                        | Pre-multiply by 1000 (`level * 1000.0` for MQTT float).   |
@@ -104,7 +107,7 @@ Behaviour per state:
 `bc_protocol/alarm.rs::classify_alarm` turns one `<AlarmEvent>` (`status` + `AItype`, both comma lists, lower-cased and trimmed, empty tokens dropped) into an `AlarmUpdate { motion, objects, visitor, doorbell_press }`. `listen_on_motion`'s task applies it to the first event for the listener's channel; `MotionData::next_alarm_update()` yields every update in order, `next_motion()` coalesces to the latest motion state.
 
 - `status` token `visitor` is a held state: after one button press the doorbell repeats it in every push for roughly 15 s (`MD,visitor` → `MD,visitor` → `visitor` → `none`). The classifier reports it per push as `visitor: Some(bool)` and leaves `doorbell_press` false; `visitor: None` (no event for the channel) leaves the state unchanged.
-- A press is the rising edge of `visitor`: `alarm.rs::VisitorEdge`, owned by `listen_on_motion`'s task, sets `doorbell_press` on a push holding `visitor` after one without it. Each subscribe starts with no visitor, so the first `visitor` push a new listener sees is a press.
+- A press is the rising edge of `visitor`: `alarm.rs::VisitorEdge`, owned by `camera_tasks::motion_listener`, sets `doorbell_press` on a push holding `visitor` after one without it. Each subscribe starts with no visitor, so the first `visitor` push a new subscription sees is a press, unless a webhook press was published less than `[webhook] motion_wake_hold_secs` earlier.
 - `dn` / `daynight` is a day/night switch. Neither it nor `visitor` counts as motion.
 - A push whose status tokens are all in {`visitor`, `dn`, `daynight`} with no active `AItype` leaves motion at `NoChange` and `objects` at `None`.
 - Any other push is motion `Start` when a status token is outside {`none`, `visitor`, `dn`, `daynight`} or any `AItype` token is not `none`, else `Stop`, and `objects` is `Some(set)` where the set replaces the previous one (an empty set clears every class).
@@ -121,7 +124,7 @@ MQTT surface: retained `status/ai/{person,vehicle,animal,face,package}` (`on` / 
 
 At session start the motion listener publishes `off` for every class whose topic the current capabilities keep (retracted topics are cleared by discovery) and caches the empty set, clearing a retained `on` an earlier session or process left; each `Some` set after that publishes only the classes that changed. An `on` always publishes; an `off` publishes only when its topic is not retracted by current capabilities, or when that class was reported `on` earlier in the session, so a retracted topic is never re-created by an `off`. The cache replay after a broker reconnect applies the same filter. `StatusCache::lock_ai_publish` serialises the listener's cache-and-publish, capability detection's AI-cache clear and caps write, and the replay's read-and-publish, so a replay never re-emits a set the listener has replaced or pairs stale objects with new caps. A press is logged, published, not cached, and holds the wake lock for the per-camera `motion_wake_hold_secs` setting (extending a post-motion hold, never shortening an active motion hold).
 
-The motion listener is the only consumer of cmd 33 pushes, so AI objects and doorbell presses follow `enable_motion`, and `CameraEnableFlags::allows` gates the `ai` and `doorbell` discovery entities on the same flag. cmd 33 pushes arrive only while bairelay holds a connected session: a press during a session extends the existing wake hold, and a press on a sleeping battery doorbell reaches bairelay only through the push listener (`push_listener.rs`), as a motion edge.
+The motion listener and the webhook listener publish cmd 33 alarms through `camera_tasks::report_alarm_update`, so AI objects and doorbell presses follow `enable_motion`, and `CameraEnableFlags::allows` gates the `ai` and `doorbell` discovery entities on the same flag. cmd 33 pushes arrive only while bairelay holds a connected session: a press during a session extends the existing wake hold, and a press on a sleeping battery doorbell reaches bairelay through its webhook, or through the push listener (`push_listener.rs`) as a motion edge. Presses from every source share a 10 s dedupe (`StatusCache::claim_doorbell_press`).
 
 ### Time + DST split across two Bc messages
 
@@ -448,6 +451,9 @@ The mock doesn't connect to a broker; `EventLoop::poll` is leaked at test constr
 | `drive_reconnect_with_backoff` + `ReconnectOutcome`    | Pure reconnect-loop timing contract.             |
 | `ScriptedDiscoverer` (`test_support` in discovery.rs)  | Script local/remote/map/relay outcomes.          |
 | `MockVideoStream`                                      | Drive `drain_first_iframe` with scripted frames. |
+| `webhook_listener` tests' `Local` harness              | Run `serve` over `tokio::io::duplex` on paused time; `Local::push` fires a push edge for the dedupe tests. |
+| `FakeCameraBuilder::with_set_ha_cfg_pending()`         | Record the HaCfg write, then pend (cancel tests). |
+| `crate::test_logs::capture_at(Level)`                  | Thread-scoped log capture for log-content asserts. |
 
 `ReconnectBackoff::sleep_with_cancel(&CancellationToken) -> bool` is shared between production `CameraHandle::run` and the test seam — the "wait for next delay, bail on cancel" contract lives in one place.
 
@@ -560,3 +566,26 @@ Bairelay's outgoing discovery (`crates/core/src/bc_protocol/connection/discovery
 ### `u32` wraparound in `bcudp::xml_crypto`
 
 `crates/core/src/bcudp/xml_crypto.rs::{encrypt, decrypt}` use `i.wrapping_add(offset)` rather than plain `i + offset` because the `offset` argument is the packet's `tid: u32` and real cameras emit transaction IDs ≥ ~`0x60000000`. A naive add overflows `u32` in debug builds (panic) for any payload long enough to push `i + offset` past `u32::MAX`. The XOR cipher is symmetric over the full `u32` domain, so wrap-around is correct semantics — encrypt-then-decrypt with the same wrapping recovers the plaintext byte-for-byte. Regression tests in `xml_crypto.rs` cover the high-tid path (`tid = 0xFFFF_FFF0` with a multi-byte payload).
+
+## Camera webhook (HaCfg)
+
+A sleeping battery doorbell with an armed HaCfg webhook POSTs its wake reason to bairelay over plain HTTP. Requirement: `docs/specification.md` § 12. Code:
+
+| Concern | Where |
+|---------|-------|
+| HTTP request and body parsers, alarm XML helper | `crates/core/src/ha_webhook.rs` |
+| Listener, admission, routing, event mapping, `WebhookTarget` | `src/webhook_listener.rs` |
+| Arming, `ArmMemo`, `url_host`, `ha_cfg_support` | `src/camera_tasks.rs` |
+| Wake-lock holds, motion edges, `claim_wake`, `push_edge` | `src/wake_events.rs` |
+| Wake and press dedupe state | `src/status_cache.rs` |
+| `[webhook]`, `webhook = true`, `parse_webhook_advertise` | `src/config.rs` |
+
+### Security model
+
+- **Token:** 128 bits as 32 lowercase hex digits: 16 bytes from the operating system's random source (`rand::rngs::OsRng`), made by core's `ha_webhook::random_hex_token`. One per opted-in camera, new on every start, never logged.
+- **Source IP:** the accept loop closes a connection, unread and outside the connection caps, unless its canonical peer IP is an opted-in camera's recorded IP or literal configured `address` (`Shared::is_known_peer`). A request must then come from its token's camera (403 otherwise), so a camera with a hostname `address` is served once a direct session has recorded its IP.
+- **Changed camera IP:** a camera whose IP changed (e.g. a DHCP renewal) has its POSTs closed at accept until a direct session records the new IP, which the next direct session does; a literal `address` must be kept current.
+- **Limits:** 16 connections, 4 per peer, 8 KiB of headers, 64 KiB of body, 10 s per request, 2 s per response, 5 s per dispatch. Responses are fixed and carry no request data.
+- **Plain HTTP:** `verify_cert = 0`; the token travels in clear on the LAN. A request that replays it must also come from the camera's IP. The reach of a forged request matches the push listener's: a wake-lock hold and motion or press publishes.
+- **One slot:** HaCfg holds one URL, which Home Assistant's Reolink integration also uses. Arming replaces it and warns with only its host, because the path can hold that system's webhook secret.
+- The `bairelay webhook <cam>` one-shot prints the stored URL in full (control characters escaped, long values truncated) because the one-shot is the operator's own read-only view of the stored configuration.

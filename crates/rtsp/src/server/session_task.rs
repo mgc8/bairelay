@@ -9,7 +9,7 @@
 //!
 //! The session task is a small **coordinator** that, after the PLAY
 //! gate, spawns two independent per-kind dispatch loops —
-//! [`video_dispatch_loop`] and [`audio_dispatch_loop`]. Each owns its
+//! `video_dispatch_loop` and `audio_dispatch_loop`. Each owns its
 //! own `broadcast::Receiver`, polls `session_tracks` for its kind's
 //! track lazily on track-miss, and writes packets via the track's
 //! transport. The shared `TcpInterleavedTransport` mutex is held only

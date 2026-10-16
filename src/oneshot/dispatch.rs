@@ -20,7 +20,7 @@ use crate::cli_convert::{
 };
 use crate::oneshot::{
 	abilities, battery, errors::UsageError, floodlight, output::Outcome, pir, presets, ptz, reboot,
-	services, set_time, siren, snapshot, status_light, users, version,
+	services, set_time, siren, snapshot, status_light, users, version, webhook,
 };
 
 /// Pre-flight check for `snapshot --json`: the JSON status line and
@@ -88,6 +88,7 @@ pub async fn dispatch_oneshot(
 		Command::Version(_) => version::run(cam).await,
 		Command::Siren(_) => siren::run(cam).await,
 		Command::Abilities(_) => abilities::run(cam).await,
+		Command::Webhook(_) => webhook::run(cam).await,
 		Command::Presets(_) => presets::run(cam).await,
 		Command::SetTime(_) => set_time::run(cam).await,
 		Command::Snapshot {
@@ -419,6 +420,21 @@ mod tests {
 		};
 		let _ = dispatch_oneshot(&*fake, &cmd, false).await.unwrap();
 		assert_eq!(*fake.calls().pir_set.lock().unwrap(), vec![true]);
+	}
+
+	#[tokio::test]
+	async fn dispatch_webhook_runs_read_branch() {
+		let fake = FakeCameraBuilder::new().with_ha_cfg(|| Ok(None)).build();
+		let out = dispatch_oneshot(&*fake, &Command::Webhook(args()), false)
+			.await
+			.unwrap();
+		assert!(matches!(
+			out,
+			Outcome::Webhook {
+				supported: false,
+				..
+			}
+		));
 	}
 
 	#[tokio::test]

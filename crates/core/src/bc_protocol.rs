@@ -23,6 +23,7 @@ mod errors;
 #[cfg(any(test, feature = "test-util"))]
 mod fake_camera;
 mod floodlight;
+mod ha_cfg;
 mod keepalive;
 mod ledstate;
 mod link;
@@ -50,7 +51,9 @@ mod uid;
 mod users;
 mod version;
 
-pub use alarm::{classify_alarm, classify_alarm_events, AiObject, AiObjects, AlarmUpdate};
+pub use alarm::{
+	classify_alarm, classify_alarm_events, AiObject, AiObjects, AlarmUpdate, VisitorEdge,
+};
 pub use camera_driver::CameraDriver;
 pub(crate) use connection::*;
 pub use credentials::*;
@@ -116,6 +119,9 @@ pub struct BcCamera {
 	/// that skips the password grant — and thus MFA — entirely; the fallback
 	/// when Reolink issued no `mfa_trust_token`. `None` when absent.
 	cloud_refresh_token: Option<String>,
+	/// The camera's own IP when the session reaches it directly (TCP or
+	/// local discovery); `None` through remote, map or relay discovery.
+	camera_ip: Option<IpAddr>,
 }
 
 /// Options used to construct a camera
@@ -183,9 +189,33 @@ pub enum ConnectionProtocol {
 	Udp,
 }
 
+/// Where discovery found the camera and how the session reaches it.
 pub(crate) enum CameraLocation {
+	/// A direct TCP connection to the camera at this address.
 	Tcp(SocketAddr),
-	Udp(DiscoveryResult),
+	/// A UDP session set up by discovery.
+	Udp {
+		result: DiscoveryResult,
+		/// The session talks to the camera itself (local discovery);
+		/// `false` for remote, map and relay discovery.
+		direct: bool,
+	},
+}
+
+impl CameraLocation {
+	/// The camera's own IP when the session reaches it directly (TCP or
+	/// local discovery), in canonical form; `None` otherwise.
+	pub(crate) fn camera_ip(&self) -> Option<IpAddr> {
+		let addr = match self {
+			CameraLocation::Tcp(addr) => addr,
+			CameraLocation::Udp {
+				result,
+				direct: true,
+			} => result.get_addr(),
+			CameraLocation::Udp { direct: false, .. } => return None,
+		};
+		Some(addr.ip().to_canonical())
+	}
 }
 
 #[cfg(test)]
@@ -193,7 +223,9 @@ impl std::fmt::Debug for CameraLocation {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			CameraLocation::Tcp(a) => write!(f, "Tcp({a})"),
-			CameraLocation::Udp(d) => write!(f, "Udp({})", d.get_addr()),
+			CameraLocation::Udp { result, direct } => {
+				write!(f, "Udp({}, direct: {direct})", result.get_addr())
+			}
 		}
 	}
 }
@@ -340,7 +372,7 @@ impl BcCamera {
 								UidTail(&uid_local),
 								disc.get_addr()
 							);
-							Ok(CameraLocation::Udp(disc))
+							Ok(CameraLocation::Udp { result: disc, direct: true })
 						},
 						Err(e) => Err(e)
 					}
@@ -420,7 +452,7 @@ impl BcCamera {
 										UidTail(&uid_remote),
 										disc.get_addr()
 									);
-									Ok(CameraLocation::Udp(disc))
+									Ok(CameraLocation::Udp { result: disc, direct: false })
 								},
 								Err(e) => Err(e)
 							}
@@ -438,7 +470,7 @@ impl BcCamera {
 										UidTail(&uid_map),
 										disc.get_addr()
 									);
-									Ok(CameraLocation::Udp(disc))
+									Ok(CameraLocation::Udp { result: disc, direct: false })
 								},
 								Err(e) => Err(e),
 							}
@@ -456,7 +488,7 @@ impl BcCamera {
 										UidTail(&uid_relay),
 										disc.get_addr()
 									);
-									Ok(CameraLocation::Udp(disc))
+									Ok(CameraLocation::Udp { result: disc, direct: false })
 								},
 								Err(e) => Err(e),
 							}
@@ -493,15 +525,20 @@ impl BcCamera {
 		// Account-camera sigV3 handshake `(nonce, pl)`, captured from the
 		// discovery reply before the DiscoveryResult is consumed below.
 		let mut sigv3_handshake: Option<(i64, String)> = None;
+		let location = BcCamera::find_camera(options).await?;
+		let camera_ip = location.camera_ip();
 		let (sink, source): (BcConnSink, BcConnSource) = {
-			match BcCamera::find_camera(options).await? {
+			match location {
 				CameraLocation::Tcp(addr) => {
 					let (x, r) = TcpSource::new(addr, &username, passwd.as_ref(), options.debug)
 						.await?
 						.split();
 					(Box::new(x), Box::new(r))
 				}
-				CameraLocation::Udp(mut discovery) => {
+				CameraLocation::Udp {
+					result: mut discovery,
+					..
+				} => {
 					sigv3_handshake = discovery.take_sigv3_handshake();
 					let (x, r) = UdpSource::new_from_discovery(
 						discovery,
@@ -538,6 +575,7 @@ impl BcCamera {
 			cloud_uid: options.uid.clone(),
 			cloud_mfa_trust_token: options.cloud_mfa_trust_token.clone(),
 			cloud_refresh_token: options.cloud_refresh_token.clone(),
+			camera_ip,
 		};
 		// `keepalive` registers the inbound handler. If it fails, tear
 		// the just-started BcConnection down explicitly so we don't
@@ -552,6 +590,13 @@ impl BcCamera {
 	/// This method will get a new message number and increment the message count atomically
 	pub fn new_message_num(&self) -> u16 {
 		self.message_num.fetch_add(1, Ordering::Relaxed)
+	}
+
+	/// The IP of the camera this session is connected to, when the
+	/// session reaches the camera itself (direct TCP or local discovery).
+	/// `None` when it runs through remote, map or relay discovery.
+	pub fn camera_ip(&self) -> Option<IpAddr> {
+		self.camera_ip
 	}
 
 	fn get_connection(&self) -> Arc<BcConnection> {
@@ -668,6 +713,7 @@ impl BcCamera {
 			cloud_uid: None,
 			cloud_mfa_trust_token: None,
 			cloud_refresh_token: None,
+			camera_ip: None,
 		}
 	}
 
@@ -734,6 +780,13 @@ mod bccamera_helpers_tests {
 		assert_eq!(cam.new_message_num(), 0);
 		assert_eq!(cam.new_message_num(), 1);
 		assert_eq!(cam.new_message_num(), 2);
+	}
+
+	#[tokio::test]
+	async fn mock_camera_reports_no_camera_ip() {
+		let mock = MockConnection::new().build().await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		assert_eq!(cam.camera_ip(), None);
 	}
 
 	#[tokio::test]
@@ -991,7 +1044,7 @@ mod discoverer_fallback_tests {
 	//! module in the crate, but no single arm depends on wall time.
 	use super::*;
 	use crate::bc_protocol::connection::discovery::test_support::{
-		CallLog, Outcome, ScriptedDiscoverer,
+		ok_discovery, CallLog, Outcome, ScriptedDiscoverer,
 	};
 	use crate::bc_protocol::resolution::DiscoveryMethods;
 	use std::sync::Arc;
@@ -1055,7 +1108,8 @@ mod discoverer_fallback_tests {
 		let opts = opts_udp_with_uid();
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("ok");
-		assert!(matches!(loc, CameraLocation::Udp(_)));
+		assert!(matches!(loc, CameraLocation::Udp { .. }));
+		assert_eq!(loc.camera_ip(), Some("127.0.0.1".parse().unwrap()));
 		// The registration branch is spawned concurrently — it may call
 		// `get_registration` before the local arm wins. What we assert
 		// is that at least `local` ran and we got an Ok.
@@ -1076,9 +1130,27 @@ mod discoverer_fallback_tests {
 		opts.discovery = DiscoveryMethods::Relay;
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("ok");
-		assert!(matches!(loc, CameraLocation::Udp(_)));
+		assert!(matches!(loc, CameraLocation::Udp { .. }));
+		assert_eq!(loc.camera_ip(), None);
 		assert!(log.methods().contains(&"get_registration"));
 		assert!(log.methods().contains(&"relay"));
+	}
+
+	#[tokio::test]
+	async fn camera_ip_is_canonical_for_direct_locations_only() {
+		let mapped: SocketAddr = "[::ffff:192.0.2.7]:9000".parse().unwrap();
+		let want: Option<IpAddr> = Some("192.0.2.7".parse().unwrap());
+		assert_eq!(CameraLocation::Tcp(mapped).camera_ip(), want);
+		let direct = CameraLocation::Udp {
+			result: ok_discovery(mapped),
+			direct: true,
+		};
+		assert_eq!(direct.camera_ip(), want);
+		let relayed = CameraLocation::Udp {
+			result: ok_discovery(mapped),
+			direct: false,
+		};
+		assert_eq!(relayed.camera_ip(), None);
 	}
 
 	#[tokio::test]
@@ -1122,7 +1194,8 @@ mod discoverer_fallback_tests {
 		opts.discovery = DiscoveryMethods::Map;
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("ok");
-		assert!(matches!(loc, CameraLocation::Udp(_)));
+		assert!(matches!(loc, CameraLocation::Udp { .. }));
+		assert_eq!(loc.camera_ip(), None);
 		assert!(log.methods().contains(&"map"));
 	}
 
@@ -1141,7 +1214,8 @@ mod discoverer_fallback_tests {
 		opts.discovery = DiscoveryMethods::Remote;
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("ok");
-		assert!(matches!(loc, CameraLocation::Udp(_)));
+		assert!(matches!(loc, CameraLocation::Udp { .. }));
+		assert_eq!(loc.camera_ip(), None);
 		assert!(log.methods().contains(&"remote"));
 	}
 
@@ -1218,6 +1292,7 @@ mod discoverer_fallback_tests {
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("ok");
 		assert!(matches!(loc, CameraLocation::Tcp(_)));
+		assert_eq!(loc.camera_ip(), Some("127.0.0.1".parse().unwrap()));
 		assert_eq!(log.methods(), vec!["check_tcp"]);
 	}
 
@@ -1306,7 +1381,8 @@ mod discoverer_fallback_tests {
 		opts.discovery = DiscoveryMethods::Relay; // enable all four arms
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("local must win quickly");
-		assert!(matches!(loc, CameraLocation::Udp(_)));
+		assert!(matches!(loc, CameraLocation::Udp { .. }));
+		assert_eq!(loc.camera_ip(), Some("127.0.0.1".parse().unwrap()));
 		assert!(log.methods().contains(&"local"));
 	}
 
@@ -1328,7 +1404,8 @@ mod discoverer_fallback_tests {
 		opts.discovery = DiscoveryMethods::Relay;
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("remote must win, others cancelled");
-		assert!(matches!(loc, CameraLocation::Udp(_)));
+		assert!(matches!(loc, CameraLocation::Udp { .. }));
+		assert_eq!(loc.camera_ip(), None);
 		assert!(log.methods().contains(&"remote"));
 	}
 
@@ -1350,7 +1427,8 @@ mod discoverer_fallback_tests {
 		opts.discovery = DiscoveryMethods::Relay;
 		let (res, log) = run_with_timeout(opts, sc).await;
 		let loc = res.expect("map must win, relay sleep cancelled");
-		assert!(matches!(loc, CameraLocation::Udp(_)));
+		assert!(matches!(loc, CameraLocation::Udp { .. }));
+		assert_eq!(loc.camera_ip(), None);
 		assert!(log.methods().contains(&"map"));
 	}
 }

@@ -29,6 +29,26 @@ use crate::stream_source::RwLockPoisonRecover as _;
 use bairelay_mqtt::control::IrMode;
 use bairelay_neolink_core::bc_protocol::AiObjects;
 use std::sync::RwLock;
+use std::time::Duration;
+
+/// Doorbell presses closer together than this are one press: the
+/// webhook, a forwarded alarm and the session can each report the same
+/// button push.
+pub const DOORBELL_PRESS_DEDUPE_WINDOW: Duration = Duration::from_secs(10);
+
+/// A push edge and a webhook wake closer together than this are one
+/// wake of a sleeping camera: the camera opens its push connection and
+/// POSTs its webhook for the same wake. The same window as presses.
+pub const WAKE_DEDUPE_WINDOW: Duration = DOORBELL_PRESS_DEDUPE_WINDOW;
+
+/// What reported a sleeping camera's wake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeSource {
+	/// The camera's connect to the push listener.
+	Push,
+	/// A `doorbell` or `pir` wake POST to the webhook listener.
+	Webhook,
+}
 
 #[derive(Debug, Default)]
 pub struct StatusCache {
@@ -45,6 +65,10 @@ pub struct StatusCache {
 	/// capability detection's AI clear and caps write, and across the
 	/// replay's read-and-publish, so none of them interleave.
 	ai_publish: tokio::sync::Mutex<()>,
+	/// When the last doorbell press was published.
+	last_doorbell_press: RwLock<Option<tokio::time::Instant>>,
+	/// The source and time of the last wake that was acted on.
+	last_wake: RwLock<Option<(WakeSource, tokio::time::Instant)>>,
 }
 
 impl StatusCache {
@@ -122,11 +146,93 @@ impl StatusCache {
 	pub async fn lock_ai_publish(&self) -> tokio::sync::MutexGuard<'_, ()> {
 		self.ai_publish.lock().await
 	}
+
+	/// Claim the right to publish a doorbell press at `now`: `true`, and
+	/// recorded, unless a press was claimed less than
+	/// [`DOORBELL_PRESS_DEDUPE_WINDOW`] before `now`.
+	pub fn claim_doorbell_press(&self, now: tokio::time::Instant) -> bool {
+		let mut last = self.last_doorbell_press.write_recover();
+		if last.is_some_and(|t| within(t, now, DOORBELL_PRESS_DEDUPE_WINDOW)) {
+			return false;
+		}
+		*last = Some(now);
+		true
+	}
+
+	/// Whether a doorbell press was claimed less than `window` before
+	/// `now`.
+	pub fn doorbell_pressed_within(&self, window: Duration, now: tokio::time::Instant) -> bool {
+		self.last_doorbell_press
+			.read_recover()
+			.is_some_and(|t| within(t, now, window))
+	}
+
+	/// Claim a wake reported by `source` at `now`: `true`, and recorded,
+	/// unless the other source's wake was claimed less than
+	/// [`WAKE_DEDUPE_WINDOW`] before `now`. Wakes from one source are
+	/// never folded together, so a later push edge still extends the
+	/// hold and owns the fallback `off`.
+	pub fn claim_wake(&self, source: WakeSource, now: tokio::time::Instant) -> bool {
+		let mut last = self.last_wake.write_recover();
+		if last.is_some_and(|(s, t)| s != source && within(t, now, WAKE_DEDUPE_WINDOW)) {
+			return false;
+		}
+		*last = Some((source, now));
+		true
+	}
+}
+
+/// `true` when `now` falls less than `window` after `last`.
+fn within(last: tokio::time::Instant, now: tokio::time::Instant, window: Duration) -> bool {
+	now.saturating_duration_since(last) < window
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn doorbell_press_claims_dedupe_inside_the_window() {
+		let c = StatusCache::default();
+		let t0 = tokio::time::Instant::now();
+		assert!(c.claim_doorbell_press(t0));
+		assert!(!c.claim_doorbell_press(t0));
+		assert!(!c.claim_doorbell_press(t0 + Duration::from_secs(9)));
+		let t1 = t0 + DOORBELL_PRESS_DEDUPE_WINDOW;
+		assert!(c.claim_doorbell_press(t1), "the window ends");
+		assert!(
+			!c.claim_doorbell_press(t1 + Duration::from_secs(1)),
+			"anchored at t1"
+		);
+	}
+
+	#[test]
+	fn doorbell_pressed_within_reads_the_last_claim() {
+		let c = StatusCache::default();
+		let t0 = tokio::time::Instant::now();
+		let window = Duration::from_secs(30);
+		assert!(!c.doorbell_pressed_within(window, t0), "no press yet");
+		assert!(c.claim_doorbell_press(t0));
+		assert!(c.doorbell_pressed_within(window, t0));
+		assert!(c.doorbell_pressed_within(window, t0 + Duration::from_secs(29)));
+		assert!(!c.doorbell_pressed_within(window, t0 + window));
+	}
+
+	#[test]
+	fn wake_claims_fold_the_other_source_inside_the_window() {
+		use WakeSource::{Push, Webhook};
+		let c = StatusCache::default();
+		let t0 = tokio::time::Instant::now();
+		let at = |s| t0 + Duration::from_secs(s);
+		assert!(c.claim_wake(Push, t0));
+		assert!(!c.claim_wake(Webhook, at(3)), "the same wake");
+		assert!(c.claim_wake(Push, at(5)), "one source is never folded");
+		assert!(!c.claim_wake(Webhook, at(14)), "anchored at the later push");
+		assert!(c.claim_wake(Webhook, at(15)), "the window ends");
+		assert!(!c.claim_wake(Push, at(15)), "and works both ways");
+		assert!(c.claim_wake(Webhook, at(16)));
+		assert!(c.claim_wake(Push, at(26)));
+	}
 
 	#[test]
 	fn defaults_to_none() {

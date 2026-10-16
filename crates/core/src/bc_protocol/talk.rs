@@ -251,7 +251,7 @@ impl BcCamera {
 	///
 	/// Send sound to the camera through a channel
 	///
-	/// This is similar to [`talk`] except it uses a channel to receive data
+	/// This is similar to [`talk`](Self::talk) except it uses a channel to receive data
 	///
 	/// The data should be in the format as described in `<TalkAbility>` xml
 	/// This method assumes that you have set up the data in the desired format

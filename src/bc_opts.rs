@@ -444,38 +444,12 @@ mod tests {
 		assert_eq!(opts.port, Some(9000));
 	}
 
-	use std::sync::{Arc, Mutex};
-
-	/// Shared in-memory sink for log lines emitted under
-	/// [`capture_warns`].
-	#[derive(Clone, Default)]
-	struct LogSink(Arc<Mutex<Vec<u8>>>);
-
-	impl std::io::Write for LogSink {
-		fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-			self.0.lock().unwrap().extend_from_slice(buf);
-			Ok(buf.len())
-		}
-		fn flush(&mut self) -> std::io::Result<()> {
-			Ok(())
-		}
-	}
-
 	/// Run `fut` on this thread with a WARN-level subscriber; returns its
 	/// output and every WARN line it emitted.
 	async fn capture_warns<T>(fut: impl std::future::Future<Output = T>) -> (T, String) {
-		let sink = LogSink::default();
-		let writer = sink.clone();
-		let subscriber = tracing_subscriber::fmt()
-			.with_max_level(tracing::Level::WARN)
-			.with_ansi(false)
-			.with_writer(move || writer.clone())
-			.finish();
-		let guard = tracing::subscriber::set_default(subscriber);
+		let captured = crate::test_logs::capture_at(tracing::Level::WARN);
 		let out = fut.await;
-		drop(guard);
-		let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-		(out, logs)
+		(out, captured.text())
 	}
 
 	/// Without a uid the failure is the caller's to log: the error names

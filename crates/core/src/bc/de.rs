@@ -141,8 +141,17 @@ fn bc_modern_msg<'a>(
 		}
 		// Apply the XML parse function, but throw away the reference to decrypted in the Ok and
 		// Err case. This error-error-error thing is the same idiom Nom uses internally.
-		let parsed = Extension::try_parse(processed_ext_buf).map_err(|_| {
-			log::error!("Extension buffer: {:?}", processed_ext_buf);
+		let parsed = Extension::try_parse(processed_ext_buf).map_err(|e| {
+			// The buffer, and the parse error that can quote it, are
+			// logged only when debugging: either can hold credentials.
+			log::error!(
+				"Unable to parse extension XML ({} bytes)",
+				processed_ext_buf.len()
+			);
+			if context.debug {
+				log::trace!("Extension buffer: {:?}", processed_ext_buf);
+				log::trace!("Extension XML error: {e:?}");
+			}
 			Err::Error(make_error(
 				buf,
 				"Unable to parse Extension XML",
@@ -229,13 +238,17 @@ fn bc_modern_msg<'a>(
 				);
 			}
 			let xml = BcXml::try_parse(processed_payload_buf.as_slice()).map_err(|e| {
-				error!("header.msg_id: {}", header.msg_id);
+				// The payload, and the parse error that can quote it, are
+				// logged only when debugging: either can hold credentials
+				// or a webhook URL.
 				error!(
-					"processed_payload_buf: {:X?}::{:?}",
-					processed_payload_buf,
-					std::str::from_utf8(&processed_payload_buf)
+					"Unable to parse payload XML: msg_id {} ({} bytes)",
+					header.msg_id,
+					processed_payload_buf.len()
 				);
-				log::error!("e: {:?}", e);
+				if context.debug {
+					log::trace!("Payload XML error: {e:?}");
+				}
 				Err::Error(make_error(
 					buf,
 					"Unable to parse Payload XML",
@@ -302,12 +315,9 @@ mod tests {
 	use super::*;
 	use crate::bc::xml::*;
 	use assert_matches::assert_matches;
-	use env_logger::Env;
 
 	fn init() {
-		let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-			.is_test(true)
-			.try_init();
+		crate::test_logs::init();
 	}
 
 	#[test]
@@ -827,6 +837,78 @@ mod tests {
 			let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
 			let mut buf = BytesMut::from(&bytes[..]);
 			let _ = Bc::deserialize(&context, &mut buf);
+		}
+	}
+
+	/// A message with a modern header whose body is `body`, as a
+	/// payload with no extension.
+	fn modern_msg_bytes(body: &[u8]) -> Vec<u8> {
+		let bc = Bc {
+			meta: BcMeta {
+				msg_id: 806,
+				channel_id: 0,
+				stream_type: 0,
+				response_code: 200,
+				msg_num: 7,
+				class: 0x0000,
+			},
+			body: BcBody::ModernMsg(ModernMsg {
+				extension: None,
+				payload: Some(BcPayloads::Binary(body.to_vec())),
+			}),
+		};
+		bc.serialize(vec![], &EncryptionProtocol::Unencrypted)
+			.expect("serialize ok")
+	}
+
+	/// Bytes 20..24 of a modern header: the payload offset, which is the
+	/// extension's length.
+	const PAYLOAD_OFFSET: std::ops::Range<usize> = 20..24;
+
+	/// Whether `logs` shows `SECRET`, as text or as a byte dump.
+	fn shows_secret(logs: &str) -> bool {
+		logs.contains("SECRET")
+			|| logs.contains(&format!("{:?}", b"SECRET").replace(['[', ']'], ""))
+	}
+
+	/// Deserialize `bytes` with debugging `debug`, returning whether it
+	/// failed and what it logged.
+	fn deserialize_logged(bytes: &[u8], debug: bool) -> (bool, String) {
+		let mut context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
+		if debug {
+			context.debug_on();
+		}
+		let (result, logs) =
+			crate::test_logs::capture(|| Bc::deserialize(&context, &mut BytesMut::from(bytes)));
+		(result.is_err(), logs)
+	}
+
+	/// A payload that is not valid XML fails the message; the payload is
+	/// logged only when debugging.
+	#[test]
+	fn malformed_payload_xml_is_an_error() {
+		let bytes = modern_msg_bytes(b"<HaCfg><url>http://example.com/hook/SECRET</ur");
+		assert_eq!(&bytes[PAYLOAD_OFFSET], &[0; 4]);
+		for debug in [false, true] {
+			let (failed, logs) = deserialize_logged(&bytes, debug);
+			assert!(failed, "debug={debug}");
+			assert!(logs.contains("Unable to parse payload XML"), "{logs}");
+			assert_eq!(shows_secret(&logs), debug, "debug={debug}: {logs}");
+		}
+	}
+
+	/// An extension that is not valid XML fails the message; the buffer
+	/// is logged only when debugging.
+	#[test]
+	fn malformed_extension_xml_is_an_error() {
+		let body = b"<Extension><userName>SECRET</user";
+		let mut bytes = modern_msg_bytes(body);
+		bytes[PAYLOAD_OFFSET].copy_from_slice(&(body.len() as u32).to_le_bytes());
+		for debug in [false, true] {
+			let (failed, logs) = deserialize_logged(&bytes, debug);
+			assert!(failed, "debug={debug}");
+			assert!(logs.contains("Unable to parse extension XML"), "{logs}");
+			assert_eq!(shows_secret(&logs), debug, "debug={debug}: {logs}");
 		}
 	}
 }

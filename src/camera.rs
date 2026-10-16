@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use crate::preview_state::PreviewState;
 use crate::status_cache::StatusCache;
 use crate::stream_source::{MutexPoisonRecover as _, RwLockPoisonRecover as _, StreamSource};
 use crate::wake_lock::WakeLockCounter;
+use crate::webhook_listener::WebhookTarget;
 
 // ── Camera State ──────────────────────────────────────────────────────
 
@@ -230,10 +232,26 @@ pub struct CameraHandle {
 	/// write of one `<LedState>` on the camera, so overlapping commands
 	/// would otherwise undo each other's field.
 	led_write_lock: tokio::sync::Mutex<()>,
-	/// Bumped by the push listener for every push from this camera. A
-	/// push's hold window only clears `motion` if no later push has
-	/// arrived, so back-to-back pushes don't cut each other short.
+	/// Bumped by every wake motion edge from this camera (a push or a
+	/// webhook PIR wake). An edge's hold window only clears `motion` if
+	/// no later edge has arrived, so back-to-back edges don't cut each
+	/// other short.
 	push_seq: AtomicU64,
+	/// The camera's own IP from the last session that reached the camera
+	/// directly (TCP or local discovery). A session through remote, map
+	/// or relay discovery leaves it unchanged. `None` until the first
+	/// such session.
+	camera_ip: std::sync::RwLock<Option<IpAddr>>,
+	/// The random path token the webhook listener accepts this camera's
+	/// POSTs on (`/hook/<token>`), generated once per process when the
+	/// camera has `webhook = true`; `None` otherwise.
+	webhook_token: Option<String>,
+	/// Where this camera's webhook points: set by the orchestrator when
+	/// `[webhook]` is enabled. Arming runs only with both this and
+	/// [`Self::webhook_token`].
+	webhook_target: Option<WebhookTarget>,
+	/// What webhook arming remembers across this camera's sessions.
+	webhook_memo: camera_tasks::ArmMemo,
 	/// Global `Config::stream_prune_grace_secs` propagated by the
 	/// orchestrator at construction. Threaded through to
 	/// [`crate::config::resolve_idle_disconnect_timeout`] so the floor
@@ -289,6 +307,9 @@ impl CameraHandle {
 	) -> Self {
 		let (preview_state_tx, preview_state_rx) = watch::channel(PreviewState::Sleeping);
 		let preview_state_tx = Arc::new(preview_state_tx);
+		let webhook_token = config
+			.webhook
+			.then(bairelay_neolink_core::ha_webhook::random_hex_token);
 		Self {
 			config,
 			cancel: parent_cancel.child_token(),
@@ -313,8 +334,20 @@ impl CameraHandle {
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
 			led_write_lock: tokio::sync::Mutex::new(()),
 			push_seq: AtomicU64::new(0),
+			camera_ip: std::sync::RwLock::new(None),
+			webhook_token,
+			webhook_target: None,
+			webhook_memo: camera_tasks::ArmMemo::default(),
 			prune_grace: Duration::ZERO,
 		}
+	}
+
+	/// Builder setter: where an opted-in camera's webhook points. The
+	/// orchestrator sets it on every camera when `[webhook]` is enabled.
+	#[must_use]
+	pub fn with_webhook_target(mut self, target: WebhookTarget) -> Self {
+		self.webhook_target = Some(target);
+		self
 	}
 
 	/// Builder setter: propagate the configured
@@ -429,7 +462,7 @@ impl CameraHandle {
 	/// Publish retained HA discovery config payloads for this camera.
 	///
 	/// Early-returns `Ok(())` when either (a) no
-	/// [`DiscoveryPublisher`] is attached (operator did not opt in
+	/// [`bairelay_mqtt::DiscoveryPublisher`] is attached (operator did not opt in
 	/// via `[mqtt.discovery]`), or (b) the capability cache is still
 	/// `None` (first successful connect has not completed, or the
 	/// `get_support` call failed and the next reconnect will re-probe).
@@ -483,14 +516,62 @@ impl CameraHandle {
 		Arc::clone(&self.status_cache)
 	}
 
-	/// Push counter the push listener bumps; see the `push_seq` field.
+	/// The camera's own IP from the last session that reached it
+	/// directly (TCP or local discovery); `None` until the first such
+	/// session.
+	pub fn camera_ip(&self) -> Option<IpAddr> {
+		*self.camera_ip.read_recover()
+	}
+
+	/// The camera's configured `address` when it is an IP literal.
+	pub fn configured_ip(&self) -> Option<IpAddr> {
+		use crate::bc_opts::{parse_address, AddressHost};
+		match parse_address(self.config.address.as_deref()?).ok()?.host {
+			AddressHost::Ip(ip) => Some(ip),
+			AddressHost::Name(_) => None,
+		}
+	}
+
+	/// This camera's webhook path token; see the `webhook_token` field.
+	pub fn webhook_token(&self) -> Option<&str> {
+		self.webhook_token.as_deref()
+	}
+
+	/// How long after a published press a new session treats the
+	/// camera's `visitor` state as that press: `[webhook]
+	/// motion_wake_hold_secs` for an opted-in camera, whose webhook press
+	/// can come well before the session it wakes; `None` otherwise.
+	fn held_press_window(&self) -> Option<Duration> {
+		self.webhook_token.as_ref()?;
+		self.webhook_target.as_ref().map(WebhookTarget::hold)
+	}
+
+	/// Where this camera's webhook points, when `[webhook]` is enabled.
+	#[cfg(test)]
+	pub(crate) fn webhook_target(&self) -> Option<&WebhookTarget> {
+		self.webhook_target.as_ref()
+	}
+
+	/// Test helper: set the connection state directly.
+	#[cfg(test)]
+	pub(crate) fn set_state_for_test(&self, state: CameraState) {
+		self.set_state(state);
+	}
+
+	/// Test helper: record `ip` as the camera's own address.
+	#[cfg(test)]
+	pub(crate) fn set_camera_ip_for_test(&self, ip: IpAddr) {
+		*self.camera_ip.write_recover() = Some(ip);
+	}
+
+	/// Wake motion-edge counter; see the `push_seq` field.
 	pub fn push_seq(&self) -> &AtomicU64 {
 		&self.push_seq
 	}
 
 	/// `true` once `battery_poller` has concluded this camera has no
 	/// battery hardware and given up. Sticky for the process lifetime;
-	/// gates the poller respawn in [`Self::spawn_session_tasks`].
+	/// gates the poller respawn in `Self::spawn_session_tasks`.
 	pub fn battery_unsupported(&self) -> bool {
 		self.battery_unsupported.load(Ordering::Acquire)
 	}
@@ -996,6 +1077,9 @@ impl CameraHandle {
 
 		*self.bc_camera.write_recover() = Some(Arc::clone(&driver));
 		*self.bc_camera_concrete.write_recover() = concrete.clone();
+		if let Some(ip) = driver.camera_ip() {
+			*self.camera_ip.write_recover() = Some(ip);
+		}
 
 		// Populate the capability cache for HA discovery.
 		// `get_support()` is idempotent and read-only. On success we
@@ -1120,6 +1204,12 @@ impl CameraHandle {
 			});
 		}
 
+		// Webhook arming, for opted-in cameras only. Spawned so its
+		// camera round trips never hold up the tasks below.
+		if self.webhook_token.is_some() && self.webhook_target.is_some() {
+			tasks.spawn(Arc::clone(self).arm_webhook(Arc::clone(driver), session_cancel.clone()));
+		}
+
 		if let Some(ref mqtt) = self.mqtt_client {
 			let caps = self.capabilities().unwrap_or_default();
 			if self.config.mqtt.enable_motion {
@@ -1133,6 +1223,7 @@ impl CameraHandle {
 					Duration::from_secs_f64(self.config.motion_wake_hold_secs),
 					self.status_cache(),
 					caps,
+					self.held_press_window(),
 				));
 			}
 			// `battery_unsupported` latches when the poller concludes the
@@ -1214,6 +1305,36 @@ impl CameraHandle {
 		}
 
 		tasks
+	}
+
+	/// Point this camera's webhook at the listener for the session on
+	/// `driver`; see [`camera_tasks::arm_webhook`]. The URL is derived for
+	/// the recorded camera IP, else the configured literal one; arming
+	/// skips when no URL can be derived, warning the first time.
+	async fn arm_webhook(
+		self: Arc<Self>,
+		driver: Arc<dyn CameraDriver>,
+		cancel: CancellationToken,
+	) {
+		let (Some(token), Some(target)) = (self.webhook_token(), self.webhook_target.as_ref())
+		else {
+			return;
+		};
+		let url = match target.url(self.camera_ip().or(self.configured_ip()), token) {
+			Ok(url) => url,
+			Err(reason) => {
+				self.webhook_memo.report_no_host(&self.config.name, reason);
+				return;
+			}
+		};
+		camera_tasks::arm_webhook(
+			&*driver,
+			&self.config.name,
+			&url,
+			&self.webhook_memo,
+			&cancel,
+		)
+		.await;
 	}
 
 	/// Tear down a session: drain the spawned task `JoinSet` (2 s
@@ -3284,6 +3405,266 @@ mod tests {
 		.expect("grace period path must exit");
 
 		assert_eq!(handle.state(), CameraState::Disconnected);
+	}
+
+	/// Each session that reaches the camera directly records its IP; a
+	/// session through remote, map or relay discovery keeps the last one.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn connected_session_records_the_last_direct_camera_ip() {
+		use crate::config::test_helpers::minimal_camera_config;
+		use bairelay_neolink_core::bc::xml::Support;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let handle = Arc::new(CameraHandle::new(
+			minimal_camera_config("cam1"),
+			CancellationToken::new(),
+			None,
+		));
+		assert_eq!(handle.camera_ip(), None);
+
+		let first: IpAddr = "192.0.2.10".parse().unwrap();
+		let second: IpAddr = "192.0.2.11".parse().unwrap();
+		for (ip, want) in [
+			(Some(first), Some(first)),
+			(None, Some(first)),
+			(Some(second), Some(second)),
+		] {
+			let mut builder = FakeCameraBuilder::new()
+				.with_support(|| Ok(Support::default()))
+				.with_linktype(|| {
+					Err(bairelay_neolink_core::bc_protocol::Error::Other(
+						"link fail",
+					))
+				});
+			if let Some(ip) = ip {
+				builder = builder.with_camera_ip(ip);
+			}
+			let driver: Arc<dyn CameraDriver> = builder.build();
+			tokio::time::timeout(
+				Duration::from_secs(30),
+				handle.run_connected_session_for_test(driver, None),
+			)
+			.await
+			.expect("session must exit after keepalive failures");
+			assert_eq!(handle.camera_ip(), want, "after a session with {ip:?}");
+		}
+	}
+
+	// ── Webhook arming ──
+
+	/// A fake whose keepalive fails at once, so its session ends on its
+	/// own after the session tasks start.
+	fn short_session_camera(
+		builder: bairelay_neolink_core::bc_protocol::FakeCameraBuilder,
+	) -> Arc<bairelay_neolink_core::bc_protocol::FakeCamera> {
+		builder
+			.with_support(|| Ok(bairelay_neolink_core::bc::xml::Support::default()))
+			.with_linktype(|| {
+				Err(bairelay_neolink_core::bc_protocol::Error::Other(
+					"link fail",
+				))
+			})
+			.build()
+	}
+
+	/// `cam1` at a hostname, opted in to the webhook or not, with a
+	/// listener bound on `bind`.
+	fn webhook_handle(opt_in: bool, bind: &str) -> Arc<CameraHandle> {
+		webhook_handle_at(opt_in, bind, "cam1.example.com:9000")
+	}
+
+	/// [`webhook_handle`] with the camera's configured `address`.
+	fn webhook_handle_at(opt_in: bool, bind: &str, address: &str) -> Arc<CameraHandle> {
+		let mut config = crate::config::test_helpers::minimal_camera_config("cam1");
+		config.webhook = opt_in;
+		config.address = Some(address.into());
+		let block = crate::config::WebhookConfig {
+			enable: true,
+			webhook_addr: Some(bind.to_string()),
+			..Default::default()
+		};
+		let target = WebhookTarget::from_config(&block, "0.0.0.0").unwrap();
+		Arc::new(
+			CameraHandle::new(config, CancellationToken::new(), None).with_webhook_target(target),
+		)
+	}
+
+	async fn run_short_session(handle: &Arc<CameraHandle>, driver: Arc<dyn CameraDriver>) {
+		tokio::time::timeout(
+			Duration::from_secs(30),
+			handle.run_connected_session_for_test(driver, None),
+		)
+		.await
+		.expect("session must exit after keepalive failures");
+	}
+
+	/// A HaCfg read closure that counts its calls and answers `cfg`.
+	fn counted_ha_cfg(
+		cfg: Option<bairelay_neolink_core::bc::xml::HaCfg>,
+	) -> (
+		Arc<std::sync::atomic::AtomicUsize>,
+		impl Fn() -> Result<
+				Option<bairelay_neolink_core::bc::xml::HaCfg>,
+				bairelay_neolink_core::Error,
+			> + Send
+			+ Sync
+			+ 'static,
+	) {
+		let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let counter = Arc::clone(&reads);
+		(reads, move || {
+			counter.fetch_add(1, Ordering::SeqCst);
+			Ok(cfg.clone())
+		})
+	}
+
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn connected_session_arms_an_opted_in_webhook() {
+		use bairelay_neolink_core::bc::xml::HaCfg;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let handle = webhook_handle(true, "192.0.2.5");
+		let url = format!(
+			"http://192.0.2.5:{}/hook/{}",
+			crate::config::DEFAULT_WEBHOOK_PORT,
+			handle.webhook_token().unwrap()
+		);
+		let want = HaCfg {
+			version: "1.1".into(),
+			enable: 1,
+			url,
+			verify_cert: 0,
+		};
+		let back = want.clone();
+		let reads = std::sync::atomic::AtomicUsize::new(0);
+		let fake = short_session_camera(FakeCameraBuilder::new().with_ha_cfg(move || {
+			match reads.fetch_add(1, Ordering::SeqCst) {
+				0 => Ok(Some(HaCfg::default())),
+				_ => Ok(Some(back.clone())),
+			}
+		}));
+		run_short_session(&handle, Arc::clone(&fake) as Arc<dyn CameraDriver>).await;
+		assert_eq!(*fake.calls().set_ha_cfg.lock().unwrap(), vec![want]);
+	}
+
+	/// A literal-IP camera is armed on a wildcard bind before any
+	/// session has recorded its address.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn connected_session_arms_a_literal_ip_camera_on_a_wildcard_bind() {
+		use bairelay_neolink_core::bc::xml::HaCfg;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let handle = webhook_handle_at(true, "0.0.0.0", "127.0.0.1:9000");
+		assert_eq!(handle.camera_ip(), None);
+		let url = format!(
+			"http://127.0.0.1:{}/hook/{}",
+			crate::config::DEFAULT_WEBHOOK_PORT,
+			handle.webhook_token().unwrap()
+		);
+		let (_, read) = counted_ha_cfg(Some(HaCfg::default()));
+		let fake = short_session_camera(FakeCameraBuilder::new().with_ha_cfg(read));
+		run_short_session(&handle, Arc::clone(&fake) as Arc<dyn CameraDriver>).await;
+		let written = fake.calls().set_ha_cfg.lock().unwrap().clone();
+		assert_eq!(written.len(), 1, "{written:?}");
+		assert_eq!(written[0].url, url);
+	}
+
+	#[test]
+	fn held_press_window_is_the_webhook_hold_for_opted_in_cameras() {
+		let hold =
+			Duration::from_secs_f64(crate::config::WebhookConfig::default().motion_wake_hold_secs);
+		assert_eq!(
+			webhook_handle(true, "192.0.2.5").held_press_window(),
+			Some(hold)
+		);
+		assert_eq!(webhook_handle(false, "192.0.2.5").held_press_window(), None);
+		let config = crate::config::test_helpers::minimal_camera_config("cam1");
+		let plain = CameraHandle::new(config, CancellationToken::new(), None);
+		assert_eq!(plain.held_press_window(), None);
+	}
+
+	#[test]
+	fn configured_ip_is_the_literal_address_only() {
+		let ip_of = |address: Option<&str>| {
+			let mut config = crate::config::test_helpers::minimal_camera_config("cam1");
+			config.address = address.map(str::to_string);
+			CameraHandle::new(config, CancellationToken::new(), None).configured_ip()
+		};
+		assert_eq!(
+			ip_of(Some("192.0.2.10:9000")),
+			Some(IpAddr::from([192, 0, 2, 10]))
+		);
+		assert_eq!(
+			ip_of(Some("192.0.2.10")),
+			Some(IpAddr::from([192, 0, 2, 10]))
+		);
+		assert_eq!(
+			ip_of(Some("[2001:db8::10]:9000")),
+			"2001:db8::10".parse().ok()
+		);
+		assert_eq!(ip_of(Some("cam1.example.com:9000")), None);
+		assert_eq!(ip_of(None), None);
+	}
+
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn connected_session_never_touches_a_camera_without_webhook() {
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let handle = webhook_handle(false, "192.0.2.5");
+		let (reads, read) = counted_ha_cfg(Some(Default::default()));
+		let fake = short_session_camera(FakeCameraBuilder::new().with_ha_cfg(read));
+		run_short_session(&handle, Arc::clone(&fake) as Arc<dyn CameraDriver>).await;
+		assert_eq!(reads.load(Ordering::SeqCst), 0);
+		assert!(fake.calls().set_ha_cfg.lock().unwrap().is_empty());
+	}
+
+	/// The skip warns on the first session only; later ones log at debug.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn connected_session_skips_arming_without_a_reachable_host() {
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let handle = webhook_handle(true, "0.0.0.0");
+		let (reads, read) = counted_ha_cfg(Some(Default::default()));
+		let read = Arc::new(read);
+		for _ in 0..3 {
+			let read = Arc::clone(&read);
+			let fake = short_session_camera(FakeCameraBuilder::new().with_ha_cfg(move || read()));
+			run_short_session(&handle, Arc::clone(&fake) as Arc<dyn CameraDriver>).await;
+			assert!(fake.calls().set_ha_cfg.lock().unwrap().is_empty());
+		}
+		assert_eq!(reads.load(Ordering::SeqCst), 0);
+		let out = logs.text();
+		let skips: Vec<&str> = out
+			.lines()
+			.filter(|l| l.contains("Webhook not armed"))
+			.collect();
+		assert_eq!(skips.len(), 3, "{out}");
+		assert!(
+			skips[0].contains("WARN") && skips[0].contains("cam1"),
+			"{out}"
+		);
+		assert!(skips[0].contains("webhook_advertise"), "{out}");
+		assert!(skips[1..].iter().all(|l| l.contains("DEBUG")), "{out}");
+	}
+
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn missing_ha_cfg_logs_once_across_sessions() {
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let handle = webhook_handle(true, "192.0.2.5");
+		let (reads, read) = counted_ha_cfg(None);
+		let read = Arc::new(read);
+		for _ in 0..3 {
+			let read = Arc::clone(&read);
+			let fake = short_session_camera(FakeCameraBuilder::new().with_ha_cfg(move || read()));
+			run_short_session(&handle, Arc::clone(&fake) as Arc<dyn CameraDriver>).await;
+			assert!(fake.calls().set_ha_cfg.lock().unwrap().is_empty());
+		}
+		assert_eq!(reads.load(Ordering::SeqCst), 3);
+		let out = logs.text();
+		assert_eq!(out.matches("lacks HaCfg").count(), 1, "{out}");
 	}
 
 	#[tokio::test]

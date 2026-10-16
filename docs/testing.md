@@ -11,6 +11,7 @@ Run these locally before pushing; CI runs the equivalent set on Linux + macOS:
 ```
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test
 ```
 
@@ -585,7 +586,7 @@ Every change passes through:
 
 1. Unit tests for pure logic — `cargo test`.
 2. Integration tests via mock providers / fixture replay against real RTSP clients.
-3. **Live-verify on real battery-camera hardware before merging anything that touches the RTSP path, MQTT bridge, wake server, or push listener.** Mocks pre-populate state that real cameras only fill in over time; race conditions in connect / wake / disconnect cycles only surface on real hardware.
+3. **Live-verify on real battery-camera hardware before merging anything that touches the RTSP path, MQTT bridge, wake server, push listener, or webhook listener.** Mocks pre-populate state that real cameras only fill in over time; race conditions in connect / wake / disconnect cycles only surface on real hardware.
 
 The standard live-verify rig is:
 

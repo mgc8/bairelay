@@ -53,6 +53,17 @@ pub enum Outcome {
 	StatusLight {
 		state: bool,
 	},
+	/// `supported` is false when the firmware has no `<HaCfg>`; `code`
+	/// is then the camera's error reply code, or `None` for an empty
+	/// reply, and the other fields are `None`.
+	Webhook {
+		supported: bool,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		code: Option<u16>,
+		enable: Option<bool>,
+		url: Option<String>,
+		verify_cert: Option<bool>,
+	},
 	PtzMoveTo {
 		preset_id: u8,
 	},
@@ -209,6 +220,41 @@ fn format_human(outcome: &Outcome) -> (String, String) {
 			format!("Status light: {}\n", if *state { "on" } else { "off" }),
 			String::new(),
 		),
+		Outcome::Webhook {
+			supported: false,
+			code,
+			..
+		} => (
+			match code {
+				Some(code) => format!("Webhook: unsupported (camera replied {code})\n"),
+				None => "Webhook: unsupported\n".into(),
+			},
+			String::new(),
+		),
+		Outcome::Webhook {
+			enable,
+			url,
+			verify_cert,
+			..
+		} => {
+			let on_off = |v: &Option<bool>| match v {
+				Some(true) => "on",
+				_ => "off",
+			};
+			let url = match url.as_deref() {
+				Some(u) if !u.is_empty() => display_text(u, URL_DISPLAY_MAX),
+				_ => "(empty)".to_string(),
+			};
+			(
+				format!(
+					"Webhook: supported\n  enable: {}\n  url: {}\n  verify_cert: {}\n",
+					on_off(enable),
+					url,
+					on_off(verify_cert),
+				),
+				String::new(),
+			)
+		}
 		Outcome::PtzMoveTo { preset_id } => (
 			String::new(),
 			format!("ok (moved to preset {})\n", preset_id),
@@ -290,6 +336,33 @@ fn format_human(outcome: &Outcome) -> (String, String) {
 	}
 }
 
+/// Longest camera-supplied string, in characters, printed in human mode.
+const URL_DISPLAY_MAX: usize = 512;
+
+/// Replace control characters with their escaped form so camera-supplied
+/// text cannot inject terminal escape sequences.
+pub fn sanitize_display(s: &str) -> String {
+	s.chars()
+		.map(|c| {
+			if c.is_control() {
+				c.escape_default().to_string()
+			} else {
+				c.to_string()
+			}
+		})
+		.collect()
+}
+
+/// [`sanitize_display`] after cutting `s` to `max` characters, marking a
+/// cut with an ellipsis.
+fn display_text(s: &str, max: usize) -> String {
+	let mut out = sanitize_display(&s.chars().take(max).collect::<String>());
+	if s.chars().nth(max).is_some() {
+		out.push('…');
+	}
+	out
+}
+
 fn format_json_success(outcome: &Outcome) -> String {
 	let mut v = serde_json::to_value(outcome).expect("result must serialize");
 	if let serde_json::Value::Object(ref mut m) = v {
@@ -317,6 +390,135 @@ pub fn format_failure(mode: Mode, err: &anyhow::Error, kind: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn webhook_supported() -> Outcome {
+		Outcome::Webhook {
+			supported: true,
+			code: None,
+			enable: Some(true),
+			url: Some("http://192.0.2.10/h".into()),
+			verify_cert: Some(false),
+		}
+	}
+
+	fn webhook_unsupported() -> Outcome {
+		Outcome::Webhook {
+			supported: false,
+			code: None,
+			enable: None,
+			url: None,
+			verify_cert: None,
+		}
+	}
+
+	#[test]
+	fn human_webhook_supported_lists_fields() {
+		let (out, _) = format_success(Mode::Human, &webhook_supported());
+		assert!(out.contains("Webhook: supported"), "{out}");
+		assert!(out.contains("enable: on"), "{out}");
+		assert!(out.contains("url: http://192.0.2.10/h"), "{out}");
+		assert!(out.contains("verify_cert: off"), "{out}");
+	}
+
+	#[test]
+	fn human_webhook_empty_url_is_shown_as_empty() {
+		let (out, _) = format_success(
+			Mode::Human,
+			&Outcome::Webhook {
+				supported: true,
+				code: None,
+				enable: Some(false),
+				url: Some(String::new()),
+				verify_cert: Some(true),
+			},
+		);
+		assert!(out.contains("enable: off"), "{out}");
+		assert!(out.contains("url: (empty)"), "{out}");
+		assert!(out.contains("verify_cert: on"), "{out}");
+	}
+
+	#[test]
+	fn human_webhook_url_control_chars_are_escaped() {
+		let (out, _) = format_success(
+			Mode::Human,
+			&Outcome::Webhook {
+				supported: true,
+				code: None,
+				enable: Some(true),
+				url: Some("http://x/\u{1b}[31m".into()),
+				verify_cert: Some(false),
+			},
+		);
+		assert!(!out.contains('\u{1b}'), "{out:?}");
+		assert!(out.contains("http://x/\\u{1b}[31m"), "{out}");
+	}
+
+	#[test]
+	fn human_webhook_long_url_is_truncated_with_ellipsis() {
+		let (out, _) = format_success(
+			Mode::Human,
+			&Outcome::Webhook {
+				supported: true,
+				code: None,
+				enable: Some(true),
+				url: Some("a".repeat(URL_DISPLAY_MAX + 10)),
+				verify_cert: Some(false),
+			},
+		);
+		let line = out.lines().find(|l| l.contains("url:")).unwrap();
+		assert_eq!(
+			line.trim(),
+			format!("url: {}…", "a".repeat(URL_DISPLAY_MAX))
+		);
+	}
+
+	#[test]
+	fn sanitize_display_escapes_controls_only() {
+		assert_eq!(sanitize_display("ok é\n\t\u{7f}"), "ok é\\n\\t\\u{7f}");
+	}
+
+	#[test]
+	fn human_webhook_unsupported() {
+		let (out, _) = format_success(Mode::Human, &webhook_unsupported());
+		assert_eq!(out, "Webhook: unsupported\n");
+	}
+
+	fn webhook_error_reply() -> Outcome {
+		Outcome::Webhook {
+			supported: false,
+			code: Some(404),
+			enable: None,
+			url: None,
+			verify_cert: None,
+		}
+	}
+
+	#[test]
+	fn human_webhook_unsupported_names_the_reply_code() {
+		let (out, _) = format_success(Mode::Human, &webhook_error_reply());
+		assert_eq!(out, "Webhook: unsupported (camera replied 404)\n");
+	}
+
+	#[test]
+	fn json_webhook_supported_and_unsupported() {
+		let (out, _) = format_success(Mode::Json, &webhook_supported());
+		let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+		assert_eq!(v["ok"], true);
+		assert_eq!(v["supported"], true);
+		assert_eq!(v["enable"], true);
+		assert_eq!(v["url"], "http://192.0.2.10/h");
+		assert_eq!(v["verify_cert"], false);
+		assert!(v.get("code").is_none(), "{out}");
+		let (out, _) = format_success(Mode::Json, &webhook_unsupported());
+		let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+		assert_eq!(v["supported"], false);
+		assert!(v["url"].is_null());
+		assert!(v.get("code").is_none(), "{out}");
+		let (out, _) = format_success(Mode::Json, &webhook_error_reply());
+		let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+		assert_eq!(v["supported"], false);
+		assert_eq!(v["code"], 404);
+	}
 
 	#[test]
 	fn human_battery() {

@@ -13,6 +13,8 @@ Bairelay stands on the shoulders of [Neolink](https://github.com/QuantumEntangle
 
 Without their multi-year work this project would not exist. The vendored `bairelay_neolink_core` crate is a modernised descendant of their codebase under the same AGPL-3.0 license.
 
+Thanks also to [apocaliss92](https://github.com/apocaliss92) for [nodelink-js](https://github.com/apocaliss92/nodelink-js) (MIT), whose reverse-engineered Baichuan documentation informs the status-LED `ledCtrl` decoding, the cmd 33 alarm event tokens, and the HaCfg webhook.
+
 This project's development made use of **AI agentic coding**, especially for test generation, packet capture analysis, and reverse-engineering tasks against pcap dumps of camera ↔ cloud traffic. The protocol work itself is grounded in public reverse-engineering of cameras the operator owns; no Reolink code, firmware, or proprietary documentation was used.
 
 ---
@@ -31,7 +33,7 @@ Bairelay's primary design target is **Reolink battery cameras** — the Argus 3 
 2. Sleep aggressively to preserve battery and need to be woken on demand.
 3. Push motion alerts via a cloud channel rather than a LAN broadcast.
 
-**Battery-powered doorbells** (Reolink battery Video Doorbell class) are in scope for their event surface (doorbell press, AI objects: person, vehicle, animal, face, package), published to MQTT and Home Assistant. Presses and AI objects arrive on the camera's alarm push, which bairelay sees only while it holds a connected session: a press during a session publishes and extends the existing wake hold, and a press on a sleeping battery doorbell reaches bairelay only through the [push listener](#push-listener-tcp443), as a motion edge.
+**Battery-powered doorbells** (Reolink battery Video Doorbell class) are in scope for their event surface (doorbell press, AI objects: person, vehicle, animal, face, package), published to MQTT and Home Assistant. Presses and AI objects arrive on the camera's alarm push, which bairelay sees only while it holds a connected session: a press during a session publishes and extends the existing wake hold, and a press on a sleeping battery doorbell reaches bairelay through its [webhook](#battery-doorbell-webhook), or through the [push listener](#push-listener-tcp443), as a motion edge.
 
 Non-battery Reolink cameras (the wired RLC line, wired doorbells, NVR-attached models) almost universally support **native RTSP** out of the box — there is no need for a translation layer, so they are explicitly out of scope.
 
@@ -284,6 +286,21 @@ This will prompt Reolink to send an authorisation code (emailed code by default;
 
 More details can be found in the documentation under [`docs/cloud-account.md`](docs/cloud-account.md).
 
+### Battery doorbell webhook
+
+On firmware with HaCfg support, a sleeping battery doorbell can POST its wake reason to bairelay, so a button press publishes `status/doorbell` `press` instead of a bare motion edge. `bairelay webhook <camera>` shows whether the camera supports it.
+
+```toml
+[webhook]
+enable = true
+
+[[cameras]]
+name = "front_door"
+webhook = true
+```
+
+Arming replaces any other webhook URL on the doorbell, such as Home Assistant's Reolink integration's. The webhook is plain HTTP on the LAN, protected by a random per-camera token and a source-IP check.
+
 ---
 
 ## Command-line usage
@@ -319,6 +336,7 @@ Camera commands:
   version        Print firmware + model info
   siren          Trigger the siren once
   abilities      Dump the camera's abilityInfo XML + parsed permissions
+  webhook        Read the camera's HTTP webhook configuration
 
 Other:
   check-config    Validate the config file and exit (no camera connection)

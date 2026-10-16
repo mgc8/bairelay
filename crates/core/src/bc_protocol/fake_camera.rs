@@ -12,6 +12,7 @@
 // so accidentally unused scaffolding surfaces naturally.
 
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -19,7 +20,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc::Receiver;
 
 use crate::bc::xml::{
-	AbilityInfo, BatteryInfo, FloodlightStatusList, HttpPort, HttpsPort, LedState, LinkType,
+	AbilityInfo, BatteryInfo, FloodlightStatusList, HaCfg, HttpPort, HttpsPort, LedState, LinkType,
 	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, UserList,
 	VersionInfo,
 };
@@ -76,6 +77,8 @@ pub struct FakeCalls {
 	pub set_rtmp: Mutex<Vec<(Option<bool>, Option<u32>)>>,
 	/// Each `set_onvif(on, port)` call appended.
 	pub set_onvif: Mutex<Vec<(Option<bool>, Option<u32>)>>,
+	/// Each `set_ha_cfg(cfg)` call appended.
+	pub set_ha_cfg: Mutex<Vec<HaCfg>>,
 }
 
 /// Internal state backing a [`FakeCamera`]. Read-method closures are
@@ -95,6 +98,7 @@ struct FakeState {
 	get_ledstate_pending: bool,
 	led_writes_fail: bool,
 	abilities: Option<Vec<String>>,
+	camera_ip: Option<IpAddr>,
 	is_floodlight_tasks_enabled: Option<BoxFn<bool>>,
 	get_snapshot: Option<BoxFn<Vec<u8>>>,
 	get_snapshot_pending: bool,
@@ -103,6 +107,9 @@ struct FakeState {
 	is_floodlight_tasks_enabled_pending: bool,
 	get_ptz_preset_pending: bool,
 	get_ledstate: Option<BoxFn<LedState>>,
+	get_ha_cfg: Option<BoxFn<Option<HaCfg>>>,
+	get_ha_cfg_pending: bool,
+	set_ha_cfg_pending: bool,
 	get_ptz_preset: Option<BoxFn<PtzPreset>>,
 	version: Option<BoxFn<VersionInfo>>,
 	get_users: Option<BoxFn<UserList>>,
@@ -259,6 +266,28 @@ impl FakeCameraBuilder {
 		self
 	}
 
+	/// Install the closure invoked on [`CameraDriver::get_ha_cfg`] and as
+	/// the read-back of [`CameraDriver::set_ha_cfg`].
+	pub fn with_ha_cfg<F>(mut self, f: F) -> Self
+	where
+		F: Fn() -> Result<Option<HaCfg>> + Send + Sync + 'static,
+	{
+		self.state.get_ha_cfg = Some(Box::new(f));
+		self
+	}
+
+	/// Make `get_ha_cfg` await `pending()` forever.
+	pub fn with_ha_cfg_pending(mut self) -> Self {
+		self.state.get_ha_cfg_pending = true;
+		self
+	}
+
+	/// Make `set_ha_cfg` record the call, then await `pending()` forever.
+	pub fn with_set_ha_cfg_pending(mut self) -> Self {
+		self.state.set_ha_cfg_pending = true;
+		self
+	}
+
 	/// Install the closure invoked on [`CameraDriver::get_ptz_preset`].
 	pub fn with_ptz_preset<F>(mut self, f: F) -> Self
 	where
@@ -386,6 +415,13 @@ impl FakeCameraBuilder {
 	/// no report received (every lookup is `None`).
 	pub fn with_abilities(mut self, names: &[&str]) -> Self {
 		self.state.abilities = Some(names.iter().map(|n| n.to_string()).collect());
+		self
+	}
+
+	/// The address [`CameraDriver::camera_ip`] reports. Default: `None`
+	/// (a session through remote, map or relay discovery).
+	pub fn with_camera_ip(mut self, ip: IpAddr) -> Self {
+		self.state.camera_ip = Some(ip);
 		self
 	}
 
@@ -605,6 +641,10 @@ impl CameraDriver for FakeCamera {
 		Some(names.iter().any(|a| a == name))
 	}
 
+	fn camera_ip(&self) -> Option<IpAddr> {
+		self.inner.camera_ip
+	}
+
 	async fn get_ledstate(&self) -> Result<LedState> {
 		if self.inner.get_ledstate_pending {
 			std::future::pending::<()>().await;
@@ -614,6 +654,31 @@ impl CameraDriver for FakeCamera {
 			Some(f) => f(),
 			None => unset("get_ledstate"),
 		}
+	}
+
+	async fn get_ha_cfg(&self) -> Result<Option<HaCfg>> {
+		if self.inner.get_ha_cfg_pending {
+			std::future::pending::<()>().await;
+			unreachable!()
+		}
+		match self.inner.get_ha_cfg.as_ref() {
+			Some(f) => f(),
+			None => unset("get_ha_cfg"),
+		}
+	}
+
+	async fn set_ha_cfg(&self, cfg: &HaCfg) -> Result<Option<HaCfg>> {
+		self.inner
+			.calls
+			.set_ha_cfg
+			.lock()
+			.unwrap()
+			.push(cfg.clone());
+		if self.inner.set_ha_cfg_pending {
+			std::future::pending::<()>().await;
+			unreachable!()
+		}
+		self.get_ha_cfg().await
 	}
 
 	async fn get_ptz_preset(&self) -> Result<PtzPreset> {

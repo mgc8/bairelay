@@ -109,6 +109,12 @@ pub struct Config {
 	#[serde(default)]
 	pub push_listener: Option<PushListenerConfig>,
 
+	/// Optional `[webhook]` block. Disabled by default. When enabled,
+	/// bairelay serves `POST /hook/<token>` for cameras with
+	/// `webhook = true`, which report wake reasons and alarms there.
+	#[serde(default)]
+	pub webhook: Option<WebhookConfig>,
+
 	/// Neolink-compat: tokio-console debugging knob. Bairelay does not
 	/// integrate `tokio-console`; verbosity is driven by `RUST_LOG`
 	/// (or `-v` / `-vv` / `-vvv` on the CLI). Accepted so old configs
@@ -165,6 +171,7 @@ impl Default for Config {
 			mqtt: None,
 			wake_server: None,
 			push_listener: None,
+			webhook: None,
 			tokio_console: None,
 			stream_prune_grace_secs: default_prune_grace_secs(),
 			cloud_account: None,
@@ -226,6 +233,125 @@ impl Default for PushListenerConfig {
 
 fn default_push_listener_port() -> u16 {
 	443
+}
+
+// ── WebhookConfig ──────────────────────────────────────────────────────
+
+/// Default `[webhook] webhook_port`.
+pub const DEFAULT_WEBHOOK_PORT: u16 = 8780;
+
+/// HTTP listener that receives the camera's HaCfg webhook POSTs. Keys
+/// are prefixed (`webhook_addr` / `webhook_port`) for the same reason
+/// as [`PushListenerConfig`]'s.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+	#[serde(default)]
+	pub enable: bool,
+
+	/// Bind address. `None` falls back to the top-level `bind_addr`.
+	#[serde(default)]
+	pub webhook_addr: Option<String>,
+
+	/// Bind port.
+	#[serde(default = "default_webhook_port")]
+	pub webhook_port: u16,
+
+	/// `host:port` the cameras are told to POST to, when the bind
+	/// address is not what they can reach (NAT, reverse proxy, a
+	/// wildcard bind). Parsed by [`parse_webhook_advertise`].
+	#[serde(default)]
+	pub webhook_advertise: Option<String>,
+
+	/// How long one webhook wake or alarm edge holds the camera's wake
+	/// lock, so the connect loop reaches it while it is awake.
+	#[serde(default = "default_motion_wake_hold_secs")]
+	pub motion_wake_hold_secs: f64,
+}
+
+impl Default for WebhookConfig {
+	fn default() -> Self {
+		Self {
+			enable: false,
+			webhook_addr: None,
+			webhook_port: DEFAULT_WEBHOOK_PORT,
+			webhook_advertise: None,
+			motion_wake_hold_secs: default_motion_wake_hold_secs(),
+		}
+	}
+}
+
+fn default_webhook_port() -> u16 {
+	DEFAULT_WEBHOOK_PORT
+}
+
+/// A parsed `webhook_advertise`: an IP or hostname plus a non-zero port.
+/// `Display` gives `host:port`, bracketing an IPv6 host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebhookAdvertise {
+	pub host: String,
+	pub port: u16,
+}
+
+impl std::fmt::Display for WebhookAdvertise {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		if self.host.contains(':') {
+			write!(f, "[{}]:{}", self.host, self.port)
+		} else {
+			write!(f, "{}:{}", self.host, self.port)
+		}
+	}
+}
+
+impl WebhookAdvertise {
+	/// Whether the host is loopback: an IP literal in a loopback range,
+	/// or `localhost`.
+	pub fn is_loopback(&self) -> bool {
+		match self.host.parse::<std::net::IpAddr>() {
+			Ok(ip) => ip.to_canonical().is_loopback(),
+			Err(_) => self
+				.host
+				.strip_suffix('.')
+				.unwrap_or(&self.host)
+				.eq_ignore_ascii_case("localhost"),
+		}
+	}
+}
+
+/// Warn when `[webhook] webhook_advertise` names a loopback host: only
+/// a camera on this host (a simulator) can reach it. Called once at
+/// startup and by `check-config`, alongside [`warn_wire_debug_enabled`].
+pub fn warn_loopback_webhook_advertise(config: &Config) {
+	let advertise = config
+		.webhook
+		.as_ref()
+		.filter(|w| w.enable)
+		.and_then(|w| w.webhook_advertise.as_deref())
+		.and_then(|raw| parse_webhook_advertise(raw).ok());
+	if let Some(advertise) = advertise.filter(WebhookAdvertise::is_loopback) {
+		tracing::warn!(
+			"config: [webhook] webhook_advertise {advertise} is a loopback address; only a camera on this host can reach it"
+		);
+	}
+}
+
+/// Parse a `webhook_advertise` value: `ip:port`, `hostname:port` or
+/// `[ipv6]:port`, with a port above 0. Pure; no DNS.
+pub fn parse_webhook_advertise(raw: &str) -> Result<WebhookAdvertise, String> {
+	let parsed = crate::bc_opts::parse_address(raw)?;
+	let port = match parsed.port {
+		Some(0) => return Err("port must be greater than 0".into()),
+		Some(port) => port,
+		None => return Err("a port is required (host:port)".into()),
+	};
+	let host = match parsed.host {
+		crate::bc_opts::AddressHost::Ip(ip) if ip.is_unspecified() || ip.is_multicast() => {
+			return Err(format!("{ip} is not a unicast address cameras can reach"));
+		}
+		crate::bc_opts::AddressHost::Ip(ip) => ip.to_string(),
+		crate::bc_opts::AddressHost::Name(name) => name,
+	};
+	Ok(WebhookAdvertise { host, port })
 }
 
 // ── UserConfig ─────────────────────────────────────────────────────────
@@ -414,6 +540,11 @@ pub struct CameraConfig {
 	#[serde(default, skip_serializing_if = "Option::is_none", alias = "verbose")]
 	pub debug: Option<bool>,
 
+	/// Arm the camera's HaCfg webhook so it reports wake reasons and
+	/// alarms to the `[webhook]` listener. Requires `[webhook] enable`.
+	#[serde(default)]
+	pub webhook: bool,
+
 	// ── Neolink migration compat (deprecated; warn + ignore) ──────────
 	// Each Option<_> exists only so old configs parse cleanly under
 	// `deny_unknown_fields`. `warn_neolink_compat_fields` emits a one-
@@ -476,6 +607,7 @@ impl Default for CameraConfig {
 			pause: PauseConfig::default(),
 			permitted_users: Vec::new(),
 			debug: None,
+			webhook: false,
 			print_format: None,
 			update_time: None,
 			buffer_duration: None,
@@ -1342,6 +1474,67 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		}
 	}
 
+	// `[webhook]` validation, plus the per-camera opt-in it gates.
+	let webhook_enabled = config.webhook.as_ref().is_some_and(|w| w.enable);
+	if let Some(wh) = config.webhook.as_ref().filter(|w| w.enable) {
+		if wh.webhook_port == 0 {
+			return Err("[webhook]: webhook_port must be greater than 0".to_string());
+		}
+		// The other TCP listeners that run alongside, by config key.
+		let tls_port = config
+			.certificate
+			.as_ref()
+			.map(|_| config.tls_bind_port.unwrap_or(DEFAULT_TLS_BIND_PORT));
+		let push_port = config
+			.push_listener
+			.as_ref()
+			.filter(|p| p.enable)
+			.map(|p| p.push_listener_port);
+		let others = [
+			(
+				"bind_port",
+				(config.bind_port != 0).then_some(config.bind_port),
+			),
+			("tls_bind_port", tls_port),
+			("[push_listener] push_listener_port", push_port),
+		];
+		for (key, port) in others {
+			if port == Some(wh.webhook_port) {
+				return Err(format!(
+					"[webhook]: webhook_port ({}) and {key} must differ",
+					wh.webhook_port
+				));
+			}
+		}
+		// `Duration::from_secs_f64` panics on NaN / negative / infinite.
+		if !wh.motion_wake_hold_secs.is_finite() || wh.motion_wake_hold_secs < 0.0 {
+			return Err(format!(
+				"[webhook]: motion_wake_hold_secs must be a non-negative finite number (got {})",
+				wh.motion_wake_hold_secs,
+			));
+		}
+		if let Some(addr) = &wh.webhook_addr {
+			if addr.parse::<std::net::IpAddr>().is_err() {
+				return Err(format!(
+					"[webhook]: webhook_addr '{addr}' must be an IP address"
+				));
+			}
+		}
+		if let Some(adv) = &wh.webhook_advertise {
+			if let Err(e) = parse_webhook_advertise(adv) {
+				return Err(format!("[webhook]: invalid webhook_advertise '{adv}': {e}"));
+			}
+		}
+	}
+	if let Some(cam) = config.cameras.iter().find(|c| c.webhook) {
+		if !webhook_enabled {
+			return Err(format!(
+				"Camera '{}': webhook = true requires [webhook] enable = true",
+				cam.name
+			));
+		}
+	}
+
 	// Each entry of `permitted_users` on a camera must reference a globally
 	// configured `[[users]]` name. This catches typos at startup rather
 	// than at the first failed RTSP authentication.
@@ -1363,6 +1556,46 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// A config with `[webhook] enable` and `webhook_advertise`.
+	fn advertising(enable: bool, advertise: &str) -> Config {
+		Config {
+			webhook: Some(WebhookConfig {
+				enable,
+				webhook_advertise: Some(advertise.to_string()),
+				..WebhookConfig::default()
+			}),
+			..Config::default()
+		}
+	}
+
+	#[test]
+	fn loopback_webhook_advertise_warns_only_when_enabled_and_loopback() {
+		for (enable, advertise, warns) in [
+			(true, "127.0.0.1:8780", true),
+			(true, "localhost:8780", true),
+			(true, "[::1]:8780", true),
+			(true, "192.0.2.5:8780", false),
+			(true, "example.com:8780", false),
+			(true, "not an address", false),
+			(false, "127.0.0.1:8780", false),
+		] {
+			let logs = crate::test_logs::capture_at(tracing::Level::WARN);
+			warn_loopback_webhook_advertise(&advertising(enable, advertise));
+			let out = logs.text();
+			assert_eq!(
+				out.matches("WARN").count(),
+				usize::from(warns),
+				"{advertise} (enable={enable}): {out}"
+			);
+			if warns {
+				assert!(out.contains("webhook_advertise"), "{out}");
+			}
+		}
+		let logs = crate::test_logs::capture_at(tracing::Level::WARN);
+		warn_loopback_webhook_advertise(&Config::default());
+		assert!(logs.text().is_empty());
+	}
 
 	fn now_s() -> i64 {
 		std::time::SystemTime::now()

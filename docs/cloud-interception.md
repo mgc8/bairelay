@@ -477,7 +477,7 @@ Same shape as Part I's recipe (`docs/testing.md` § "Local wake server live-veri
 | TCP listener + accept loop                    | `src/push_listener.rs::run`                                          |
 | Peer-IP → registry UID                        | `crates/wake-server/src/registry.rs::CameraRegistry::lookup_by_ip`   |
 | Long-form UID → camera handle (prefix match)  | `src/push_listener.rs::match_camera_by_uid`                          |
-| Motion publish + wake-lock + fallback off     | `src/push_listener.rs::fire_motion`                                  |
+| Motion publish + wake-lock + fallback off     | `src/wake_events.rs::push_edge` → `motion_edge`                      |
 | Operator-facing config schema                 | `src/config.rs::PushListenerConfig`, `sample_config.toml`            |
 | Shared-registry construction                  | `crates/wake-server/src/lib.rs::make_registry`                       |
 | Orchestrator integration                      | `src/main.rs` (the spawn block alongside the wake server)            |

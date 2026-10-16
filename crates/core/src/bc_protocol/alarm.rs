@@ -130,8 +130,9 @@ pub struct AlarmUpdate {
 	/// for the channel) leaves the previous state unchanged.
 	pub visitor: Option<bool>,
 	/// The doorbell button was pressed: the rising edge of `visitor`,
-	/// which the `listen_on_motion` task sets per push.
-	/// [`classify_alarm`] leaves it `false`.
+	/// set by a caller that tracks `visitor` across pushes with a
+	/// [`VisitorEdge`]. [`classify_alarm`] and `listen_on_motion` leave
+	/// it `false`.
 	pub doorbell_press: bool,
 }
 
@@ -223,15 +224,23 @@ pub fn classify_alarm_events(events: &[AlarmEvent], channel_id: u8, at: Instant)
 ///
 /// A press is the rising edge of `visitor`: a push reporting `visitor`
 /// after one without it, or as the first push seen. Updates with
-/// `visitor: None` leave the state unchanged. Starts with no visitor.
+/// `visitor: None` leave the state unchanged. Starts with no visitor,
+/// or with it held ([`VisitorEdge::held`]).
 #[derive(Debug, Default)]
-pub(crate) struct VisitorEdge {
+pub struct VisitorEdge {
 	visitor: bool,
 }
 
 impl VisitorEdge {
+	/// An edge that starts with the visitor state held, for a press
+	/// already reported elsewhere: the first `visitor` push is no
+	/// press, and one after a push without `visitor` is.
+	pub fn held() -> Self {
+		Self { visitor: true }
+	}
+
 	/// `update` with `doorbell_press` set when it is a rising edge.
-	pub(crate) fn apply(&mut self, update: AlarmUpdate) -> AlarmUpdate {
+	pub fn apply(&mut self, update: AlarmUpdate) -> AlarmUpdate {
 		let Some(visitor) = update.visitor else {
 			return update;
 		};
@@ -597,6 +606,17 @@ mod tests {
 		for (statuses, expected) in cases {
 			assert_eq!(presses(statuses), *expected, "statuses {statuses:?}");
 		}
+	}
+
+	#[test]
+	fn held_visitor_edge_presses_only_after_a_clear() {
+		let at = Instant::now();
+		let mut edge = VisitorEdge::held();
+		let got: Vec<bool> = ["visitor", "visitor", "none", "visitor"]
+			.into_iter()
+			.map(|status| edge.apply(classify_alarm(status, None, at)).doorbell_press)
+			.collect();
+		assert_eq!(got, [false, false, false, true]);
 	}
 
 	#[test]

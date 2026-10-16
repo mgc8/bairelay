@@ -31,6 +31,7 @@ Camera commands:
   version        Print firmware + model info
   siren          Trigger the siren once
   abilities      Dump the camera's abilityInfo XML + parsed permissions
+  webhook        Read the camera's HTTP webhook configuration
 
 Other:
   check-config   Validate the config file and exit (no camera connection)
@@ -114,7 +115,7 @@ pub enum UserTypeArg {
 /// Subcommands under `ptz`.
 #[derive(Debug, Subcommand)]
 pub enum PtzCommand {
-	/// Move to a stored preset. Omit <id> to list presets instead.
+	#[command(about = "Move to a stored preset. Omit <id> to list presets instead")]
 	Preset { preset_id: Option<u8> },
 	/// Save the camera's current position as a new preset.
 	Assign { preset_id: u8, name: String },
@@ -166,15 +167,17 @@ pub enum OnOff {
 pub enum UserAction {
 	/// List all configured users.
 	List,
-	/// Create a new user. Omit <password> to be prompted (TTY) or
-	/// to read from stdin (when piped).
+	#[command(
+		about = "Create a new user. Omit <password> to be prompted (TTY) or to read from stdin (when piped)"
+	)]
 	Add {
 		name: String,
 		user_type: UserTypeArg,
 		password: Option<String>,
 	},
-	/// Change the password of an existing user. Omit <password> to be
-	/// prompted (TTY) or to read from stdin (when piped).
+	#[command(
+		about = "Change the password of an existing user. Omit <password> to be prompted (TTY) or to read from stdin (when piped)"
+	)]
 	Password {
 		name: String,
 		password: Option<String>,
@@ -186,7 +189,7 @@ pub enum UserAction {
 /// Arguments common to every one-shot subcommand.
 #[derive(Debug, clap::Args)]
 pub struct OneShotArgs {
-	/// Camera name (must match a [[cameras]] entry in the config).
+	#[arg(help = "Camera name (must match a [[cameras]] entry in the config)")]
 	pub camera: String,
 }
 
@@ -197,19 +200,21 @@ pub enum Command {
 
 	/// Run the RTSP server only.
 	Rtsp {
-		/// Dump raw BcMedia packets to <dir>/<camera>-<stream>.bcmedia for
-		/// fixture capture and replay testing. Opt-in; no effect on live
-		/// streaming. See docs/testing.md for the capture playbook.
-		#[arg(long = "dump-bcmedia", value_name = "DIR")]
+		#[arg(
+			long = "dump-bcmedia",
+			value_name = "DIR",
+			help = "Dump raw BcMedia packets to <dir>/<camera>-<stream>.bcmedia for fixture capture and replay testing. Opt-in; no effect on live streaming. See docs/testing.md for the capture playbook"
+		)]
 		dump_bcmedia: Option<PathBuf>,
 	},
 
 	/// Run both the MQTT bridge and RTSP server.
 	MqttRtsp {
-		/// Dump raw BcMedia packets to <dir>/<camera>-<stream>.bcmedia for
-		/// fixture capture and replay testing. Opt-in; no effect on live
-		/// streaming. See docs/testing.md for the capture playbook.
-		#[arg(long = "dump-bcmedia", value_name = "DIR")]
+		#[arg(
+			long = "dump-bcmedia",
+			value_name = "DIR",
+			help = "Dump raw BcMedia packets to <dir>/<camera>-<stream>.bcmedia for fixture capture and replay testing. Opt-in; no effect on live streaming. See docs/testing.md for the capture playbook"
+		)]
 		dump_bcmedia: Option<PathBuf>,
 	},
 
@@ -269,6 +274,12 @@ pub enum Command {
 	/// production camera. Used to capture ground-truth ability strings
 	/// for `MissingAbility` gate decisions.
 	Abilities(OneShotArgs),
+
+	/// Read the camera's HTTP webhook configuration (enable, url,
+	/// verify_cert). Reports "unsupported" (exit 0) when the firmware
+	/// answers with an empty body or a persistent error reply, after
+	/// retrying the wake-time 400. Read-only.
+	Webhook(OneShotArgs),
 
 	/// Query or set the PIR sensor.
 	Pir {
@@ -380,6 +391,7 @@ impl Cli {
 			| Command::Version(_)
 			| Command::Siren(_)
 			| Command::Abilities(_)
+			| Command::Webhook(_)
 			| Command::Pir { .. }
 			| Command::StatusLight { .. }
 			| Command::Ptz { .. }
@@ -443,7 +455,8 @@ impl Cli {
 			| Command::SetTime(a)
 			| Command::Version(a)
 			| Command::Siren(a)
-			| Command::Abilities(a) => Some(&a.camera),
+			| Command::Abilities(a)
+			| Command::Webhook(a) => Some(&a.camera),
 			Command::Snapshot { common, .. }
 			| Command::Floodlight { common, .. }
 			| Command::Pir { common, .. }
@@ -733,6 +746,16 @@ mod tests {
 	}
 
 	#[test]
+	fn parse_webhook_takes_camera_only() {
+		let cli = Cli::try_parse_from(["bairelay", "webhook", "driveway"]).unwrap();
+		let Command::Webhook(a) = &cli.command else {
+			panic!("wrong variant")
+		};
+		assert_eq!(a.camera, "driveway");
+		assert!(Cli::try_parse_from(["bairelay", "webhook", "driveway", "on"]).is_err());
+	}
+
+	#[test]
 	fn parse_status_light_read_and_set() {
 		let cli = Cli::try_parse_from(["bairelay", "status-light", "driveway"]).unwrap();
 		assert!(matches!(cli.command, Command::StatusLight { .. }));
@@ -934,6 +957,7 @@ mod tests {
 			"version",
 			"siren",
 			"abilities",
+			"webhook",
 		] {
 			assert!(
 				help.contains(cmd),

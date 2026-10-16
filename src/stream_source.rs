@@ -804,7 +804,7 @@ impl StreamSource {
 
 /// Test-only handle for simulating a live `Frame::Video` arrival in
 /// unit tests. See
-/// [`StreamSource::start_inert_for_test_with_gap_and_injector`].
+/// `StreamSource::start_inert_for_test_with_gap_and_injector`.
 ///
 /// `pub` (not `pub(crate)`) so `tests/fixture_replay.rs` can drive
 /// production's gap-detection ticker from an integration test. The
@@ -1145,7 +1145,7 @@ fn micros_to_90khz(micros: u32) -> u32 {
 /// Check whether the gap threshold has elapsed since the last live
 /// frame; flip `gap_state` to `Bridging` if so. Called on every
 /// gap-detection tick from both [`reader_task`] and its test stand-in
-/// in [`StreamSource::start_inert_for_test_with_gap_and_injector`].
+/// in `StreamSource::start_inert_for_test_with_gap_and_injector`.
 /// Kept as a free fn so the two call sites cannot drift.
 fn check_gap_and_update_state(
 	last_live_frame_at: &Mutex<tokio::time::Instant>,
@@ -1673,8 +1673,8 @@ fn maybe_capture_packet(
 /// return `None` — they do not count as "upstream video frame
 /// arrived" for gap detection. Callers must gate
 /// `last_live_frame_at` / `gap_state` / `last_emitted_pts` updates
-/// on `Some(_)` so an early-return inside [`handle_iframe`] /
-/// [`handle_pframe`] (empty NAL list, P-frame before any I-frame,
+/// on `Some(_)` so an early-return inside `handle_iframe` /
+/// `handle_pframe` (empty NAL list, P-frame before any I-frame,
 /// undetectable codec) does not spuriously mark the source as
 /// `Live` when subscribers saw nothing.
 ///

@@ -377,7 +377,7 @@ impl Drop for ConnAckTask {
 }
 
 /// Drive the MQTT event loop until `cancel` fires: dispatch control
-/// publishes, start ConnAck handling (see [`ConnAckTask`]), and pace
+/// publishes, start ConnAck handling (see `ConnAckTask`), and pace
 /// reconnects on errors. Exiting aborts a ConnAck run still in flight.
 /// `shutdown` stops ConnAck handling only; the loop keeps polling until
 /// `cancel`, so the cameras' final publishes still reach the broker.

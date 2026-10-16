@@ -142,7 +142,7 @@ impl BcCamera {
 
 	/// Set a PTZ preset.
 	///
-	/// The current position will be saved as a preset with the given [preset_id] and [name]
+	/// The current position will be saved as a preset with the given `preset_id` and `name`
 	pub async fn set_ptz_preset(&self, preset_id: u8, name: String) -> Result<()> {
 		self.has_ability_rw("control").await?;
 		let connection = self.get_connection();

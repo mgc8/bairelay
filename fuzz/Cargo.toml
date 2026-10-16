@@ -84,3 +84,17 @@ path = "fuzz_targets/adpcm_decode_block.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "webhook_http_request"
+path = "fuzz_targets/webhook_http_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webhook_body"
+path = "fuzz_targets/webhook_body.rs"
+test = false
+doc = false
+bench = false

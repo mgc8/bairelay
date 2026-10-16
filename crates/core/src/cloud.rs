@@ -13,7 +13,7 @@
 //!    bundle, solving a hashcash proof-of-work challenge if the cloud demands
 //!    one (`error.code == 8214`).
 //!
-//! The bundle is short-lived, so [`mint_bundle`] caches it per-UID only until
+//! The bundle is short-lived, so [`mint_bundle`](crate::cloud::mint_bundle) caches it per-UID only until
 //! shortly before its `exp` and re-mints after that — battery cameras wake
 //! often, and replaying the full OAuth flow per wake would risk Reolink-side
 //! rate-limiting. See `login::run_sigv3_direct`.

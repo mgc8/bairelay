@@ -19,3 +19,4 @@ pub mod snapshot;
 pub mod status_light;
 pub mod users;
 pub mod version;
+pub mod webhook;
