@@ -593,6 +593,30 @@ The standard live-verify rig is:
 
 If you don't have hardware, say so on the PR — a maintainer with cameras will run the rig before merge.
 
+## XML corpus snapshots
+
+`crates/core/src/xml_corpus_tests.rs` is a snapshot harness over a directory of real camera XML payloads. It is dormant unless `BAIRELAY_XML_CORPUS=<dir>` is set. Each `<dir>/*.xml` is parsed with the production parser chosen by its root element (`<body>` → `BcXml`, `<Extension>` → `Extension`, `<P2P>` → `UdpXml`) and re-serialised; the parsed structure plus the outbound bytes form the snapshot, stored beside the file as `<name>.xml.snap`.
+
+- `BAIRELAY_XML_CORPUS=<dir>` — enables the test.
+- `BAIRELAY_XML_CORPUS_BLESS=1` — writes or refreshes the `.snap` files. Without it the test fails listing every file whose snapshot changed, and writes the new output as `<name>.xml.snap.new` beside the `.snap`.
+
+The corpus lives in `tests/logs/xml-corpus/` (git-ignored). It holds decrypted camera payloads, including credential hashes and UIDs, so it stays local and is never committed or shared.
+
+Capturing a corpus:
+
+1. Copy `config.toml` to `tests/logs/xml-corpus/config.toml` and set `debug = true` under each `[[cameras]]`.
+2. Run the read-only one-shots (`version`, `battery`, `abilities`, `presets`, `services`, `users`, `status-light`, `pir`, `floodlight`) against that config with `RUST_LOG=info,bairelay_neolink_core::bc::de=trace`.
+3. Extract each `Payload Txt: "<rust-debug-escaped xml>"` line from stderr, un-escape the string, and write one `<hash>.xml` per unique payload into `tests/logs/xml-corpus/corpus/`.
+
+Run it before and after any XML-stack upgrade (quick-xml, serde, or the `bc/xml.rs` / `bcudp/xml.rs` structs):
+
+```
+BAIRELAY_XML_CORPUS=$PWD/tests/logs/xml-corpus/corpus BAIRELAY_XML_CORPUS_BLESS=1 cargo test -p bairelay-neolink-core --lib xml_corpus   # before: bless
+BAIRELAY_XML_CORPUS=$PWD/tests/logs/xml-corpus/corpus cargo test -p bairelay-neolink-core --lib xml_corpus                                # after: compare
+```
+
+Each `.snap.new` is a payload whose parsed or serialised form changed; review it against the `.snap` and either fix the regression or re-bless.
+
 ## Local wake server live-verify
 
 Pre-requisite: a real Argus on the same LAN as bairelay, plus a LAN DNS resolver (Pi-hole, dnsmasq, unbound, the gateway's resolver, or whatever the cameras query) that returns the bairelay box's IP for `p2p.reolink.com` and `p2p1.reolink.com` … `p2p11.reolink.com`. **The cameras' DNS resolution is the load-bearing piece** — `/etc/hosts` on the bairelay box is irrelevant because cameras don't query it; they query their configured DNS (typically DHCP-provided, which points at your LAN resolver). Bairelay's outgoing discovery uses the same DNS, so once the resolver is configured both directions land on the wake server.

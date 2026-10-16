@@ -106,7 +106,7 @@ Local replacement for Reolink's P2P cloud. Full wire-level reference: `docs/clou
 | CLI                    | `clap`                 | 4.x     | Derive macro                     |
 | Serde                  | `serde`                | 1.x     | Derive macro                     |
 | Config format          | `toml`                 | 0.8.x   | TOML parsing                     |
-| XML serialisation      | `quick-xml`            | 0.36.x  | Serialiser + deserialiser        |
+| XML serialisation      | `quick-xml`            | 0.42.x  | Serialiser + deserialiser        |
 | Byte buffers           | `bytes`                | 1.x     | XML serialisation buffer         |
 
 ### RTSP / RTP (`crates/rtsp/`)
@@ -137,7 +137,7 @@ H.264 NAL → RTP (RFC 6184) and H.265 NAL → RTP (RFC 7798) packetisation are 
 | Hashing                | `md5`                  | 0.7.x   | Challenge-response auth          |
 | Parsing                | `nom`                  | 7.x     | Binary protocol parsing          |
 | Serialisation          | `cookie-factory`       | 0.3.x   | Binary protocol writing          |
-| XML                    | `quick-xml`            | 0.36.x  | Camera XML messages              |
+| XML                    | `quick-xml`            | 0.42.x  | Camera XML messages              |
 | CRC                    | `crc32fast`            | 1.x     | Packet checksums                 |
 
 ### Wake server (`crates/wake-server/`)
