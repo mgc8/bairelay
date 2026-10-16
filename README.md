@@ -490,14 +490,18 @@ Every push and pull request runs the workspace through GitHub Actions (`.github/
 
 - `cargo fmt --all --check` (rustfmt with hard tabs, see `rustfmt.toml`)
 - `cargo clippy --all-targets -- -D warnings`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - `cargo test --all-targets` on Linux **and** macOS
 - `cargo tarpaulin` with `fail-under` set in `tarpaulin.toml`
+- `hadolint/hadolint-action` on `hassio/bairelay/Dockerfile`
+- `frenck/action-addon-linter` on `hassio/bairelay`
 
 The same gates run locally:
 
 ```bash
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo test
 cargo tarpaulin
 ```

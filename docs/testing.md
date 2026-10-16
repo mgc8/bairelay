@@ -11,7 +11,7 @@ Run these locally before pushing; CI runs the equivalent set on Linux + macOS:
 ```
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo test
 ```
 
