@@ -21,6 +21,10 @@ bind = "0.0.0.0"
 # can never outlive the Baichuan session it pulls from.
 # stream_prune_grace_secs = 30
 
+# Directory that MQTT control/talk WAV paths must resolve under. Unset,
+# any regular file bairelay can read is accepted from any broker client.
+# talk_dir = "/srv/bairelay/talk"
+
 
 # RTSP user accounts. Without any [[users]], connections are anonymous.
 # [[users]]
@@ -130,6 +134,18 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 #   on_motion, on_client, on_disconnect, motion_timeout, mode
 # have no effect in bairelay and can be removed.
 # timeout = 30  # deprecated alias for idle_disconnect_timeout_secs
+
+# [cameras.talk_config]
+# Pins the two-way audio TalkConfig. Battery doorbells need this table,
+# even empty: without it the talk path queries TalkAbility and checks the
+# two_way_audio ability, which these cameras do not provide.
+# duplex = "FDX"
+# audio_stream_mode = "followVideoStream"
+# audio_type = "adpcm"        # only adpcm is supported
+# sample_rate = 16000         # Hz
+# sample_precision = 16
+# length_per_encoder = 1024   # >= 120; ADPCM block = length_per_encoder / 2 + 4 bytes
+# sound_track = "mono"
 
 
 [[cameras]]

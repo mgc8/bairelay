@@ -833,3 +833,32 @@ fn reject_extra_path_segments() {
 	let cmd = parse_control_message(P, "neolink/cam1/control/ptz/preset/extra", b"1");
 	assert!(cmd.is_none(), "extra segments must reject");
 }
+
+#[test]
+fn parse_talk_absolute_path() {
+	let cmd = parse_control_message(P, "neolink/cam1/control/talk", b" /srv/chime.wav\n");
+	match cmd {
+		Some(ControlCommand::Talk { camera, path }) => {
+			assert_eq!(camera, "cam1");
+			assert_eq!(path, "/srv/chime.wav");
+		}
+		other => panic!("expected Talk, got {other:?}"),
+	}
+	let cmd = ControlCommand::Talk {
+		camera: "cam1".into(),
+		path: "/a.wav".into(),
+	};
+	assert_eq!(cmd.control_topic(P), "neolink/cam1/control/talk");
+	assert_eq!(cmd.camera_name(), "cam1");
+}
+
+#[test]
+fn talk_rejects_relative_empty_and_reply_tokens() {
+	for payload in [&b"chime.wav"[..], b"", b"OK", b"FAIL"] {
+		assert!(
+			parse_control_message(P, "neolink/cam1/control/talk", payload).is_none(),
+			"payload {:?} must not parse",
+			String::from_utf8_lossy(payload)
+		);
+	}
+}

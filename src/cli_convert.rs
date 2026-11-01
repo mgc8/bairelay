@@ -178,6 +178,15 @@ pub fn clone_command(cmd: &cli::Command) -> cli::Command {
 		Command::SetTime(a) => Command::SetTime(clone_oneshot_args(a)),
 		Command::Version(a) => Command::Version(clone_oneshot_args(a)),
 		Command::Siren(a) => Command::Siren(clone_oneshot_args(a)),
+		Command::Talk {
+			common,
+			file,
+			volume,
+		} => Command::Talk {
+			common: clone_oneshot_args(common),
+			file: file.clone(),
+			volume: *volume,
+		},
 		Command::Abilities(a) => Command::Abilities(clone_oneshot_args(a)),
 		Command::Webhook(a) => Command::Webhook(clone_oneshot_args(a)),
 		Command::Snapshot {

@@ -24,6 +24,7 @@ pub mod startup_wake;
 pub mod status_cache;
 pub mod stream_source;
 pub mod supervisor;
+pub mod talk;
 pub mod tls_load;
 pub mod wake_events;
 pub mod wake_lock;

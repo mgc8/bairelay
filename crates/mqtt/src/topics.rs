@@ -133,6 +133,18 @@ pub fn control_siren(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/control/siren")
 }
 
+/// Play a host WAV file through the camera speaker (payload: absolute
+/// path): `{prefix}/{cam}/control/talk`
+pub fn control_talk(prefix: &str, cam: &str) -> String {
+	format!("{prefix}/{cam}/control/talk")
+}
+
+/// Talk progress (`playing`, `done`, `error: <text>`):
+/// `{prefix}/{cam}/status/talk`
+pub fn status_talk(prefix: &str, cam: &str) -> String {
+	format!("{prefix}/{cam}/status/talk")
+}
+
 /// Wake battery camera for N minutes: `{prefix}/{cam}/control/wakeup`
 pub fn control_wakeup(prefix: &str, cam: &str) -> String {
 	format!("{prefix}/{cam}/control/wakeup")
@@ -179,6 +191,7 @@ pub fn subscribe_topics(prefix: &str, cam: &str) -> Vec<String> {
 		control_zoom(prefix, cam),
 		control_siren(prefix, cam),
 		control_wakeup(prefix, cam),
+		control_talk(prefix, cam),
 		// Query topics
 		query_battery(prefix, cam),
 		query_preview(prefix, cam),

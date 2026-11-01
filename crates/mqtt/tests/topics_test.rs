@@ -248,8 +248,8 @@ fn query_pir_topic_format() {
 #[test]
 fn subscribe_topics_count() {
 	let subs = bairelay_mqtt::topics::subscribe_topics(PREFIX, "cam1");
-	// 12 control + 4 query = 16 topics
-	assert_eq!(subs.len(), 16);
+	// 13 control + 4 query = 17 topics
+	assert_eq!(subs.len(), 17);
 }
 
 #[test]
@@ -267,6 +267,7 @@ fn subscribe_topics_include_all_control() {
 	assert!(subs.contains(&"bairelay/cam1/control/zoom".to_string()));
 	assert!(subs.contains(&"bairelay/cam1/control/siren".to_string()));
 	assert!(subs.contains(&"bairelay/cam1/control/wakeup".to_string()));
+	assert!(subs.contains(&"bairelay/cam1/control/talk".to_string()));
 }
 
 #[test]
@@ -289,5 +290,5 @@ fn legacy_neolink_prefix_subscribe_list_matches_pre_2g_paths() {
 	assert!(subs.contains(&"neolink/cam1/control/floodlight".to_string()));
 	assert!(subs.contains(&"neolink/cam1/control/wakeup".to_string()));
 	assert!(subs.contains(&"neolink/cam1/query/battery".to_string()));
-	assert_eq!(subs.len(), 16);
+	assert_eq!(subs.len(), 17);
 }

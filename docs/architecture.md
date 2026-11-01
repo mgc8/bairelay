@@ -27,7 +27,8 @@ bairelay/
 
 Owns the application lifecycle:
 
-- CLI parsing via `clap` — service modes (`mqtt` / `rtsp` / `mqtt-rtsp`), one-shot camera commands (`reboot`, `snapshot`, `battery`, etc.), and `check-config` (parse + validate + warn, no camera connect).
+- CLI parsing via `clap` — service modes (`mqtt` / `rtsp` / `mqtt-rtsp`), one-shot camera commands (`reboot`, `snapshot`, `battery`, `talk`, etc.), and `check-config` (parse + validate + warn, no camera connect).
+- Two-way audio (`src/talk/`) — WAV reader, linear resampler and DVI4 IMA ADPCM encoder, plus the `TalkConfig` resolver shared by the `talk` one-shot and the MQTT `control/talk` topic.
 - TOML configuration loading and validation.
 - Camera orchestrator: spawns per-camera task trees, manages connections.
 - Wake-lock counter with dual `Notify` and Drop-based RAII guards.
@@ -187,6 +188,20 @@ Two separate notifications:
 Both use `Notify::notify_one()` (not `notify_waiters()`) so a permit is stored when no waiter is registered — late `.notified().await` calls still fire. The grace-period timer listens on `notify_release` and starts a countdown; any new `acquire()` before the countdown expires resets it.
 
 The watchdog also monitors wake-lock state and can force-disconnect via a `disconnect_signal: Notify` on each camera.
+
+### Talk (two-way audio)
+
+```
+WAV file ──load (10 s, regular file, size cap)──▶ mono PCM
+                                                    │
+TalkConfig ◀── [cameras.talk_config] │ TalkAbility (5 s) │ Reolink defaults
+    │                                               ▼
+    └──────────▶ resample → volume → DVI4 IMA ADPCM blocks ──▶ BcCamera::talk (msg 201, 202, 11)
+```
+
+- **Entry points.** `bairelay talk` runs through the one-shot runner with an op deadline of clip length + 30 s. MQTT `control/talk` runs in its own task: the WAV loads before the wake lock is taken, so a bad path never wakes a battery camera. The wake lock is held for the clip plus at most 15 s connect wait and the 30 s margin. Clips are capped at 600 s.
+- **Resolver tiers.** `[cameras.talk_config]` wins. Otherwise the first entry of each `TalkAbility` list, when all three are non-empty. Otherwise FDX / followVideoStream / adpcm / 16000 Hz / 16 bit / 1024 / mono. With the table set, the `TalkAbility` query and the core's `two_way_audio` ability gate are skipped.
+- **One talk per camera.** A second `control/talk` on a camera that is playing gets `error: busy`; letting it through would make the camera reply 422 and the core's retry would stop the first clip.
 
 ### Watchdog
 

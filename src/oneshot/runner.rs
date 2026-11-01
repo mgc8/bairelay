@@ -32,6 +32,20 @@ pub async fn run<F, T>(cfg: &CameraConfig, cancel: CancellationToken, op: F) -> 
 where
 	F: for<'a> FnOnce(&'a BcCamera) -> BoxFuture<'a, Result<T>>,
 {
+	run_with_op_timeout(cfg, cancel, OP_TIMEOUT, op).await
+}
+
+/// [`run`] with a caller-chosen operation deadline, for operations that
+/// legitimately outlast the default 30 s (`talk` plays a whole clip).
+pub async fn run_with_op_timeout<F, T>(
+	cfg: &CameraConfig,
+	cancel: CancellationToken,
+	op_timeout: Duration,
+	op: F,
+) -> Result<T>
+where
+	F: for<'a> FnOnce(&'a BcCamera) -> BoxFuture<'a, Result<T>>,
+{
 	let max_enc = max_encryption(cfg);
 
 	tokio::select! {
@@ -58,7 +72,7 @@ where
 			// instead of releasing immediately on `logout()`. Battery
 			// cams park on TCP-drop either way, but explicit logout is
 			// faster and matches the comment's intent.
-			let op_result: Result<T> = match timeout(OP_TIMEOUT, op(&camera)).await {
+			let op_result: Result<T> = match timeout(op_timeout, op(&camera)).await {
 				Ok(inner) => inner,
 				Err(_) => Err(anyhow!("operation timed out")),
 			};

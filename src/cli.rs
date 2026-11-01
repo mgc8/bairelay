@@ -30,6 +30,7 @@ Camera commands:
   set-time       Set the camera clock to the host's current local time
   version        Print firmware + model info
   siren          Trigger the siren once
+  talk           Play a WAV file through the camera speaker
   abilities      Dump the camera's abilityInfo XML + parsed permissions
   webhook        Read the camera's HTTP webhook configuration
 
@@ -269,6 +270,22 @@ pub enum Command {
 	/// Trigger the siren once.
 	Siren(OneShotArgs),
 
+	/// Play a WAV file through the camera speaker (two-way audio). The
+	/// file must be 16-bit PCM; it is downmixed to mono, resampled to
+	/// the talk sample rate and encoded as IMA ADPCM. The `TalkConfig`
+	/// comes from `[cameras.talk_config]`, else the camera's
+	/// `TalkAbility`, else the Reolink ADPCM defaults.
+	Talk {
+		#[command(flatten)]
+		common: OneShotArgs,
+		/// WAV file to play (16-bit PCM). `--file-path` is a neolink-compat alias.
+		#[arg(short = 'f', long = "file", alias = "file-path", value_name = "WAV")]
+		file: PathBuf,
+		/// Gain applied to the samples before encoding (1.0 = unchanged).
+		#[arg(long, default_value = "1.0")]
+		volume: f32,
+	},
+
 	/// Dump the camera's `abilityInfo` XML and the flat list of
 	/// permission triples it carries. Read-only; safe to run on a
 	/// production camera. Used to capture ground-truth ability strings
@@ -390,6 +407,7 @@ impl Cli {
 			| Command::SetTime(_)
 			| Command::Version(_)
 			| Command::Siren(_)
+			| Command::Talk { .. }
 			| Command::Abilities(_)
 			| Command::Webhook(_)
 			| Command::Pir { .. }
@@ -458,6 +476,7 @@ impl Cli {
 			| Command::Abilities(a)
 			| Command::Webhook(a) => Some(&a.camera),
 			Command::Snapshot { common, .. }
+			| Command::Talk { common, .. }
 			| Command::Floodlight { common, .. }
 			| Command::Pir { common, .. }
 			| Command::StatusLight { common, .. }
@@ -927,6 +946,44 @@ mod tests {
 	}
 
 	#[test]
+	fn parse_talk_subcommand() {
+		let cli = Cli::try_parse_from([
+			"bairelay",
+			"talk",
+			"-c",
+			"c.toml",
+			"door",
+			"--file",
+			"/tmp/a.wav",
+			"--volume",
+			"0.5",
+		])
+		.unwrap();
+		let Command::Talk {
+			common,
+			file,
+			volume,
+		} = &cli.command
+		else {
+			panic!("expected Talk");
+		};
+		assert_eq!(common.camera, "door");
+		assert_eq!(file, &PathBuf::from("/tmp/a.wav"));
+		assert_eq!(*volume, 0.5);
+		assert_eq!(cli.camera_name(), Some("door"));
+		assert!(cli.is_oneshot());
+		// neolink-compat alias and default volume.
+		let cli =
+			Cli::try_parse_from(["bairelay", "talk", "door", "--file-path", "a.wav"]).unwrap();
+		let Command::Talk { volume, .. } = &cli.command else {
+			panic!("expected Talk");
+		};
+		assert_eq!(*volume, 1.0);
+		// --file is required.
+		assert!(Cli::try_parse_from(["bairelay", "talk", "door"]).is_err());
+	}
+
+	#[test]
 	fn help_template_lists_all_subcommands_grouped() {
 		// The hand-rolled help_template must stay in sync with the
 		// Command enum. If someone adds a new camera command without
@@ -956,6 +1013,7 @@ mod tests {
 			"set-time",
 			"version",
 			"siren",
+			"talk",
 			"abilities",
 			"webhook",
 		] {

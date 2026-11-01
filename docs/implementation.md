@@ -32,6 +32,7 @@ Static structure and dependency tables live in `docs/architecture.md`.
 | `set_floodlight_manual(bool, u16)`    | Second arg is duration **seconds**. Use 30.               |
 | `zoom_to(u32)`                        | Pre-multiply by 1000 (`level * 1000.0` for MQTT float).   |
 | `set_ptz_preset(u8, String)`          | Preset ID + name.                                         |
+| `talk_ability(bypass)` / `talk(adpcm, cfg, bypass)` | Two-way audio. `talk` sends `TalkConfig` (msg 201), the ADPCM blocks (msg 202, paced at real time) and talk-stop (msg 11). `bypass` skips the `two_way_audio` ability gate; the binary sets it only for a camera with `[cameras.talk_config]`. Battery doorbells never answer `TalkAbility` (msg 10). |
 | `start_video(kind, channel, record)` / `stop_video(kind)` | Returns `StreamData`; covered by `VideoStream` trait. |
 | `get_snapshot()`                      | JPEG; each call wakes battery cameras — use sparingly. An Argus answers msg 109 with `400` (`CameraServiceUnavailable`) for several seconds after connect (6 s or more); startup wake and the preview poller retry through `camera_tasks::snapshot_with_retry` (2 s backoff while the next attempt starts within 12 s of the first, cancel-aware, 10 s per attempt). |
 
@@ -45,6 +46,9 @@ Every async `BcCamera` method can hang indefinitely if the camera drops the TCP 
 | Keepalive         | 5 s      |
 | Pollers           | 10 s     |
 | Control commands  | 30 s     |
+| Talk `TalkAbility` query | 5 s (falls back to defaults) |
+| Talk WAV load     | 10 s     |
+| Talk playback     | clip length + 30 s |
 | Logout            | 5 s      |
 
 ### Calls that spawn internal tasks
@@ -256,6 +260,7 @@ Match neolink's wire behaviour exactly:
 - **Siren.** `bc.siren()` takes no arguments. Only fire on `"on"` payload; ignore `"off"`.
 - **Wakeup.** Acquires a wake lock immediately (triggers the camera connection), then waits for the camera to actually connect before starting the countdown. 2-minute connection timeout, respects the cancellation token.
 - **Reply convention.** After every control command, publish `"OK"` or `"FAIL"` (non-retained) to the same control topic. Enables HA automations to confirm command success.
+- **Talk.** Payload is an absolute host path to a 16-bit PCM WAV. With top-level `talk_dir`, the canonicalised path must lie under it. Status goes to `status/talk` (non-retained): `playing`, then `done` or `error: <code>` with code `not_found`, `not_a_file`, `outside_talk_dir`, `decode`, `timeout`, `busy` or `camera` — never the path or OS error text.
 - **Query responses.** `query/battery` and `query/pir` serialise the full struct to XML via `quick_xml::se::to_writer` and publish to `status/battery` and `status/pir` respectively (non-retained).
 
 ---
@@ -265,6 +270,10 @@ Match neolink's wire behaviour exactly:
 ### ADPCM ser/de asymmetry
 
 `BcMedia::Adpcm` does **not** round-trip byte-exact through `serialize` → `deserialize`. The serialiser pads on `data.len() % 8`; the deserialiser pads on `(data.len() + 4) % 8` (the wire `payload_size` includes the 4-byte sub-header). The capture pipeline writes raw camera-side bytes through a single `serialize` per packet, so on-disk `.bcmedia` files parse cleanly. **Do not** re-serialise captured packets to "normalise" them — the first ADPCM packet desyncs the loop.
+
+### Talk ADPCM block layout (DVI4)
+
+The talk encoder (`src/talk/adpcm.rs`) matches GStreamer `adpcmenc layout=dvi blockalign=<n>` as used by the neolink talk client. Block size is `length_per_encoder / 2 + 4` bytes (516 for the default 1024); `BcCamera::talk` chunks its input by the same size. Each mono block is: first sample as `i16` LE, step index (0–88, carried over from the previous block), one reserved zero byte, then `2 * (n - 4)` 4-bit codes, low nibble first — 1025 samples per 516-byte block. The predictor restarts from the header sample each block. The last block is padded with silence.
 
 ### HEVC NAL whitelist (`is_decodable_nal`)
 
@@ -351,6 +360,7 @@ Reconnect on transient network failures still uses `ReconnectBackoff::sleep_with
 - `idle_disconnect`: defaults `false`. Must be explicitly enabled for battery cameras.
 - `gap_threshold_secs`: must be finite + positive.
 - `idle_disconnect_timeout_secs`: must be finite + positive.
+- `[cameras.talk_config]`: `audio_type = "adpcm"`, `sample_rate > 0`, `length_per_encoder >= 120` and `(length_per_encoder / 2) % 4 == 0`.
 
 ### Neolink-compat fields
 
