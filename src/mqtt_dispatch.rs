@@ -63,6 +63,14 @@ pub async fn dispatch_control(
 		return;
 	}
 
+	// Talk loads the WAV before it takes the wake lock (a bad path must
+	// not wake a battery camera), runs past CMD_TIMEOUT, and reports on
+	// `status/talk`, so it has its own path.
+	if let ControlCommand::Talk { path, .. } = &cmd {
+		dispatch_talk(cam, path, mqtt, topic_prefix).await;
+		return;
+	}
+
 	// Acquire the wake lock FIRST. If the camera is sleeping, this is
 	// what triggers the connection — the camera task is parked on
 	// `wait_for_acquire()`. Holding the guard until dispatch ends keeps
@@ -239,7 +247,7 @@ pub async fn dispatch_control(
 				Ok(())
 			}
 		}
-		ControlCommand::Wakeup { .. } => {
+		ControlCommand::Wakeup { .. } | ControlCommand::Talk { .. } => {
 			// Handled above (before connection check)
 			unreachable!()
 		}
@@ -355,6 +363,81 @@ async fn wait_for_bc_camera(
 		_ = cancel.cancelled() => None,
 		result = tokio::time::timeout(deadline, inner) => result.ok().flatten(),
 	}
+}
+
+/// Cameras with a `control/talk` in flight. A second talk on the same
+/// camera would make the camera reply 422 and the core's retry would
+/// stop the first clip, so it is refused instead.
+static TALK_BUSY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Releases the camera's [`TALK_BUSY`] slot on drop.
+struct TalkSlot(String);
+
+impl TalkSlot {
+	fn claim(camera: &str) -> Option<Self> {
+		let mut busy = TALK_BUSY.lock().unwrap_or_else(|e| e.into_inner());
+		if busy.iter().any(|c| c == camera) {
+			return None;
+		}
+		busy.push(camera.to_string());
+		Some(TalkSlot(camera.to_string()))
+	}
+}
+
+impl Drop for TalkSlot {
+	fn drop(&mut self) {
+		let mut busy = TALK_BUSY.lock().unwrap_or_else(|e| e.into_inner());
+		busy.retain(|c| c != &self.0);
+	}
+}
+
+/// `control/talk`: play the host WAV at `path`. Publishes `playing`,
+/// then `done` or `error: <code>` on `status/talk` (codes:
+/// [`crate::talk::TalkError::code`]; never the path or OS text), and
+/// `OK` / `FAIL` on the control topic like every other command.
+async fn dispatch_talk(cam: &Arc<CameraHandle>, path: &str, mqtt: &SharedMqttClient, prefix: &str) {
+	let camera = cam.name().to_string();
+	let status_topic = topics::status_talk(prefix, &camera);
+	let result = run_talk(cam, path, mqtt, &status_topic).await;
+	let (status, reply) = match &result {
+		Ok(()) => ("done".to_string(), "OK"),
+		Err(e) => {
+			tracing::warn!(camera = %camera, code = e.code(), error = %e, "talk failed");
+			(format!("error: {}", e.code()), "FAIL")
+		}
+	};
+	let _ = mqtt.publish(&status_topic, status.as_bytes()).await;
+	let _ = mqtt
+		.publish(&topics::control_talk(prefix, &camera), reply.as_bytes())
+		.await;
+}
+
+async fn run_talk(
+	cam: &Arc<CameraHandle>,
+	path: &str,
+	mqtt: &SharedMqttClient,
+	status_topic: &str,
+) -> Result<(), crate::talk::TalkError> {
+	use crate::talk::TalkError;
+	let _slot = TalkSlot::claim(cam.name()).ok_or(TalkError::Busy)?;
+	let clip = crate::talk::load_clip(std::path::Path::new(path), cam.config().talk_dir.as_deref())
+		.await?;
+	let _guard = cam.wake_lock().acquire();
+	let bc = match cam.bc_camera() {
+		Some(bc) => bc,
+		None => wait_for_bc_camera(cam, Duration::from_secs(15))
+			.await
+			.ok_or_else(|| {
+				TalkError::Camera(anyhow::anyhow!("camera did not connect within 15 s"))
+			})?,
+	};
+	let _ = mqtt.publish(status_topic, b"playing").await;
+	let deadline = crate::talk::clip_duration(&clip) + crate::talk::TALK_OP_MARGIN;
+	timeout(deadline, crate::talk::play(&*bc, cam.config(), &clip, 1.0))
+		.await
+		.map_err(|_| TalkError::Camera(anyhow::anyhow!("talk timed out")))?
+		.map_err(TalkError::Camera)?;
+	Ok(())
 }
 
 /// Collapse a `timeout(..).await` outcome into a plain camera-result,
@@ -503,6 +586,120 @@ mod tests {
 		// linger for the 120 s connect-timeout budget.
 		cameras.get("cam-wake").unwrap().cancel_token().cancel();
 		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+
+	/// `control/talk` loads the WAV, calls `talk` once, and reports
+	/// `playing` then `done` on `status/talk`.
+	#[tokio::test]
+	async fn dispatch_talk_plays_wav_and_reports_status() {
+		let fake = FakeCameraBuilder::new()
+			.with_talk_ability(|| Ok(Default::default()))
+			.build();
+		let (cameras, fake) = test_cameras_with_fake("cam-talk", fake);
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let wav = tempfile::NamedTempFile::new().unwrap();
+		std::fs::write(
+			wav.path(),
+			crate::talk::wav::tests::make_wav(16000, 1, &[0; 2050]),
+		)
+		.unwrap();
+
+		dispatch_control(
+			ControlCommand::Talk {
+				camera: "cam-talk".to_string(),
+				path: wav.path().to_str().unwrap().to_string(),
+			},
+			&cameras,
+			&mqtt,
+			"bairelay",
+		)
+		.await;
+
+		let calls = fake.calls().talk.lock().unwrap();
+		assert_eq!(calls.len(), 1);
+		assert_eq!(calls[0].0.len(), 2 * 516);
+		let status: Vec<Vec<u8>> = mock
+			.published()
+			.into_iter()
+			.filter(|(t, _, _)| t == "bairelay/cam-talk/status/talk")
+			.map(|(_, p, _)| p)
+			.collect();
+		assert_eq!(status, vec![b"playing".to_vec(), b"done".to_vec()]);
+		assert!(mock
+			.published()
+			.iter()
+			.any(|(t, p, _)| t == "bairelay/cam-talk/control/talk" && p == b"OK"));
+	}
+
+	/// With `talk_dir` set, a path outside it is refused before any
+	/// camera call and reported as `error: outside_talk_dir`.
+	#[tokio::test]
+	async fn dispatch_talk_outside_talk_dir_reports_code() {
+		let root = tempfile::tempdir().unwrap();
+		let allowed = root.path().join("allowed");
+		std::fs::create_dir(&allowed).unwrap();
+		let outside = root.path().join("x.wav");
+		std::fs::write(
+			&outside,
+			crate::talk::wav::tests::make_wav(16000, 1, &[0; 4]),
+		)
+		.unwrap();
+		let mut cfg = minimal_camera_config("cam-talk-dir");
+		cfg.talk_dir = Some(allowed);
+		let handle = Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None));
+		let fake = FakeCameraBuilder::new().build();
+		let driver: Arc<dyn CameraDriver> = fake.clone();
+		handle.set_driver_for_test(driver);
+		let mut cameras = HashMap::new();
+		cameras.insert("cam-talk-dir".to_string(), handle);
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+
+		dispatch_control(
+			ControlCommand::Talk {
+				camera: "cam-talk-dir".to_string(),
+				path: outside.to_str().unwrap().to_string(),
+			},
+			&cameras,
+			&mqtt,
+			"bairelay",
+		)
+		.await;
+
+		assert!(fake.calls().talk.lock().unwrap().is_empty());
+		assert!(mock.published().iter().any(|(t, p, _)| {
+			t == "bairelay/cam-talk-dir/status/talk" && p == b"error: outside_talk_dir"
+		}));
+	}
+
+	/// A missing WAV is reported as `error: ...` without calling `talk`.
+	#[tokio::test]
+	async fn dispatch_talk_missing_file_reports_error() {
+		let fake = FakeCameraBuilder::new().build();
+		let (cameras, fake) = test_cameras_with_fake("cam-talk-missing", fake);
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+
+		dispatch_control(
+			ControlCommand::Talk {
+				camera: "cam-talk-missing".to_string(),
+				path: "/nonexistent/bairelay-talk-xxyy.wav".to_string(),
+			},
+			&cameras,
+			&mqtt,
+			"bairelay",
+		)
+		.await;
+
+		assert!(fake.calls().talk.lock().unwrap().is_empty());
+		let published = mock.published();
+		let status = published
+			.iter()
+			.find(|(t, _, _)| t == "bairelay/cam-talk-missing/status/talk")
+			.map(|(_, p, _)| String::from_utf8_lossy(p).into_owned())
+			.expect("status/talk published");
+		assert_eq!(status, "error: not_found");
+		assert!(published
+			.iter()
+			.any(|(t, p, _)| t == "bairelay/cam-talk-missing/control/talk" && p == b"FAIL"));
 	}
 
 	/// `ControlCommand::Reboot` dispatches to `CameraDriver::reboot`

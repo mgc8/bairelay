@@ -155,6 +155,13 @@ pub struct Config {
 	#[serde(default)]
 	pub cloud_password: Option<String>,
 
+	/// Directory that MQTT `control/talk` paths must resolve under (after
+	/// canonicalisation). Unset, any regular file the bairelay user can
+	/// read is accepted — anyone who can publish to the broker can then
+	/// make bairelay read it. Does not restrict the `talk` CLI.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub talk_dir: Option<std::path::PathBuf>,
+
 	pub cameras: Vec<CameraConfig>,
 }
 
@@ -176,6 +183,7 @@ impl Default for Config {
 			stream_prune_grace_secs: default_prune_grace_secs(),
 			cloud_account: None,
 			cloud_password: None,
+			talk_dir: None,
 			cameras: Vec::new(),
 		}
 	}
@@ -482,6 +490,10 @@ pub struct CameraConfig {
 	/// Host's refresh token from the same bootstrap (refresh-grant fallback).
 	#[serde(skip)]
 	pub cloud_refresh_token: Option<String>,
+	/// Document-root `talk_dir`, copied onto each camera by
+	/// [`parse_config`] for the MQTT `control/talk` path check.
+	#[serde(skip)]
+	pub talk_dir: Option<std::path::PathBuf>,
 
 	#[serde(default, alias = "channel")]
 	pub channel_id: u8,
@@ -581,6 +593,74 @@ pub struct CameraConfig {
 	pub push_notifications: Option<bool>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub strict: Option<bool>,
+
+	/// Two-way audio (`talk`) parameters to send as the Baichuan
+	/// `TalkConfig` (msg 201) instead of the camera's `TalkAbility`
+	/// reply. A battery doorbell NEEDS this table, even an empty one:
+	/// it does not answer `TalkAbility` and does not advertise the
+	/// `two_way_audio` ability, so without the table the core's ability
+	/// gate refuses talk. With the table set, bairelay skips both the
+	/// `TalkAbility` query and the gate. See [`TalkConfigOverride`].
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub talk_config: Option<TalkConfigOverride>,
+}
+
+/// `[cameras.talk_config]`: the `TalkConfig` values for `talk`. Each
+/// field defaults to the standard Reolink ADPCM value, so an empty table
+/// selects the defaults outright.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TalkConfigOverride {
+	#[serde(default = "default_talk_duplex")]
+	pub duplex: String,
+	#[serde(default = "default_talk_audio_stream_mode")]
+	pub audio_stream_mode: String,
+	#[serde(default = "default_talk_audio_type")]
+	pub audio_type: String,
+	#[serde(default = "default_talk_sample_rate")]
+	pub sample_rate: u16,
+	#[serde(default = "default_talk_sample_precision")]
+	pub sample_precision: u16,
+	#[serde(default = "default_talk_length_per_encoder")]
+	pub length_per_encoder: u16,
+	#[serde(default = "default_talk_sound_track")]
+	pub sound_track: String,
+}
+
+impl Default for TalkConfigOverride {
+	fn default() -> Self {
+		Self {
+			duplex: default_talk_duplex(),
+			audio_stream_mode: default_talk_audio_stream_mode(),
+			audio_type: default_talk_audio_type(),
+			sample_rate: default_talk_sample_rate(),
+			sample_precision: default_talk_sample_precision(),
+			length_per_encoder: default_talk_length_per_encoder(),
+			sound_track: default_talk_sound_track(),
+		}
+	}
+}
+
+fn default_talk_duplex() -> String {
+	"FDX".to_string()
+}
+fn default_talk_audio_stream_mode() -> String {
+	"followVideoStream".to_string()
+}
+fn default_talk_audio_type() -> String {
+	"adpcm".to_string()
+}
+fn default_talk_sample_rate() -> u16 {
+	16000
+}
+fn default_talk_sample_precision() -> u16 {
+	16
+}
+fn default_talk_length_per_encoder() -> u16 {
+	1024
+}
+fn default_talk_sound_track() -> String {
+	"mono".to_string()
 }
 
 impl Default for CameraConfig {
@@ -595,6 +675,7 @@ impl Default for CameraConfig {
 			cloud_password: None,
 			cloud_mfa_trust_token: None,
 			cloud_refresh_token: None,
+			talk_dir: None,
 			channel_id: 0,
 			stream: StreamConfig::default(),
 			discovery: DiscoveryMethod::default(),
@@ -616,6 +697,7 @@ impl Default for CameraConfig {
 			max_discovery_retries: None,
 			push_notifications: None,
 			strict: None,
+			talk_config: None,
 		}
 	}
 }
@@ -821,6 +903,7 @@ const TOP_LEVEL_SCALAR_KEYS: &[&str] = &[
 	"tls_client_ca",
 	"tokio_console",
 	"stream_prune_grace_secs",
+	"talk_dir",
 ];
 
 /// Walk a parsed TOML document and flag any scalar key that lives inside
@@ -913,6 +996,7 @@ pub fn parse_config(toml_str: &str) -> Result<Config, String> {
 	for cam in &mut config.cameras {
 		cam.cloud_account = config.cloud_account.clone();
 		cam.cloud_password = config.cloud_password.clone();
+		cam.talk_dir = config.talk_dir.clone();
 	}
 	Ok(config)
 }
@@ -1550,6 +1634,44 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		}
 	}
 
+	for camera in &config.cameras {
+		if let Some(t) = &camera.talk_config {
+			validate_talk_config(t)
+				.map_err(|e| format!("camera '{}' [cameras.talk_config]: {e}", camera.name))?;
+		}
+	}
+
+	Ok(())
+}
+
+/// Smallest `length_per_encoder` accepted in `[cameras.talk_config]`.
+pub const MIN_TALK_LENGTH_PER_ENCODER: u16 = 120;
+
+/// Check a `[cameras.talk_config]` table against what the ADPCM talk
+/// path can encode: `adpcm`, a non-zero rate, and a block payload
+/// (`length_per_encoder / 2`) of at least 60 bytes and a multiple of 4.
+pub fn validate_talk_config(t: &TalkConfigOverride) -> Result<(), String> {
+	if t.audio_type != "adpcm" {
+		return Err(format!(
+			"audio_type must be \"adpcm\", got {:?}",
+			t.audio_type
+		));
+	}
+	if t.sample_rate == 0 {
+		return Err("sample_rate must be greater than 0".to_string());
+	}
+	if t.length_per_encoder < MIN_TALK_LENGTH_PER_ENCODER {
+		return Err(format!(
+			"length_per_encoder must be at least {MIN_TALK_LENGTH_PER_ENCODER}, got {}",
+			t.length_per_encoder
+		));
+	}
+	if !(t.length_per_encoder / 2).is_multiple_of(4) {
+		return Err(format!(
+			"length_per_encoder / 2 must be a multiple of 4, got {}",
+			t.length_per_encoder
+		));
+	}
 	Ok(())
 }
 
@@ -1917,5 +2039,102 @@ mod tests {
 			password = "x"
 		"#;
 		assert!(toml::from_str::<Config>(toml).is_err());
+	}
+
+	#[test]
+	fn talk_config_table_parses_with_defaults_and_rejects_unknown_keys() {
+		let toml = r#"
+			bind = "0.0.0.0"
+
+			[[cameras]]
+			name = "door"
+			address = "192.0.2.10"
+			username = "admin"
+			password = "x"
+
+			[cameras.talk_config]
+			sample_rate = 8000
+			length_per_encoder = 512
+		"#;
+		let cfg = parse_config(toml).expect("parse");
+		let t = cfg.cameras[0].talk_config.as_ref().expect("talk_config");
+		assert_eq!(t.sample_rate, 8000);
+		assert_eq!(t.length_per_encoder, 512);
+		assert_eq!(t.duplex, "FDX");
+		assert_eq!(t.audio_stream_mode, "followVideoStream");
+		assert_eq!(t.audio_type, "adpcm");
+		assert_eq!(t.sample_precision, 16);
+		assert_eq!(t.sound_track, "mono");
+		validate_config(&cfg).expect("valid");
+
+		let absent = parse_config(
+			&toml
+				.replace("[cameras.talk_config]", "")
+				.replace("sample_rate = 8000", "")
+				.replace("length_per_encoder = 512", ""),
+		)
+		.expect("parse");
+		assert!(absent.cameras[0].talk_config.is_none());
+
+		let bad = toml.replace("sample_rate = 8000", "samplerate = 8000");
+		assert!(
+			parse_config(&bad).is_err(),
+			"unknown talk_config key must be rejected"
+		);
+	}
+
+	#[test]
+	fn validate_talk_config_bounds() {
+		let ok = TalkConfigOverride::default();
+		assert!(validate_talk_config(&ok).is_ok());
+		let cases = [
+			TalkConfigOverride {
+				audio_type: "aac".into(),
+				..Default::default()
+			},
+			TalkConfigOverride {
+				sample_rate: 0,
+				..Default::default()
+			},
+			TalkConfigOverride {
+				length_per_encoder: 112,
+				..Default::default()
+			},
+			TalkConfigOverride {
+				length_per_encoder: 122, // 61-byte payload
+				..Default::default()
+			},
+		];
+		for c in cases {
+			assert!(validate_talk_config(&c).is_err(), "{c:?} must be rejected");
+		}
+		assert!(validate_talk_config(&TalkConfigOverride {
+			length_per_encoder: 120,
+			..Default::default()
+		})
+		.is_ok());
+	}
+
+	#[test]
+	fn talk_dir_is_copied_onto_cameras() {
+		let toml = r#"
+			bind = "0.0.0.0"
+			talk_dir = "/srv/talk"
+
+			[[cameras]]
+			name = "door"
+			address = "192.0.2.10"
+			username = "admin"
+			password = "x"
+		"#;
+		let cfg = parse_config(toml).expect("parse");
+		assert_eq!(
+			cfg.talk_dir.as_deref(),
+			Some(std::path::Path::new("/srv/talk"))
+		);
+		assert_eq!(
+			cfg.cameras[0].talk_dir.as_deref(),
+			Some(std::path::Path::new("/srv/talk"))
+		);
 	}
 }

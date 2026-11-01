@@ -46,6 +46,14 @@ pub enum Outcome {
 		build_day: String,
 	},
 	Siren,
+	/// `talk` played a clip. `config_source` is `config`, `camera` or
+	/// `defaults` (the tier that produced the `TalkConfig`).
+	Talk {
+		config_source: String,
+		sample_rate: u16,
+		blocks: usize,
+		duration_ms: u64,
+	},
 	Pir {
 		enable: bool,
 		sensitivity: Option<u8>,
@@ -145,6 +153,18 @@ fn format_human(outcome: &Outcome) -> (String, String) {
 	match outcome {
 		Outcome::Reboot => (String::new(), "ok (reboot sent)\n".into()),
 		Outcome::Siren => (String::new(), "ok (siren triggered)\n".into()),
+		Outcome::Talk {
+			config_source,
+			sample_rate,
+			blocks,
+			duration_ms,
+		} => (
+			String::new(),
+			format!(
+				"ok (talk: played {:.1} s, {blocks} ADPCM blocks at {sample_rate} Hz, TalkConfig from {config_source})\n",
+				*duration_ms as f64 / 1000.0
+			),
+		),
 		Outcome::Snapshot {
 			bytes,
 			path,

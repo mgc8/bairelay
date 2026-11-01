@@ -21,8 +21,8 @@ use tokio::sync::mpsc::Receiver;
 
 use crate::bc::xml::{
 	AbilityInfo, BatteryInfo, FloodlightStatusList, HaCfg, HttpPort, HttpsPort, LedState, LinkType,
-	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, UserList,
-	VersionInfo,
+	OnvifPort, PtzPreset, RfAlarmCfg, RtmpPort, RtspPort, ServerPort, Support, TalkAbility,
+	TalkConfig, UserList, VersionInfo,
 };
 
 use super::camera_driver::CameraDriver;
@@ -79,6 +79,11 @@ pub struct FakeCalls {
 	pub set_onvif: Mutex<Vec<(Option<bool>, Option<u32>)>>,
 	/// Each `set_ha_cfg(cfg)` call appended.
 	pub set_ha_cfg: Mutex<Vec<HaCfg>>,
+	/// Each `talk(adpcm, cfg, bypass)` call appended as
+	/// `(adpcm bytes, cfg, bypass_ability_gate)`.
+	pub talk: Mutex<Vec<(Vec<u8>, TalkConfig, bool)>>,
+	/// Count of `talk_ability` invocations.
+	pub talk_ability: Mutex<u32>,
 }
 
 /// Internal state backing a [`FakeCamera`]. Read-method closures are
@@ -122,6 +127,9 @@ struct FakeState {
 	get_linktype: Option<BoxFn<LinkType>>,
 	get_support: Option<BoxFn<Support>>,
 	get_abilityinfo: Option<BoxFn<AbilityInfo>>,
+	talk_ability: Option<BoxFn<TalkAbility>>,
+	talk_result: Option<BoxFn<()>>,
+	talk_ability_pending: bool,
 	/// One [`MotionData`] per `listen_on_motion` call, in order.
 	motion_stream: Mutex<VecDeque<MotionData>>,
 	floodlight_stream: Mutex<Option<Receiver<FloodlightStatusList>>>,
@@ -396,6 +404,32 @@ impl FakeCameraBuilder {
 		self
 	}
 
+	/// Install the closure invoked on [`CameraDriver::talk_ability`].
+	pub fn with_talk_ability<F>(mut self, f: F) -> Self
+	where
+		F: Fn() -> Result<TalkAbility> + Send + Sync + 'static,
+	{
+		self.state.talk_ability = Some(Box::new(f));
+		self
+	}
+
+	/// Make `talk_ability` await `pending()` forever, like a battery
+	/// doorbell that never answers message 10.
+	pub fn with_talk_ability_pending(mut self) -> Self {
+		self.state.talk_ability_pending = true;
+		self
+	}
+
+	/// Install the result of [`CameraDriver::talk`]. Unset, `talk`
+	/// records the call and returns `Ok(())`.
+	pub fn with_talk_result<F>(mut self, f: F) -> Self
+	where
+		F: Fn() -> Result<()> + Send + Sync + 'static,
+	{
+		self.state.talk_result = Some(Box::new(f));
+		self
+	}
+
 	/// Make `battery_info` await `pending()` forever — used by 30 s
 	/// command-timeout tests under `tokio::time::pause()`. Mutually
 	/// exclusive with `with_battery_info(...)`; the pending flag
@@ -475,6 +509,23 @@ impl FakeCameraBuilder {
 		Arc::new(FakeCamera {
 			inner: Arc::new(self.state),
 		})
+	}
+}
+
+impl FakeCamera {
+	/// `Err(MissingAbility)` when an ability list is set and lacks
+	/// `two_way_audio`; `Ok` when no list is set (ungated fake).
+	fn talk_gate(&self) -> Result<()> {
+		match self.inner.abilities.as_ref() {
+			Some(names) if !names.iter().any(|a| a == "two_way_audio") => {
+				Err(Error::MissingAbility {
+					name: "two_way_audio".to_string(),
+					requested: "write".to_string(),
+					actual: "none".to_string(),
+				})
+			}
+			_ => Ok(()),
+		}
 	}
 }
 
@@ -842,6 +893,48 @@ impl CameraDriver for FakeCamera {
 		match self.inner.get_abilityinfo.as_ref() {
 			Some(f) => f(),
 			None => unset("get_abilityinfo"),
+		}
+	}
+
+	/// Mirrors `BcCamera`'s `two_way_audio` gate when the test set an
+	/// ability list with [`FakeCameraBuilder::with_abilities`]: missing
+	/// → `MissingAbility` unless the caller bypasses the gate.
+	async fn talk_ability(&self, bypass_ability_gate: bool) -> Result<TalkAbility> {
+		*self.inner.calls.talk_ability.lock().unwrap() += 1;
+		if self.inner.talk_ability_pending {
+			std::future::pending::<()>().await;
+			unreachable!()
+		}
+		if let Err(e) = self.talk_gate() {
+			return if bypass_ability_gate {
+				Ok(TalkAbility::default())
+			} else {
+				Err(e)
+			};
+		}
+		match self.inner.talk_ability.as_ref() {
+			Some(f) => f(),
+			None => unset("talk_ability"),
+		}
+	}
+
+	async fn talk(
+		&self,
+		adpcm: &[u8],
+		talk_config: TalkConfig,
+		bypass_ability_gate: bool,
+	) -> Result<()> {
+		if !bypass_ability_gate {
+			self.talk_gate()?;
+		}
+		self.inner.calls.talk.lock().unwrap().push((
+			adpcm.to_vec(),
+			talk_config,
+			bypass_ability_gate,
+		));
+		match self.inner.talk_result.as_ref() {
+			Some(f) => f(),
+			None => Ok(()),
 		}
 	}
 }

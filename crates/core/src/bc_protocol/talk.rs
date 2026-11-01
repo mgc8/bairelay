@@ -14,12 +14,19 @@ impl BcCamera {
 	/// It is also sent when the request for talk config returns status code 422
 	///
 	pub async fn talk_stop(&self) -> Result<()> {
+		self.talk_stop_inner(false).await
+	}
+
+	/// [`talk_stop`](Self::talk_stop) with the ability gate optional, for
+	/// the `talk` / `talk_stream` calls made with `bypass_ability_gate`.
+	async fn talk_stop_inner(&self, bypass_ability_gate: bool) -> Result<()> {
 		// Two-way audio gates on the `two_way_audio` ability — battery
-		// Argus cameras don't have it. The talk path is deferred per
-		// spec §10 today; gating it here is a no-cost MissingAbility
-		// shape for any future bairelay caller plus the live neolink
-		// CLI.
-		self.has_ability_rw("two_way_audio").await?;
+		// Argus cameras don't have it. A caller with an operator-pinned
+		// TalkConfig (`[cameras.talk_config]`) bypasses the gate: some
+		// battery doorbells accept talk without advertising it.
+		if !bypass_ability_gate {
+			self.has_ability_rw("two_way_audio").await?;
+		}
 		let connection = self.get_connection();
 
 		let msg_num = self.new_message_num();
@@ -63,11 +70,21 @@ impl BcCamera {
 	///
 	/// Requests the [`TalkAbility`] xml
 	///
-	pub async fn talk_ability(&self) -> Result<TalkAbility> {
+	/// With `bypass_ability_gate`, a camera that does not advertise
+	/// `two_way_audio` gets an empty [`TalkAbility`] (no network query)
+	/// instead of [`Error::MissingAbility`]. Callers set it only when
+	/// the operator pinned the TalkConfig in the config file.
+	///
+	pub async fn talk_ability(&self, bypass_ability_gate: bool) -> Result<TalkAbility> {
 		// Same gate as the active talk methods — querying TalkAbility
 		// on a non-talk camera should surface MissingAbility, not the
 		// generic protocol error the camera replies with.
-		self.has_ability_ro("two_way_audio").await?;
+		if let Err(e) = self.has_ability_ro("two_way_audio").await {
+			if bypass_ability_gate {
+				return Ok(TalkAbility::default());
+			}
+			return Err(e);
+		}
 		let connection = self.get_connection();
 		let msg_num = self.new_message_num();
 		let mut sub_get = connection.subscribe(MSG_ID_TALKABILITY, msg_num).await?;
@@ -125,9 +142,18 @@ impl BcCamera {
 	///
 	/// * `talk_config` - The talk config that describes the adpcm data
 	///
+	/// * `bypass_ability_gate` - Skip the `two_way_audio` ability check.
+	///   Set only when `talk_config` was pinned by the operator.
 	///
-	pub async fn talk(&self, adpcm: &[u8], talk_config: TalkConfig) -> Result<()> {
-		self.has_ability_rw("two_way_audio").await?;
+	pub async fn talk(
+		&self,
+		adpcm: &[u8],
+		talk_config: TalkConfig,
+		bypass_ability_gate: bool,
+	) -> Result<()> {
+		if !bypass_ability_gate {
+			self.has_ability_rw("two_way_audio").await?;
+		}
 		let connection = self.get_connection();
 
 		let msg_num = self.new_message_num();
@@ -172,7 +198,7 @@ impl BcCamera {
 			response_code: 422, ..
 		} = msg.meta
 		{
-			self.talk_stop().await?;
+			self.talk_stop_inner(bypass_ability_gate).await?;
 			sub.send(build_talk_config_msg(talk_config)).await?;
 			msg = sub.recv().await?;
 		}
@@ -234,16 +260,20 @@ impl BcCamera {
 			//
 			// There is 1 initial sample stored in the block header so we add that in the end
 			//
-			let samples_sent = (adpcm_len - BLOCK_HEADER_SIZE * BLOCK_PER_PAYLOAD)
+			// Count the blocks actually in this payload: the last payload
+			// can hold fewer than BLOCK_PER_PAYLOAD (or a short block), and
+			// a fixed count underflows on it.
+			let blocks_in_payload = adpcm_len.div_ceil(full_block_size as usize);
+			let samples_sent = adpcm_len.saturating_sub(BLOCK_HEADER_SIZE * blocks_in_payload)
 				* SAMPLES_PER_BYTE
-				+ BLOCK_PER_PAYLOAD;
+				+ blocks_in_payload;
 
 			// Time to play the sample in seconds
 			let play_length = samples_sent as f32 / sample_rate as f32;
 			tokio::time::sleep(std::time::Duration::from_secs_f32(play_length)).await;
 		}
 
-		self.talk_stop().await?;
+		self.talk_stop_inner(bypass_ability_gate).await?;
 
 		Ok(())
 	}
@@ -265,9 +295,18 @@ impl BcCamera {
 	///
 	/// * `talk_config` - The talk config that describes the adpcm data
 	///
+	/// * `bypass_ability_gate` - Skip the `two_way_audio` ability check.
+	///   Set only when `talk_config` was pinned by the operator.
 	///
-	pub async fn talk_stream(&self, rx: Receiver<Vec<u8>>, talk_config: TalkConfig) -> Result<()> {
-		self.has_ability_rw("two_way_audio").await?;
+	pub async fn talk_stream(
+		&self,
+		rx: Receiver<Vec<u8>>,
+		talk_config: TalkConfig,
+		bypass_ability_gate: bool,
+	) -> Result<()> {
+		if !bypass_ability_gate {
+			self.has_ability_rw("two_way_audio").await?;
+		}
 		let connection = self.get_connection();
 
 		let msg_num = self.new_message_num();
@@ -312,7 +351,7 @@ impl BcCamera {
 			response_code: 422, ..
 		} = msg.meta
 		{
-			self.talk_stop().await?;
+			self.talk_stop_inner(bypass_ability_gate).await?;
 			sub.send(build_talk_config_msg(talk_config)).await?;
 			msg = sub.recv().await?;
 		}
@@ -424,7 +463,7 @@ impl BcCamera {
 		tokio::time::sleep(remaining_stream_duration + std::time::Duration::from_secs_f32(0.1))
 			.await;
 
-		self.talk_stop().await?;
+		self.talk_stop_inner(bypass_ability_gate).await?;
 
 		Ok(())
 	}
@@ -586,7 +625,7 @@ mod tests {
 			.await;
 		let cam = BcCamera::from_mock_connection(mock).await;
 		cam.test_set_ability("two_way_audio", true).await;
-		let ability = cam.talk_ability().await.expect("ability");
+		let ability = cam.talk_ability(false).await.expect("ability");
 		assert_eq!(ability.version, "1.1");
 		assert_eq!(ability.duplex_list.len(), 1);
 		assert_eq!(ability.audio_config_list.len(), 1);
@@ -601,7 +640,7 @@ mod tests {
 			.await;
 		let cam = BcCamera::from_mock_connection(mock).await;
 		cam.test_set_ability("two_way_audio", true).await;
-		let err = cam.talk_ability().await.expect_err("should fail");
+		let err = cam.talk_ability(false).await.expect_err("should fail");
 		assert!(matches!(err, Error::UnintelligibleReply { .. }));
 	}
 
@@ -619,7 +658,7 @@ mod tests {
 		let cam = BcCamera::from_mock_connection(mock).await;
 		cam.test_set_ability("two_way_audio", true).await;
 		let err = cam
-			.talk(&[0u8; 16], bad_talk_config())
+			.talk(&[0u8; 16], bad_talk_config(), false)
 			.await
 			.expect_err("should fail");
 		assert!(matches!(err, Error::UnknownTalkEncoding));
@@ -636,7 +675,7 @@ mod tests {
 		cam.test_set_ability("two_way_audio", true).await;
 		let (_tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 		let err = cam
-			.talk_stream(rx, bad_talk_config())
+			.talk_stream(rx, bad_talk_config(), false)
 			.await
 			.expect_err("should fail");
 		assert!(matches!(err, Error::UnknownTalkEncoding));
@@ -656,7 +695,7 @@ mod tests {
 		cam.test_set_ability("two_way_audio", true).await;
 		let r = tokio::time::timeout(
 			Duration::from_millis(300),
-			cam.talk(&[0u8; 16], ok_talk_config()),
+			cam.talk(&[0u8; 16], ok_talk_config(), false),
 		)
 		.await;
 		let err = r.expect("timely").expect_err("should fail");
@@ -685,7 +724,7 @@ mod tests {
 		let cam = BcCamera::from_mock_connection(mock).await;
 		cam.test_set_ability("two_way_audio", true).await;
 		let adpcm = vec![0u8; 32]; // 4 blocks of 8 bytes = 1 payload
-		tokio::time::timeout(Duration::from_secs(2), cam.talk(&adpcm, cfg))
+		tokio::time::timeout(Duration::from_secs(2), cam.talk(&adpcm, cfg, false))
 			.await
 			.expect("no hang")
 			.expect("talk ok");
@@ -715,7 +754,7 @@ mod tests {
 		let cam = BcCamera::from_mock_connection(mock).await;
 		cam.test_set_ability("two_way_audio", true).await;
 		let adpcm = vec![0u8; 32];
-		tokio::time::timeout(Duration::from_secs(2), cam.talk(&adpcm, cfg))
+		tokio::time::timeout(Duration::from_secs(2), cam.talk(&adpcm, cfg, false))
 			.await
 			.expect("no hang")
 			.expect("retry ok");
@@ -747,7 +786,7 @@ mod tests {
 			.unwrap();
 		drop(tx);
 
-		let r = tokio::time::timeout(Duration::from_secs(2), cam.talk_stream(rx, cfg)).await;
+		let r = tokio::time::timeout(Duration::from_secs(2), cam.talk_stream(rx, cfg, false)).await;
 		r.expect("no hang").expect("talk_stream ok");
 	}
 
@@ -777,7 +816,7 @@ mod tests {
 		tx.send(vec![1u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
 		drop(tx);
 
-		let r = tokio::time::timeout(Duration::from_secs(2), cam.talk_stream(rx, cfg)).await;
+		let r = tokio::time::timeout(Duration::from_secs(2), cam.talk_stream(rx, cfg, false)).await;
 		r.expect("no hang").expect("retry ok");
 	}
 
@@ -796,7 +835,8 @@ mod tests {
 		cam.test_set_ability("two_way_audio", true).await;
 		let (_tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
-		let r = tokio::time::timeout(Duration::from_millis(500), cam.talk_stream(rx, cfg)).await;
+		let r =
+			tokio::time::timeout(Duration::from_millis(500), cam.talk_stream(rx, cfg, false)).await;
 		let err = r.expect("timely").expect_err("should fail");
 		assert!(matches!(err, Error::UnintelligibleReply { .. }));
 	}
@@ -882,7 +922,7 @@ mod tests {
 			Error::MissingAbility { .. }
 		));
 		assert!(matches!(
-			cam.talk_ability().await.unwrap_err(),
+			cam.talk_ability(false).await.unwrap_err(),
 			Error::MissingAbility { .. }
 		));
 		// `talk` and `talk_stream` need TalkConfig args; a default-shaped
@@ -890,13 +930,69 @@ mod tests {
 		// first.
 		let cfg = TalkConfig::default();
 		assert!(matches!(
-			cam.talk(&[], cfg.clone()).await.unwrap_err(),
+			cam.talk(&[], cfg.clone(), false).await.unwrap_err(),
 			Error::MissingAbility { .. }
 		));
 		let (_tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 		assert!(matches!(
-			cam.talk_stream(rx, cfg).await.unwrap_err(),
+			cam.talk_stream(rx, cfg, false).await.unwrap_err(),
 			Error::MissingAbility { .. }
 		));
+	}
+
+	/// With `bypass_ability_gate` (operator-pinned TalkConfig), a camera
+	/// that does not advertise `two_way_audio` still talks: `talk_ability`
+	/// returns an empty ability without a query, and `talk` runs the full
+	/// TALKCONFIG → TALK → TALKRESET exchange, its internal talk-stop
+	/// included.
+	#[tokio::test]
+	async fn bypass_ability_gate_talks_without_two_way_audio_ability() {
+		let mut cfg = ok_talk_config();
+		cfg.audio_config.length_per_encoder = 8;
+		let mock = MockConnection::new()
+			.expect_msg(MSG_ID_TALKCONFIG)
+			.reply_with(reply_200_empty)
+			.expect_msg(MSG_ID_TALK)
+			.reply_none()
+			.expect_msg(MSG_ID_TALKRESET)
+			.reply_with(reply_200_empty)
+			.build()
+			.await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		// No test_set_ability: the gate would fire without the bypass.
+		assert_eq!(
+			cam.talk_ability(true).await.expect("bypass ability"),
+			TalkAbility::default()
+		);
+		tokio::time::timeout(Duration::from_secs(2), cam.talk(&[0u8; 32], cfg, true))
+			.await
+			.expect("no hang")
+			.expect("talk ok with bypass");
+	}
+
+	/// A last payload with fewer than four blocks (here 40 bytes of
+	/// 8-byte blocks: one full payload of 32, then one block of 8) used
+	/// to underflow `adpcm_len - 16` and panic.
+	#[tokio::test]
+	async fn talk_short_last_payload_does_not_underflow() {
+		let mut cfg = ok_talk_config();
+		cfg.audio_config.length_per_encoder = 8; // 8-byte blocks
+		let mock = MockConnection::new()
+			.expect_msg(MSG_ID_TALKCONFIG)
+			.reply_with(reply_200_empty)
+			.expect_msg(MSG_ID_TALK)
+			.reply_none()
+			.expect_msg(MSG_ID_TALK)
+			.reply_none()
+			.expect_msg(MSG_ID_TALKRESET)
+			.reply_with(reply_200_empty)
+			.build()
+			.await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_set_ability("two_way_audio", true).await;
+		tokio::time::timeout(Duration::from_secs(2), cam.talk(&[0u8; 40], cfg, false))
+			.await
+			.expect("no hang")
+			.expect("talk ok");
 	}
 }

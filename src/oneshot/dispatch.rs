@@ -171,6 +171,14 @@ pub async fn dispatch_oneshot(
 				"internal: service-mode command routed through oneshot dispatch"
 			))
 		}
+		Command::Talk { .. } => {
+			// `run_support::run_oneshot` routes `talk` itself: it needs
+			// the camera config (`[cameras.talk_config]`) and loads the
+			// WAV before connecting. Reaching here is a programmer bug.
+			Err(anyhow::anyhow!(
+				"internal: talk routed through generic camera dispatch"
+			))
+		}
 		Command::CheckConfig => {
 			// Same shape as above: `run_support::run_oneshot`
 			// short-circuits `check-config` before reaching

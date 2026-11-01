@@ -95,6 +95,12 @@ pub enum ControlCommand {
 		camera: String,
 		minutes: u32,
 	},
+	/// Play the WAV file at `path` (absolute, on the bairelay host)
+	/// through the camera speaker.
+	Talk {
+		camera: String,
+		path: String,
+	},
 	// Query commands (triggered by publishing to query topics)
 	QueryBattery {
 		camera: String,
@@ -132,6 +138,7 @@ impl ControlCommand {
 			ControlCommand::Zoom { .. } => format!("{prefix}/{cam}/control/zoom"),
 			ControlCommand::Siren { .. } => format!("{prefix}/{cam}/control/siren"),
 			ControlCommand::Wakeup { .. } => format!("{prefix}/{cam}/control/wakeup"),
+			ControlCommand::Talk { .. } => format!("{prefix}/{cam}/control/talk"),
 			ControlCommand::QueryBattery { .. } => format!("{prefix}/{cam}/query/battery"),
 			ControlCommand::QueryPreview { .. } => format!("{prefix}/{cam}/query/preview"),
 			ControlCommand::QueryPir { .. } => format!("{prefix}/{cam}/query/pir"),
@@ -155,6 +162,7 @@ impl ControlCommand {
 			ControlCommand::Zoom { camera, .. } => camera,
 			ControlCommand::Siren { camera, .. } => camera,
 			ControlCommand::Wakeup { camera, .. } => camera,
+			ControlCommand::Talk { camera, .. } => camera,
 			ControlCommand::QueryBattery { camera } => camera,
 			ControlCommand::QueryPreview { camera } => camera,
 			ControlCommand::QueryPir { camera } => camera,
@@ -353,6 +361,18 @@ fn parse_control_action(camera: &str, action: &str, payload: &str) -> Option<Con
 			Some(ControlCommand::Siren {
 				camera: camera.to_string(),
 				state,
+			})
+		}
+		"talk" => {
+			// An absolute host path to a WAV file. Relative paths would
+			// resolve against the service's working directory.
+			let path = payload.trim();
+			if !path.starts_with('/') || path.contains('\0') {
+				return None;
+			}
+			Some(ControlCommand::Talk {
+				camera: camera.to_string(),
+				path: path.to_string(),
 			})
 		}
 		"wakeup" => {

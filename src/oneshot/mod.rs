@@ -17,6 +17,7 @@ pub mod set_time;
 pub mod siren;
 pub mod snapshot;
 pub mod status_light;
+pub mod talk;
 pub mod users;
 pub mod version;
 pub mod webhook;

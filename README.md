@@ -185,7 +185,22 @@ Bairelay's config is **a deliberate near-superset of Neolink's** so existing con
    features = ["floodlight", "camera", "motion", "led", "ir", "reboot", "pt", "battery", "siren", "ai", "doorbell"]
    ```
 
-7. **Talk (two-way audio) is not implemented.** If you used `neolink talk`, bairelay has no equivalent yet — see the future-development notes.
+7. **Talk (two-way audio) plays WAV files only.** `bairelay talk <camera> --file <wav> [--volume <gain>]` replaces `neolink talk --file-path`. The input must be a 16-bit PCM WAV (multi-channel input is downmixed, other rates are resampled linearly); there is no GStreamer, so there is no microphone source and no other container or codec. Over MQTT, publish an absolute host path to `<prefix>/<cam>/control/talk`; progress appears on `<prefix>/<cam>/status/talk` as `playing`, then `done` or `error: <code>`, where the code is one of `not_found`, `not_a_file`, `outside_talk_dir`, `decode`, `timeout`, `busy` or `camera` (no path or OS text is published).
+
+   **Trust:** the payload is a path on the bairelay host, so anyone who can publish to the broker can make bairelay open any regular file its user can read (only valid WAV data is played, and only a short code is reported back). Set the top-level `talk_dir = "/srv/bairelay/talk"` to confine MQTT talk to that directory (paths are canonicalised, so `..` and symlinks cannot escape it). Without `talk_dir`, only expose the broker to clients you trust. `talk_dir` does not restrict the `talk` CLI.
+
+   The `TalkConfig` comes from an optional `[cameras.talk_config]` table, else the camera's `TalkAbility` reply (5 s timeout), else the Reolink ADPCM defaults. **A battery doorbell needs a `[cameras.talk_config]` table, even an empty one:** it neither answers `TalkAbility` nor advertises the `two_way_audio` ability, and without the table that ability check refuses talk. With the table, bairelay skips the query and the check. `check-config` validates the table (`audio_type = "adpcm"`, `sample_rate > 0`, `length_per_encoder >= 120` with `length_per_encoder / 2` a multiple of 4):
+
+   ```toml
+   [cameras.talk_config]   # every field optional; these are the defaults
+   duplex = "FDX"
+   audio_stream_mode = "followVideoStream"
+   audio_type = "adpcm"
+   sample_rate = 16000
+   sample_precision = 16
+   length_per_encoder = 1024
+   sound_track = "mono"
+   ```
 
 ### From-scratch config
 
@@ -532,7 +547,7 @@ The workspace ships thousands of tests across the four crates plus the binary. T
 
 A short, unordered, non-committed list of features bairelay does not have today but might grow into:
 
-- Two-way audio (talk client) — sending audio to the camera speaker via ADPCM.
+- Live two-way audio from a microphone (the `talk` command plays WAV files only).
 - Multicast RTSP — extra transport for fan-out to many concurrent LAN viewers.
 - Periodic background refresh of the PTZ preset cache (currently query-driven).
 - On-board email notifications via the camera's built-in SMTP client.

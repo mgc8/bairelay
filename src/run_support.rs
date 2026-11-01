@@ -374,6 +374,34 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 		let cancel = CancellationToken::new();
 		spawn_shutdown_cancel(cancel.clone());
 
+		// `talk` needs the camera config (`[cameras.talk_config]`) and a
+		// clip-length op deadline. The WAV is loaded before connecting so
+		// a bad file never wakes the camera.
+		if let Command::Talk { file, volume, .. } = &cli.command {
+			use crate::oneshot::errors::UsageError;
+			crate::talk::check_volume(*volume)
+				.map_err(|e| UsageError::new(format!("talk: {e:#}")))?;
+			// The CLI is operator-run: `talk_dir` restricts MQTT only.
+			let clip = crate::talk::load_clip(file, None)
+				.await
+				.map_err(|e| UsageError::new(format!("talk: {}: {e}", file.display())))?;
+			let op_timeout = crate::talk::clip_duration(&clip) + crate::talk::TALK_OP_MARGIN;
+			let volume = *volume;
+			let talk_cfg = cam_cfg.clone();
+			return runner::run_with_op_timeout(&cam_cfg, cancel, op_timeout, move |cam| {
+				async move {
+					crate::oneshot::talk::run(
+						cam as &dyn bairelay_neolink_core::bc_protocol::CameraDriver,
+						&talk_cfg,
+						&clip,
+						volume,
+					)
+					.await
+				}
+				.boxed()
+			})
+			.await;
+		}
 		// `--use-stream-raw` needs the concrete `BcCamera`. Everything
 		// else routes through the `CameraDriver` trait seam so the
 		// dispatch match arms stay testable via FakeCamera.
@@ -862,6 +890,33 @@ password = "x"
 		assert!(err.is_empty(), "Human OK path must not write to stderr");
 		let s = String::from_utf8(out).expect("utf8");
 		assert!(s.starts_with("config OK: 1 camera(s)"));
+	}
+
+	#[test]
+	fn check_config_rejects_non_adpcm_talk_config() {
+		let f = tempfile::NamedTempFile::new().unwrap();
+		let toml = r#"
+bind = "127.0.0.1"
+bind_port = 8554
+[[cameras]]
+name = "door"
+address = "10.0.0.10:9000"
+username = "admin"
+password = "x"
+[cameras.talk_config]
+audio_type = "aac"
+"#;
+		std::fs::write(f.path(), toml).unwrap();
+		let cli = cli_from(&[
+			"bairelay",
+			"check-config",
+			"-c",
+			&f.path().display().to_string(),
+		]);
+		let (code, _out, err) = check_config_capture(&cli);
+		assert_eq!(code, classify::EXIT_CONFIG);
+		let s = String::from_utf8(err).expect("utf8");
+		assert!(s.contains("audio_type"), "stderr: {s}");
 	}
 
 	#[test]
