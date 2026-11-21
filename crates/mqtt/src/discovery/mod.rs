@@ -11,6 +11,9 @@
 //!   migration).
 //! - The typo `DiscoveryAvaliablity` is fixed to
 //!   `DiscoveryAvailability`.
+//! - Entity `name`s carry only the feature (`MD`, `Person`). HA
+//!   prefixes the device name, so neolink's `{Camera} {Feature}`
+//!   showed the camera twice and doubled it in new entity IDs.
 //! - Floodlight state topic keeps neolink's JSON-template shape —
 //!   `StatusPublisher::publish_floodlight` emits
 //!   `{"state":"on"}` and HA's `state_value_template` templates it
@@ -456,7 +459,7 @@ pub fn build_floodlight_light(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "floodlight");
 	let payload = DiscoveryLight {
-		name: format!("{friendly} Floodlight"),
+		name: "Floodlight".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:spotlight-beam".to_string()),
 		device: device_block(ctx, &friendly),
@@ -475,7 +478,7 @@ pub fn build_floodlight_tasks_switch(ctx: &DiscoveryContext) -> Option<(String, 
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "floodlight_tasks");
 	let payload = DiscoverySwitch {
-		name: format!("{friendly} Floodlight Tasks"),
+		name: "Floodlight Tasks".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:spotlight-beam".to_string()),
 		device: device_block(ctx, &friendly),
@@ -495,7 +498,7 @@ pub fn build_camera(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "camera");
 	let payload = DiscoveryCamera {
-		name: format!("{friendly} Camera"),
+		name: "Camera".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:camera-iris".to_string()),
 		device: device_block(ctx, &friendly),
@@ -513,7 +516,7 @@ pub fn build_motion(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "md");
 	let payload = DiscoveryBinarySensor {
-		name: format!("{friendly} MD"),
+		name: "MD".to_string(),
 		unique_id: unique_id.clone(),
 		device_class: None,
 		icon: Some("mdi:motion-sensor".to_string()),
@@ -599,7 +602,7 @@ pub fn build_ai_binary_sensors(ctx: &DiscoveryContext) -> Vec<(String, Vec<u8>)>
 		.map(|object| {
 			let (unique_id, topic) = ai_ids(ctx, object);
 			let payload = DiscoveryBinarySensor {
-				name: format!("{friendly} {}", object.display_name()),
+				name: object.display_name().to_string(),
 				unique_id,
 				device_class: Some(object.device_class().to_string()),
 				icon: Some(object.icon().to_string()),
@@ -623,7 +626,7 @@ pub fn build_doorbell(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let (unique_id, topic) = doorbell_ids(ctx);
 	let payload = DiscoveryEvent {
-		name: format!("{friendly} Doorbell"),
+		name: "Doorbell".to_string(),
 		unique_id,
 		device_class: "doorbell".to_string(),
 		icon: "mdi:doorbell".to_string(),
@@ -647,7 +650,7 @@ pub fn build_led(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let (unique_id, topic) = led_ids(ctx);
 	let payload = DiscoverySwitch {
-		name: format!("{friendly} LED"),
+		name: "LED".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:led-on".to_string()),
 		device: device_block(ctx, &friendly),
@@ -677,7 +680,7 @@ pub fn build_ir(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let (unique_id, topic) = ir_ids(ctx);
 	let payload = DiscoverySelect {
-		name: format!("{friendly} IR"),
+		name: "IR".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:lightbulb-night".to_string()),
 		device: device_block(ctx, &friendly),
@@ -702,7 +705,7 @@ pub fn build_pir(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "pir");
 	let payload = DiscoverySwitch {
-		name: format!("{friendly} PIR"),
+		name: "PIR".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:motion-sensor".to_string()),
 		device: device_block(ctx, &friendly),
@@ -739,7 +742,7 @@ pub fn build_ptz_presets(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let mut seen = std::collections::HashSet::new();
 	options.retain(|n| seen.insert(n.clone()));
 	let payload = DiscoverySelect {
-		name: format!("{friendly} Preset"),
+		name: "Preset".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:target".to_string()),
 		device: device_block(ctx, &friendly),
@@ -766,7 +769,7 @@ pub fn build_reboot(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "reboot");
 	let payload = DiscoveryButton {
-		name: format!("{friendly} Reboot"),
+		name: "Reboot".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:restart".to_string()),
 		device: device_block(ctx, &friendly),
@@ -789,7 +792,7 @@ pub fn build_pt_buttons(ctx: &DiscoveryContext) -> Vec<(String, Vec<u8>)> {
 	for dir in ["left", "right", "up", "down"] {
 		let unique_id = unique(ctx.topic_prefix, ctx.camera_name, &format!("pan_{dir}"));
 		let payload = DiscoveryButton {
-			name: format!("{friendly} Pan {dir}"),
+			name: format!("Pan {dir}"),
 			unique_id: unique_id.clone(),
 			icon: Some(format!("mdi:pan-{dir}")),
 			device: device_block(ctx, &friendly),
@@ -809,7 +812,7 @@ pub fn build_battery(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "battery");
 	let payload = DiscoverySensor {
-		name: format!("{friendly} Battery"),
+		name: "Battery".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:battery".to_string()),
 		device: device_block(ctx, &friendly),
@@ -827,7 +830,7 @@ pub fn build_siren(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
 	let friendly = title_case(ctx.camera_name);
 	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "siren");
 	let payload = DiscoveryButton {
-		name: format!("{friendly} Siren"),
+		name: "Siren".to_string(),
 		unique_id: unique_id.clone(),
 		icon: Some("mdi:bell".to_string()),
 		device: device_block(ctx, &friendly),
@@ -1218,7 +1221,7 @@ mod tests {
 			"homeassistant/binary_sensor/bairelay_frontdoor_ai_person/config"
 		);
 		let v = parse(payload);
-		assert_eq!(v["name"], "Frontdoor Person");
+		assert_eq!(v["name"], "Person");
 		assert_eq!(v["unique_id"], "bairelay_frontdoor_ai_person");
 		assert_eq!(v["device_class"], "motion");
 		assert_eq!(v["icon"], "mdi:account");
@@ -1247,15 +1250,11 @@ mod tests {
 			})
 			.collect();
 		let expect = [
-			("Frontdoor Person", "motion", "mdi:account"),
-			("Frontdoor Vehicle", "motion", "mdi:car"),
-			("Frontdoor Animal", "motion", "mdi:paw"),
-			("Frontdoor Face", "motion", "mdi:face-recognition"),
-			(
-				"Frontdoor Package",
-				"presence",
-				"mdi:package-variant-closed",
-			),
+			("Person", "motion", "mdi:account"),
+			("Vehicle", "motion", "mdi:car"),
+			("Animal", "motion", "mdi:paw"),
+			("Face", "motion", "mdi:face-recognition"),
+			("Package", "presence", "mdi:package-variant-closed"),
 		];
 		assert_eq!(got.len(), 5);
 		for (g, e) in got.iter().zip(expect) {
@@ -1291,7 +1290,7 @@ mod tests {
 			"homeassistant/event/bairelay_frontdoor_doorbell/config"
 		);
 		let v = parse(&payload);
-		assert_eq!(v["name"], "Frontdoor Doorbell");
+		assert_eq!(v["name"], "Doorbell");
 		assert_eq!(v["unique_id"], "bairelay_frontdoor_doorbell");
 		assert_eq!(v["device_class"], "doorbell");
 		assert_eq!(v["event_types"], serde_json::json!(["press"]));

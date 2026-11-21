@@ -238,9 +238,9 @@ Camera names (`name = "..."` in `[[cameras]]`) are restricted to `[A-Za-z0-9_-]+
   | `IPCam-front` | `IPCam Front`      |
   | `frontdoor`   | `Frontdoor`        |
 
-  Per-feature entities append the feature label with a space: `Front Door Floodlight`, `Front Door Floodlight Tasks`, `Front Door Battery`, `Front Door PIR`, etc.
+  The label names the HA device. Each entity's `name` is only its feature label (`Floodlight`, `Battery`, `PIR`, ...); HA prefixes the device name, so dashboards show `Front Door Floodlight`, `Front Door Battery`, and new entity IDs come out as `light.front_door_floodlight`.
 
-If you've already renamed an entity in the HA UI, your override wins — bairelay's `name` field is only used the first time HA sees the discovery payload.
+HA fixes an entity's ID the first time it sees the entity, so existing installs keep theirs; a name you set in the HA UI wins over bairelay's.
 
 ### TLS (RTSPS)
 
