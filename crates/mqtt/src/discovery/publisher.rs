@@ -530,6 +530,15 @@ mod tests {
 			assert!(uid.starts_with("bairelay_"), "uid bad prefix: {uid}");
 		}
 
+		// HA prefixes the device name, so repeating it in an entity
+		// name shows the camera twice.
+		for (_, payload) in &out {
+			let v: serde_json::Value = serde_json::from_slice(payload).unwrap();
+			let device = v["device"]["name"].as_str().expect("device name");
+			let name = v["name"].as_str().expect("name string");
+			assert!(!name.contains(device), "name repeats device: {name}");
+		}
+
 		// No duplicate topics.
 		let mut topics: Vec<String> = out.iter().map(|(t, _)| t.clone()).collect();
 		topics.sort();
