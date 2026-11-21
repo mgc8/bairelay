@@ -20,10 +20,11 @@
 ///
 /// If `pcm_16k` has an odd length, the trailing sample is dropped.
 pub fn decimate_16_to_8(pcm_16k: &[i16]) -> Vec<i16> {
-	pcm_16k
-		.chunks_exact(2)
-		.map(|c| {
-			let avg = (c[0] as i32 + c[1] as i32 + 1) >> 1;
+	let (pairs, _odd) = pcm_16k.as_chunks::<2>();
+	pairs
+		.iter()
+		.map(|&[a, b]| {
+			let avg = (a as i32 + b as i32 + 1) >> 1;
 			avg as i16
 		})
 		.collect()
