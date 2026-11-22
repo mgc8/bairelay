@@ -881,7 +881,8 @@ async fn fake_provider_replays_real_fixtures_if_present() {
 									matches!(
 										H265NalType::from_header_byte(n[0]),
 										H265NalType::IDR_W_RADL
-											| H265NalType::IDR_N_LP | H265NalType::CRA
+											| H265NalType::IDR_N_LP
+											| H265NalType::CRA
 											| H265NalType::BLA_W_LP
 									)
 								});

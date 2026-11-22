@@ -313,7 +313,7 @@ pub trait EventSource {
 }
 
 impl EventSource for MqttEventLoop {
-	type Error = ConnectionError;
+	type Error = Box<ConnectionError>;
 	fn poll(&mut self) -> impl std::future::Future<Output = Result<Event, Self::Error>> + Send {
 		MqttEventLoop::poll(self)
 	}

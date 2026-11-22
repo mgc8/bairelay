@@ -222,9 +222,13 @@ pub struct MqttEventLoop {
 }
 
 impl MqttEventLoop {
-	/// Poll the event loop for the next MQTT event.
-	pub async fn poll(&mut self) -> Result<rumqttc::Event, rumqttc::ConnectionError> {
-		self.event_loop.poll().await
+	/// Poll the event loop for the next MQTT event. The error is boxed,
+	/// as in [`MqttError::ConnectionFailure`]: at 144 bytes,
+	/// `ConnectionError` trips clippy's `result_large_err`.
+	///
+	/// [`MqttError::ConnectionFailure`]: crate::MqttError::ConnectionFailure
+	pub async fn poll(&mut self) -> Result<rumqttc::Event, Box<rumqttc::ConnectionError>> {
+		self.event_loop.poll().await.map_err(Box::new)
 	}
 }
 
