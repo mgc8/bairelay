@@ -138,7 +138,7 @@ fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
 		verify(le_u32, |&x| x == 0 || x == 0xffffffff),
 	)(buf)?;
 	let (buf, packet_id) = error_context("Missing packet_id", le_u32)(buf)?; // This is the point at which the camera has contigious
-																		  // packets to
+																			 // packets to
 	let (buf, maybe_latency) = error_context("ACK: Missing Maybe Latency", le_u32)(buf)?;
 	let (buf, payload_size) = error_context(
 		"ACK: Missing payload_size or exceeds cap",
@@ -146,10 +146,10 @@ fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
 	)(buf)?;
 	let (buf, payload) = if payload_size > 0 {
 		let (buf, t_payload) = take(payload_size)(buf)?; // It is a binary payload of
-												   // `00 01 01 01 01 00 01`
-												   // This is a truth map of missing packets
-												   // since last contigious packet_id up
-												   // to the last packet we sent and it received
+														 // `00 01 01 01 01 00 01`
+														 // This is a truth map of missing packets
+														 // since last contigious packet_id up
+														 // to the last packet we sent and it received
 		(buf, t_payload.to_vec())
 	} else {
 		(buf, vec![])

@@ -501,14 +501,14 @@ mod tests {
 		// Reserved VCL 10..=15.
 		assert!(!is_decodable_nal(&[0x14, 0x01], VideoCodec::H265)); // type 10
 		assert!(!is_decodable_nal(&[0x1E, 0x01], VideoCodec::H265)); // type 15
-															   // Reserved VCL 22..=31.
+																	 // Reserved VCL 22..=31.
 		assert!(!is_decodable_nal(&[0x2C, 0x01], VideoCodec::H265)); // type 22
 		assert!(!is_decodable_nal(&[0x3E, 0x01], VideoCodec::H265)); // type 31
-															   // Reserved non-VCL 41..=47.
+																	 // Reserved non-VCL 41..=47.
 		assert!(!is_decodable_nal(&[0x52, 0x01], VideoCodec::H265)); // type 41
 		assert!(!is_decodable_nal(&[0x5E, 0x01], VideoCodec::H265)); // type 47
-															   // Unspecified 48..=63 (48=AP, 49=FU in RTP, but in Annex-B
-															   // they're proprietary application data — drop them all).
+																	 // Unspecified 48..=63 (48=AP, 49=FU in RTP, but in Annex-B
+																	 // they're proprietary application data — drop them all).
 		assert!(!is_decodable_nal(&[0x60, 0x01], VideoCodec::H265)); // type 48
 		assert!(!is_decodable_nal(&[0x7E, 0x01], VideoCodec::H265)); // type 63
 	}

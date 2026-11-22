@@ -574,7 +574,8 @@ impl Discoverer {
 					} if (dev.as_ref().map(valid_addr).unwrap_or(false)
 						|| dmap.as_ref().map(valid_addr).unwrap_or(false)
 						|| relay.as_ref().map(valid_addr).unwrap_or(false))
-						&& rsp != -1 && rsp != -3 =>
+						&& rsp != -1
+						&& rsp != -3 =>
 					{
 						Some(Ok((sid, dev, dmap, relay)))
 					}
@@ -671,7 +672,8 @@ impl Discoverer {
 						&& register_dmap
 							.as_ref()
 							.map(|dmap| &addr == dmap)
-							.unwrap_or(false) && &conn == "local" =>
+							.unwrap_or(false)
+						&& &conn == "local" =>
 					{
 						Some((addr, tid, did))
 					}
@@ -784,7 +786,8 @@ impl Discoverer {
 						&& register_dmap
 							.as_ref()
 							.map(|dmap| &addr == dmap)
-							.unwrap_or(false) && &conn == "map" =>
+							.unwrap_or(false)
+						&& &conn == "map" =>
 					{
 						Some((addr, tid, did))
 					}
