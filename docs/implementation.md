@@ -6,6 +6,43 @@ Static structure and dependency tables live in `docs/architecture.md`.
 
 ---
 
+## Documentation links this branch does not repair
+
+`cargo doc --workspace --no-deps --document-private-items` prints, on this branch, eight
+lines that read `warning: unresolved link to \`X\``. That phrase is what rustc 1.94 emits;
+the older wording `broken intra-doc link` matches nothing on this toolchain, so a check
+that greps for it reports zero on a repository full of dead links.
+
+Twenty-one of the twenty-nine warnings the branch inherited are fixed. The line is the
+branch's own footprint: a link is repaired when it sits in a file this branch already
+modifies, and left where it does not, because a feature branch that edits upstream
+documentation outside its own files widens its merge surface for no review gain.
+
+What is left, per file, and why:
+
+| dead links | file | why it stays |
+|---|---|---|
+| 2 | `crates/core/src/bc_protocol/connection/bcconn.rs` | never modified by this branch (`subscribe`, `handle_msg`) |
+| 1 | `crates/core/src/bc_protocol/connection/udpsource.rs` | never modified by this branch (`build_send_ack`) |
+| 1 | `crates/core/src/bc_protocol/set_helpers.rs` | never modified by this branch (`Error::SubscriberError`) |
+| 1 | `crates/rtsp/src/server/connection.rs` | never modified by this branch (`RtspMethod`) |
+| 1 | `src/oneshot/snapshot.rs` | never modified by this branch (`StreamData`) |
+| 1 | `src/startup_wake.rs` | never modified by this branch (`CameraDriver::get_snapshot`) |
+| 1 | `src/stream_source.rs` | never modified by this branch (`CameraHandle`) |
+
+These belong to a documentation-only change upstream, not to a settings-engine branch. If
+you run `cargo doc` and see eight warnings, this is the list, and none of them is new.
+
+One class rustdoc will never report, so the reading pass owns it: a doc comment whose link
+target does not exist but whose **display text** still reads like prose renders as literal
+text and warns about nothing. Two lines of that class were found by reading on this branch,
+both in documentation of the published surface, and both were removed rather than
+re-pointed because they described things that no code builds — a bridge topic
+`bairelay/<cam>/control/sonde/<serial>` that nothing serves, and a topic segment spelled
+`status/<famille>/reason` while the code builds `status/<family>/reason`. Where the link
+could be repaired it was, and where the item simply does not exist the sentence lost its
+link: a link to a method nobody defines is a more convincing lie than a plain sentence.
+
 ## `bairelay_neolink_core` API surface
 
 `BcCamera` is the production type. `CameraDriver` is the dyn-compatible trait the binary holds — production code mostly takes `Arc<dyn CameraDriver>`. `CameraHandle` keeps a parallel private `bc_camera_concrete: Arc<BcCamera>` for the two operations that aren't on the trait (`logout()` during shutdown; `StreamSource::start` for video pull loops).
@@ -349,6 +386,7 @@ Reconnect on transient network failures still uses `ReconnectBackoff::sleep_with
 - `bind_port = 0` rejected.
 - Update intervals (`battery_update`, `preview_update`, `floodlight_update`): ≥ 500 ms.
 - `idle_disconnect`: defaults `false`. Must be explicitly enabled for battery cameras.
+- `two_way_audio`: defaults `false`. Pure opt-in override of the ability gate — see [`docs/two-way-audio.md`](two-way-audio.md). Not part of the HA add-on's per-camera option set (`src/ha/options.rs`), so it is config-file only.
 - `gap_threshold_secs`: must be finite + positive.
 - `idle_disconnect_timeout_secs`: must be finite + positive.
 

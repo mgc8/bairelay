@@ -65,6 +65,8 @@ mod tests {
 
 	#[test]
 	fn multibyte_input_is_char_safe() {
+		// This module keeps non-ASCII values on purpose: they stand in for what an operator
+		// would type or a camera would answer, so they are data being tested, not prose to translate.
 		assert_eq!(UidTail("ééééééééé").to_string(), "***éééééé");
 	}
 }

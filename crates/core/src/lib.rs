@@ -87,6 +87,18 @@ pub use bc_protocol::Error;
 
 pub(crate) use bc_protocol::{Credentials, Result};
 
+/// Re-export of the channel crate [`BcCamera::talk_stream`] consumes.
+///
+/// The streaming talk sender pulls pre-encoded ADPCM blocks from a
+/// `crossbeam_channel::Receiver<Vec<u8>>` and blocks on it, so any caller
+/// that wants to feed live audio has to build exactly one of those channels.
+/// Re-exporting it here keeps a fourth crate out of downstream `Cargo.toml`s
+/// and pins callers to the version the sender was compiled against, instead of
+/// letting two versions of the crate coexist.
+///
+/// [`BcCamera::talk_stream`]: bc_protocol::BcCamera::talk_stream
+pub use crossbeam_channel;
+
 pub(crate) type NomErrorType<'a> = nom::error::VerboseError<&'a [u8]>;
 
 /// The unit tests' capturing `log` logger.

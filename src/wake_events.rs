@@ -58,7 +58,15 @@ pub(crate) fn push_edge(
 	if !claim_wake(&handle, WakeSource::Push) {
 		return false;
 	}
-	motion_edge(handle, mqtt, topic_prefix, hold, cancel);
+	spawn_motion_hold(
+		handle,
+		mqtt,
+		topic_prefix,
+		hold,
+		cancel,
+		true,
+		crate::burst::Wake::Push,
+	);
 	true
 }
 
@@ -72,7 +80,15 @@ pub(crate) fn motion_edge(
 	hold: Duration,
 	cancel: &CancellationToken,
 ) {
-	spawn_motion_hold(handle, mqtt, topic_prefix, hold, cancel, true);
+	spawn_motion_hold(
+		handle,
+		mqtt,
+		topic_prefix,
+		hold,
+		cancel,
+		true,
+		crate::burst::Wake::Motion,
+	);
 }
 
 /// Hold the camera's wake lock for `hold` so the connect loop reaches
@@ -88,9 +104,26 @@ pub(crate) fn motion_hold(
 	hold: Duration,
 	cancel: &CancellationToken,
 ) {
-	spawn_motion_hold(handle, mqtt, topic_prefix, hold, cancel, false);
+	spawn_motion_hold(
+		handle,
+		mqtt,
+		topic_prefix,
+		hold,
+		cancel,
+		false,
+		crate::burst::Wake::Motion,
+	);
 }
 
+/// The body shared by the three motion-shaped wake paths: hold the lock,
+/// publish_now the motion state if it has to, **then** offer the read burst
+/// ([`crate::burst`]).
+///
+/// The order is a rule, not a detail: the event must be on the bus before the
+/// burst's first command, otherwise the operator's automation discovers the press
+/// or the motion delayed by the whole read. It is also why the burst is a separate
+/// task: it cannot steal the publication that precedes it.
+///
 fn spawn_motion_hold(
 	handle: Arc<CameraHandle>,
 	mqtt: Option<&SharedMqttClient>,
@@ -98,6 +131,7 @@ fn spawn_motion_hold(
 	hold: Duration,
 	cancel: &CancellationToken,
 	publish_on: bool,
+	reason: crate::burst::Wake,
 ) {
 	let seq = handle.push_seq().fetch_add(1, Ordering::SeqCst) + 1;
 	let mqtt = event_mqtt(&handle, mqtt).cloned();
@@ -114,6 +148,9 @@ fn spawn_motion_hold(
 			}
 			handle.status_cache().set_motion(true);
 		}
+		// 	// The event is published: the burst may start, if this wake has not already
+		// 	// paid for one.
+		crate::burst::trigger(Arc::clone(&handle), reason);
 
 		crate::run_support::sleep_or_cancel(hold, &cancel).await;
 

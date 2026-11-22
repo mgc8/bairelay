@@ -224,6 +224,35 @@ pub(crate) fn noop_transport_for_tests() -> std::sync::Arc<dyn Transport> {
 	std::sync::Arc::new(Noop)
 }
 
+/// No-op [`Transport`] that counts `send_rtp` calls. For tests that must
+/// prove a burst replay really reached the wire (and was not merely a call
+/// that returned `Ok`). Returns the transport and the shared counter.
+#[cfg(test)]
+pub(crate) fn counting_transport_for_tests() -> (
+	std::sync::Arc<dyn Transport>,
+	std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	struct Counting(std::sync::Arc<AtomicUsize>);
+
+	#[async_trait::async_trait]
+	impl Transport for Counting {
+		async fn send_rtp(&self, _packet: &[u8]) -> io::Result<()> {
+			self.0.fetch_add(1, Ordering::SeqCst);
+			Ok(())
+		}
+		async fn send_rtcp(&self, _packet: &[u8]) -> io::Result<()> {
+			Ok(())
+		}
+		async fn close(&self) {}
+	}
+
+	let sent = std::sync::Arc::new(AtomicUsize::new(0));
+	let transport = std::sync::Arc::new(Counting(std::sync::Arc::clone(&sent)));
+	(transport, sent)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

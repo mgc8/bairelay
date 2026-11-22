@@ -12,7 +12,13 @@ mod bcconn;
 mod bcsub;
 #[cfg(test)]
 mod chain;
-pub(crate) mod discovery;
+/// UID lookup over UDP. Public for two helpers only — `broadcast_destinations`
+/// and `broadcast_socket`, re-exported from `bc_protocol` — which the binary's
+/// startup scan needs in order to ask the LAN a question it cannot ask through
+/// `Discoverer` (that type is created for one uid and drives a handshake to
+/// completion). Everything else in the module stays `pub(crate)` exactly as it
+/// was; making the module public publishes nothing but those two functions.
+pub mod discovery;
 #[cfg(any(test, feature = "test-util"))]
 pub mod mock;
 mod tcpsource;

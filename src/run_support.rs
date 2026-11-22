@@ -20,7 +20,9 @@ use crate::oneshot::classify;
 use crate::oneshot::dispatch::{dispatch_oneshot, find_camera_config, snapshot_json_preflight};
 use crate::oneshot::errors::ConfigError;
 use crate::oneshot::output::{format_failure, format_success, Mode, Outcome};
-use crate::oneshot::{runner, snapshot};
+use crate::oneshot::{
+	audio_bridge, audio_settings, chime_settings, runner, snapshot, talk, talk_capability,
+};
 
 /// Pick the one-shot output mode from the CLI flag. Extracted so the
 /// `cli.json → Mode` mapping is pinned in one place.
@@ -44,6 +46,13 @@ pub fn load_validated_config(path: &Path) -> Result<Config> {
 	// Attach the host's MFA trust token (if bootstrapped via `cloud-authorise`)
 	// from the sibling state file, so cloud cameras can clear login verification.
 	crate::config::apply_cloud_auth(&mut config, path);
+	// Same sibling-state-file rule for the settings verdicts: the families the
+	// bridge has proven modifiable are restored from
+	// `config-families-read.json` beside this config file, so a battery
+	// doorbell doesn't pay a full fifteen-command salvo to remember what it
+	// already proved yesterday. Missing or corrupt file is the current
+	// behaviour, never a startup failure — see [`crate::family_state`].
+	crate::family_state::set_path(path);
 	validate_config(&config)
 		.map_err(|e| anyhow::anyhow!(e))
 		.context("Configuration validation failed")?;
@@ -265,13 +274,28 @@ pub fn run_check_config_to<W1: std::io::Write, W2: std::io::Write>(
 	crate::config::warn_wire_debug_enabled(&config);
 	crate::config::warn_loopback_webhook_advertise(&config);
 	crate::config::warn_idle_timeout_below_prune_floor(&config);
-	// Success — short summary so operators get a quick affirmation.
-	let summary = format!(
-		"config OK: {} camera(s), bind {}:{}\n",
+	crate::config::warn_uid_beyond_local(&config);
+	crate::config::warn_startup_discovery_without_credentials(&config);
+	// Success — short summary so operators get a quick affirmation. The startup scan is
+	// said out loud because a file it approves is a file whose camera count at startup is
+	// not the number on this line: `0 cameras` here plus a scan that adopts two is a
+	// normal night for this mode, and an operator reading only the summary should not
+	// have to guess whether the mode was on. `--json` keeps its existing payload — the
+	// `cameras` key has always meant "cameras in the file", and a consumer that counted
+	// on that number should not start getting a different one because a LAN answered.
+	let mut summary = format!(
+		"config OK: {} camera(s), bind {}:{}",
 		config.cameras.len(),
 		config.bind_addr,
 		config.bind_port,
 	);
+	if let Some(scan) = config.startup_discovery_active() {
+		summary.push_str(&format!(
+			", startup discovery on (cameras that answer within {}s are added)",
+			scan.wait_secs
+		));
+	}
+	summary.push('\n');
 	match mode {
 		Mode::Json => {
 			let _ = writeln!(
@@ -397,6 +421,143 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 			})
 			.await;
 		}
+		// `audio-settings` reads and writes `<audioCfg>` through
+		// `BcCamera::get_audio_cfg` / `set_audio_cfg`. Those two are on the
+		// concrete camera and pointedly not on `CameraDriver`, so the command
+		// takes this route like `talk-abilite` does. The argument checks run
+		// before the connection: this is a battery doorbell, and a volume of
+		// 120 is a typo about the operator's own command line — it must not
+		// cost a wake-up to be refused.
+		if let Command::AudioSettings {
+			volume,
+			talk,
+			visitor_volume,
+			loudspeaker,
+			gate,
+			..
+		} = &cli.command
+		{
+			let edit = audio_settings::Edit {
+				volume: *volume,
+				talk: *talk,
+				visitor_volume: *visitor_volume,
+				loudspeaker: *loudspeaker,
+				gate: *gate,
+			};
+			edit.check()?;
+			return runner::run(&cam_cfg, cancel, move |cam| {
+				async move { audio_settings::run(cam, edit).await }.boxed()
+			})
+			.await;
+		}
+
+		// `chime-settings` reads and writes the chime family through
+		// `BcCamera::get_ding_dong_cfg` / `set_ding_dong_cfg` /
+		// `ring_ding_dong` — concrete camera, not the trait, same route.
+		// Argument checks again run before the connection: `--volume 9` is a
+		// typo, and even `--sonner` (which only rings) must be refused before
+		// a wake-up if it could not be valid.
+		if let Command::ChimeSettings {
+			volume,
+			led,
+			melody,
+			silent,
+			ring,
+			..
+		} = &cli.command
+		{
+			let edit = chime_settings::Edit {
+				volume: *volume,
+				led: *led,
+				melody: *melody,
+				silent: *silent,
+				ring: *ring,
+			};
+			edit.check()?;
+			return runner::run(&cam_cfg, cancel, move |cam| {
+				async move { chime_settings::run(cam, edit).await }.boxed()
+			})
+			.await;
+		}
+		// `talk-ability` is the second command that needs the concrete
+		// `BcCamera`: the ungated TalkAbility probe lives on `BcCamera` and
+		// pointedly not on the `CameraDriver` trait, so it cannot cross the
+		// dispatch seam every other command routes through. Intercepted here,
+		// exactly like `snapshot --use-stream-raw`.
+		if matches!(cli.command, Command::TalkAbility(_)) {
+			return runner::run(&cam_cfg, cancel, move |cam| {
+				async move { talk_capability::run(cam).await }.boxed()
+			})
+			.await;
+		}
+		// `talk` and `audio-bridge` write to the loudspeaker, and `talk` /
+		// `talk_stream` live on the concrete `BcCamera` (pointedly not on
+		// `CameraDriver`), so they take this route too. Both need a longer
+		// op deadline than the request/response default: a talk transmission
+		// paces itself at wall-clock speed.
+		if let Command::Talk { file, raw, header, .. } = &cli.command {
+			let path = file.clone();
+			// The header convention is the one wire-format knob the operator
+			// can choose, and a bad value is an argument error: refuse it here,
+			// before the camera is woken, exactly like the file check below.
+			let convention = crate::audio_control::parse_convention(header)?;
+			// Validate the file *before* connecting. This is a battery camera:
+			// waking it, logging in, and only then being told the WAV is 44.1 kHz
+			// would burn the wake window for nothing, and the refusal is about
+			// the operator's argument, not about the camera.
+			let input = crate::oneshot::pcm::read_pcm_file(&path, *raw)?;
+			let budget = talk::op_timeout_for_samples(input.samples.len());
+			let channel_id = cam_cfg.channel_id;
+			return runner::run_with_op_timeout(&cam_cfg, cancel, budget, move |cam| {
+				async move { talk::run(cam, channel_id, &path, &input, convention).await }.boxed()
+			})
+			.await;
+		}
+		if let Command::AudioBridge {
+			idle,
+			header,
+			input,
+			gain,
+			..
+		} = &cli.command {
+			if !idle.is_finite() || *idle <= 0.0 {
+				return Err(crate::oneshot::errors::UsageError::new(format!(
+					"--idle must be a positive number of seconds, got {idle}"
+				))
+				.into());
+			}
+			// Same rule as --idle: a NaN or a negative gain would either
+			// silently vanish the audio or invert the waveform, and both sound
+			// like a broken camera.
+			if !gain.is_finite() || *gain <= 0.0 {
+				return Err(crate::oneshot::errors::UsageError::new(format!(
+					"--gain must be a positive number, got {gain}"
+				))
+				.into());
+			}
+			let convention = crate::audio_control::parse_convention(header)?;
+			// Refuse a bad input format here, before the camera is woken: the
+			// pipe shape is decided by go2rtc's config, and a mismatch is a
+			// configuration bug, not something to discover mid-session.
+			let input_fmt = crate::oneshot::input::Input::parse(input)?;
+			let idle = Duration::from_secs_f64(*idle);
+			let channel_id = cam_cfg.channel_id;
+			let gain = *gain;
+			// Graceful route: the bridge closes its talk session (msg 11) on
+			// Ctrl+C instead of being dropped mid-session.
+			return runner::run_graceful(
+				&cam_cfg,
+				cancel,
+				audio_bridge::op_timeout(),
+				move |cam, cancel| async move {
+					audio_bridge::run(cam, channel_id, idle, convention, input_fmt, gain, cancel)
+						.await
+				}
+				.boxed(),
+			)
+			.await;
+		}
+
 		let cmd = crate::cli_convert::clone_command(&cli.command);
 		let json = cli.json;
 		runner::run(&cam_cfg, cancel, move |cam| {
@@ -414,6 +575,30 @@ pub async fn run_oneshot_to<W1: std::io::Write, W2: std::io::Write>(
 	}
 	.await;
 
+	code_for_output(mode, result, stdout, stderr)
+}
+
+/// Publish what the command produced and return the process exit code.
+///
+/// The invariant, written here because this is the only place it is decided:
+/// **a run that produced an `Outcome` returns 0**. A non-zero code alongside an
+/// `Outcome` would be a contradictory success - an operator would have in their
+/// pipe the complete JSON of a successful read *and* a failure code, and their
+/// script would have to guess which of the two to believe. That is exactly the
+/// report that led to `audio-settings` and `chime-settings`;
+/// those two commands have a single happy ending, an `Outcome`, so the
+/// invariant is tested here, without a camera - the full call path
+/// (`runner::run` -> a real connection) cannot be reproduced offline.
+///
+/// The bytes written come from the same
+/// [`emit_success_to`]/[`emit_failure_to`] as before: extracting this decision
+/// changes the JSON not at all.
+fn code_for_output<W1: std::io::Write, W2: std::io::Write>(
+	mode: Mode,
+	result: Result<Outcome>,
+	stdout: &mut W1,
+	stderr: &mut W2,
+) -> i32 {
 	match result {
 		Ok(outcome) => {
 			emit_success_to(mode, &outcome, stdout, stderr);
@@ -769,8 +954,47 @@ cameras = []
 	/// non-`--use-stream-raw` path. The TCP connect fails (no real
 	/// camera at 127.0.0.1:65535), surfacing through `Err(e)` →
 	/// classify → exit code. Covers the dispatch_oneshot bind branch.
-	#[tokio::test]
-	async fn run_oneshot_dispatch_path_returns_nonzero_on_tcp_failure() {
+	/// Body of a one-shot test, pinned to the heap so it can cross a
+	/// thread without generics fuss.
+	type TestBody = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
+
+	/// Runs a one-shot test on a thread with an **explicit stack** and
+	/// its own runtime.
+	///
+	/// Why the detour here: `run_oneshot` over the real TCP path is the
+	/// Baichuan handshake, so `BcXml` — every protocol block in an
+	/// `Option`, several kilobytes, with at least two copies per command.
+	/// In release — the profile of the binary that runs at the operator's
+	/// place — the thread gets exactly **tokio's 2 MB worker stack**, the
+	/// stack the one-shot really has: a green test proves the path fits
+	/// there. In debug, unoptimised frames need more room and the test
+	/// proves behaviour only — by design, not a cheat.
+	fn on_worker(body: fn() -> TestBody) {
+		let stack = if cfg!(debug_assertions) {
+			8 * 1024 * 1024
+		} else {
+			2 * 1024 * 1024
+		};
+		std::thread::Builder::new()
+			.stack_size(stack)
+			.spawn(move || {
+				let rt = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("test thread runtime");
+				rt.block_on(body());
+			})
+			.expect("test thread with explicit stack")
+			.join()
+			.expect("the one-shot must not panic against an absent camera");
+	}
+
+	#[test]
+	fn run_oneshot_dispatch_path_returns_nonzero_on_tcp_failure() {
+		on_worker(|| Box::pin(run_oneshot_dispatch_path()))
+	}
+
+	async fn run_oneshot_dispatch_path() {
 		let f = tempfile::NamedTempFile::new().unwrap();
 		// Address with `127.0.0.1:65500` — connect refused / times out.
 		let toml = r#"
@@ -795,8 +1019,12 @@ discovery = "local"
 	/// (the `if let Command::Snapshot ... use_stream_raw: true` arm),
 	/// then `runner::run` fails to connect — exit nonzero. Covers
 	/// the snapshot --use-stream-raw branch (lines 161-180).
-	#[tokio::test]
-	async fn run_oneshot_use_stream_raw_path_returns_nonzero_on_tcp_failure() {
+	#[test]
+	fn run_oneshot_use_stream_raw_path_returns_nonzero_on_tcp_failure() {
+		on_worker(|| Box::pin(run_oneshot_use_stream_raw_path()))
+	}
+
+	async fn run_oneshot_use_stream_raw_path() {
 		let f = tempfile::NamedTempFile::new().unwrap();
 		let toml = r#"
 bind = "127.0.0.1"
@@ -862,6 +1090,108 @@ password = "x"
 		assert!(err.is_empty(), "Human OK path must not write to stderr");
 		let s = String::from_utf8(out).expect("utf8");
 		assert!(s.starts_with("config OK: 1 camera(s)"));
+	}
+
+	/// The startup scan's whole premise is a file that names no camera, so the command
+	/// an operator runs before deploying has to accept that file — and say what it
+	/// accepted, because `0 camera(s)` on its own reads like a file that does nothing.
+	#[test]
+	fn check_config_accepts_a_file_that_lets_the_network_name_the_cameras() {
+		let f = tempfile::NamedTempFile::new().unwrap();
+		let toml = r#"
+bind = "127.0.0.1"
+bind_port = 8554
+
+[startup_discovery]
+enable = true
+wait_secs = 4
+username = "admin"
+password = "shared-lan-password"
+"#;
+		std::fs::write(f.path(), toml).unwrap();
+		let cli = cli_from(&[
+			"bairelay",
+			"check-config",
+			"-c",
+			&f.path().display().to_string(),
+		]);
+		let (code, out, err) = check_config_capture(&cli);
+		assert_eq!(
+			code,
+			classify::EXIT_OK,
+			"a file with no camera and a scan is a decision, not a mistake; stderr: {}",
+			String::from_utf8_lossy(&err)
+		);
+		let s = String::from_utf8(out).expect("utf8");
+		assert!(s.starts_with("config OK: 0 camera(s)"), "{s}");
+		assert!(s.contains("startup discovery on"), "{s}");
+		assert!(
+			s.contains("4s"),
+			"the window the file asked for is repeated back: {s}"
+		);
+	}
+
+	/// An unarmed table is not a mode: a file that carries one and declares its cameras
+	/// gets the summary this command has always printed, with no hint of a scan in it.
+	#[test]
+	fn check_config_says_nothing_about_a_mode_that_was_not_asked_for() {
+		let f = tempfile::NamedTempFile::new().unwrap();
+		let toml = r#"
+bind = "127.0.0.1"
+bind_port = 8554
+
+[startup_discovery]
+enable = false
+wait_secs = 4
+
+[[cameras]]
+name = "front"
+address = "10.0.0.10:9000"
+username = "admin"
+password = "x"
+"#;
+		std::fs::write(f.path(), toml).unwrap();
+		let cli = cli_from(&[
+			"bairelay",
+			"check-config",
+			"-c",
+			&f.path().display().to_string(),
+		]);
+		let (code, out, _err) = check_config_capture(&cli);
+		assert_eq!(code, classify::EXIT_OK);
+		let s = String::from_utf8(out).expect("utf8");
+		assert_eq!(s, "config OK: 1 camera(s), bind 127.0.0.1:8554\n", "{s}");
+	}
+
+	/// A table that was written but never armed, in a file with no cameras, is the one
+	/// combination that can do nothing at all. It is refused — and refused in terms of
+	/// the table the operator did write, rather than serde's `missing field`, which is
+	/// not the word they were looking for.
+	#[test]
+	fn check_config_refuses_an_unarmed_scan_table_and_names_it() {
+		let f = tempfile::NamedTempFile::new().unwrap();
+		let toml = r#"
+bind = "127.0.0.1"
+bind_port = 8554
+
+[startup_discovery]
+wait_secs = 4
+"#;
+		std::fs::write(f.path(), toml).unwrap();
+		let cli = cli_from(&[
+			"bairelay",
+			"check-config",
+			"-c",
+			&f.path().display().to_string(),
+		]);
+		let (code, _out, err) = check_config_capture(&cli);
+		assert_eq!(code, classify::EXIT_CONFIG);
+		let s = String::from_utf8(err).expect("utf8");
+		assert!(s.contains("[startup_discovery]"), "{s}");
+		assert!(
+			s.contains("enable = true"),
+			"and what to write instead: {s}"
+		);
 	}
 
 	#[test]
@@ -973,6 +1303,152 @@ on_motion = true
 		assert_eq!(code, classify::EXIT_CONFIG);
 		let s = String::from_utf8(err).expect("utf8");
 		assert!(s.contains("read"));
+	}
+
+	/// The `<audioCfg>` block of a doorbell that prints **three** volumes, as
+	/// they were observed on the user's model.
+	fn block_audio_settings() -> crate::oneshot::output::AudioCfgInfo {
+		crate::oneshot::output::AudioCfgInfo {
+			version: "1.1".into(),
+			channel_id: "0".into(),
+			volume: "100".into(),
+			timeout: "10".into(),
+			audio_select: "0".into(),
+			pre_alarm: "0".into(),
+			audio_list_id: "0".into(),
+			talk_and_reply_volume: Some("90".into()),
+			visitor_volume: Some("38".into()),
+			visitor_loudspeaker: Some("1".into()),
+			pascal: false,
+		}
+	}
+
+	/// A successful settings read returns **0** - that is the invariant the
+	/// report asked for on `audio-settings` and `chime-settings`, and the only
+	/// place it is decided is [`code_pour_sortie`]. The full path
+	/// (`runner::run` -> a real camera) cannot be reproduced offline; these two
+	/// commands have one happy ending, an `Outcome`, so this pair (Outcome ->
+	/// code + bytes) is what has to be pinned.
+	#[test]
+	fn a_successful_settings_read_returns_zero() {
+		use crate::oneshot::output::DingDongCfgInfo;
+		let cas = [
+			(
+				"audio-settings",
+				Outcome::AudioSettings {
+					tag: "audioCfg".into(),
+					changed: false,
+					block: block_audio_settings(),
+					changes: vec![],
+				},
+			),
+			(
+				"chime-settings",
+				Outcome::ChimeSettings {
+					changed: false,
+					block: DingDongCfgInfo::default(),
+					changes: vec![],
+					ring: None,
+				},
+			),
+		];
+		for (nom, outcome) in cas {
+			let mut output = Vec::new();
+			let mut erreurs = Vec::new();
+			let code = code_for_output(Mode::Json, Ok(outcome), &mut output, &mut erreurs);
+			assert_eq!(code, classify::EXIT_OK, "{nom} succeeded: the code must be 0");
+			assert!(erreurs.is_empty(), "{nom} must write nothing to stderr");
+			let lu: serde_json::Value = serde_json::from_slice(&output)
+				.unwrap_or_else(|e| panic!("{nom} doit rendre du JSON lisible : {e}"));
+			assert_eq!(lu["ok"], serde_json::Value::Bool(true), "{nom} : {lu}");
+			assert_eq!(
+				lu["changed"],
+				serde_json::Value::Bool(false),
+				"{nom}: a read writes nothing"
+			);
+		}
+		// The three volumes of the captured `<audioCfg>` are in the JSON: the
+		// missing one was on the MQTT entity side, not here.
+		let mut output = Vec::new();
+		let mut erreurs = Vec::new();
+		code_for_output(
+			Mode::Json,
+			Ok(Outcome::AudioSettings {
+				tag: "audioCfg".into(),
+				changed: false,
+				block: block_audio_settings(),
+				changes: vec![],
+			}),
+			&mut output,
+			&mut erreurs,
+		);
+		let lu: serde_json::Value = serde_json::from_slice(&output).expect("json");
+		assert_eq!(lu["block"]["volume"], "100", "<volume> is the master volume");
+		assert_eq!(
+			lu["block"]["talk_and_reply_volume"], "90",
+			"<talkAndReplyVolume> is the intercom volume"
+		);
+		assert_eq!(lu["block"]["visitor_volume"], "38", "<visitorVolume> is what the visitor hears");
+	}
+
+	/// A successful talk run exits **0** — the invariant is decided in
+	/// [`code_for_output`] and nowhere else. The full call path
+	/// (`runner::run` → real camera) is not reproducible offline, so what
+	/// gets pinned here is the pair (Outcome → exit code + emitted bytes),
+	/// including the awkward success that carries a camera error code:
+	/// `talk-ability` reporting a refusal is still a completed read.
+	#[test]
+	fn successful_run_returns_zero() {
+		let cases = [
+			(
+				"talk-ability refused",
+				Outcome::TalkAbility {
+					found: false,
+					code: 482,
+					payload: "none".into(),
+					xml: None,
+					configs: vec![],
+					duplex: vec![],
+					audio_stream_modes: vec![],
+				},
+			),
+			(
+				"talk-ability answered",
+				Outcome::TalkAbility {
+					found: true,
+					code: 200,
+					payload: "xml".into(),
+					xml: Some("<TalkAbility/>".into()),
+					configs: vec![],
+					duplex: vec![],
+					audio_stream_modes: vec![],
+				},
+			),
+		];
+		for (name, outcome) in cases {
+			let mut stdout = Vec::new();
+			let mut stderr = Vec::new();
+			let code = code_for_output(Mode::Json, Ok(outcome), &mut stdout, &mut stderr);
+			assert_eq!(code, classify::EXIT_OK, "{name} succeeded: the code must be 0");
+			assert!(stderr.is_empty(), "{name} must write nothing to stderr");
+			let parsed: serde_json::Value = serde_json::from_slice(&stdout)
+				.unwrap_or_else(|e| panic!("{name} must emit readable JSON: {e}"));
+			assert_eq!(parsed["ok"], serde_json::Value::Bool(true), "{name}: {parsed}");
+		}
+	}
+
+	/// Extracting the decision did not soften failures: an error is still
+	/// classified, and the error JSON goes to `stdout` in JSON mode.
+	#[test]
+	fn an_output_error_stays_classified() {
+		let mut output = Vec::new();
+		let mut erreurs = Vec::new();
+		let e = anyhow::anyhow!("a failure that looks like nothing known");
+		let code = code_for_output(Mode::Json, Err(e), &mut output, &mut erreurs);
+		assert_eq!(code, classify::EXIT_UNEXPECTED);
+		let lu: serde_json::Value = serde_json::from_slice(&output).expect("json");
+		assert_eq!(lu["ok"], serde_json::Value::Bool(false));
+		assert!(erreurs.is_empty(), "en mode JSON, tout part sur stdout");
 	}
 
 	#[test]

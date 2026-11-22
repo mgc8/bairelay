@@ -231,12 +231,297 @@ pub struct BcXml {
 	/// Read and write users
 	#[serde(default, rename = "UserList", skip_serializing_if = "Option::is_none")]
 	pub user_list: Option<UserList>,
+	/// The loudspeaker / intercom volume block, **PascalCase spelling**.
+	///
+	/// Read with msg 264, written back with msg 265 — see
+	/// [`BcCamera::get_audio_cfg`](crate::bc_protocol::BcCamera::get_audio_cfg).
+	/// This is the only place the doorbell's intercom volume
+	/// (`talkAndReplyVolume`) lives.
+	///
+	/// Cameras of this family have been seen to name the element both
+	/// `<AudioCfg>` and `<audioCfg>` (the internal protocol note lists both),
+	/// and quick-xml's serde decoding matches element names **exactly**, so
+	/// the block is carried by this field *and* by
+	/// [`audio_cfg_camel`](Self::audio_cfg_camel) below. Read it through
+	/// [`BcXml::audio_cfg_block`](Self::audio_cfg_block) and write it through
+	/// [`BcXml::body_with_audio_cfg`](Self::body_with_audio_cfg), which pick the
+	/// spelling the camera actually used; a SET under the other spelling is
+	/// the one thing this firmware is known to shrug off.
+	#[serde(default, rename = "AudioCfg", skip_serializing_if = "Option::is_none")]
+	pub audio_cfg: Option<AudioCfg>,
+	/// The same block as [`audio_cfg`](Self::audio_cfg), for a camera that
+	/// spells the element `<audioCfg>`. Never set together with it.
+	#[serde(default, rename = "audioCfg", skip_serializing_if = "Option::is_none")]
+	pub audio_cfg_camel: Option<AudioCfg>,
+	/// The hardwired-chime control block, msg 483 (`machineStateGet` in,
+	/// `machineStateSet` back) — see
+	/// [`BcCamera::get_ding_dong_cfg`](crate::bc_protocol::BcCamera::get_ding_dong_cfg).
+	/// One carrier spelling only: unlike `<audioCfg>`, no second casing has
+	/// ever been observed or documented for this element.
+	#[serde(default, rename = "dingdongCtrl", skip_serializing_if = "Option::is_none")]
+	pub dingdong_ctrl: Option<DingDongCtrl>,
+	/// The paired-chime list a msg 484 reply carries: one entry per chime.
+	/// Blocks whose id is missing or non-numeric are ignored by the reader
+	/// (see [`DingDongDevice::identifier`]), matching how the upstream
+	/// reference implementation walks the list.
+	#[serde(
+		default,
+		rename = "dingdongDeviceInfo",
+		skip_serializing_if = "Vec::is_empty"
+	)]
+	pub dingdong_device_info: Vec<DingDongDevice>,
+	/// The **other** documented spelling of the very same list: msg 484 is
+	/// double-use, reply *and* device push, and the pushed variant is rooted
+	/// `<dingdongList>` — the reference client lists it as the "pushed variant"
+	/// of the 484 reply.
+	///
+	/// Read-only alias, never sent: the bridge asks 484 with an empty body and
+	/// has no reason to invent a root. **This element is a container, not the
+	/// entries** — measured on a `v3.0.0.4636_25060550` doorbell, the reply is
+	/// `<dingdongList><maxPairNumber>5</maxPairNumber><pairedList>
+	/// <dingdongDeviceInfo>…`. Modelling it as the list itself (what this field
+	/// used to be) decodes exactly one entry with every tag absent, which is
+	/// how a paired, answering chime was being reported as `chime not found`. That
+	/// sentence is this bridge's own text, not a firmware string: it travelled in
+	/// french until the rename, and the renaming table in
+	/// [`docs/settings.md`](../../../../docs/settings.md) lists what is published
+	/// today. [`DingDongList`] holds both nestings a firmware can use.
+	#[serde(default, rename = "dingdongList", skip_serializing_if = "Option::is_none")]
+	pub dingdong_list: Option<DingDongList>,
+	/// The chime device-options carrier, msg 485 — request and `getParam`
+	/// reply share this element; which frame it is, is decided by `<opt>`.
+	#[serde(
+		default,
+		rename = "dingdongDeviceOpt",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub dingdong_device_opt: Option<DingDongDeviceOpt>,
+	/// The per-event chime config blocks a msg 486 reply carries, one per
+	/// ringable device. Written back one at a time inside a
+	/// [`dingdong_cfg`](Self::dingdong_cfg) wrapper by msg 487.
+	#[serde(default, rename = "deviceCfg", skip_serializing_if = "Vec::is_empty")]
+	pub device_cfg: Vec<DingDongDeviceCfg>,
+	/// The msg 487 write wrapper: `<dingdongCfg><deviceCfg>…`.
+	#[serde(default, rename = "dingdongCfg", skip_serializing_if = "Option::is_none")]
+	pub dingdong_cfg: Option<DingDongCfgReq>,
+	/// The chime silent-mode block, msgs 609 (read) / 610 (write). Writing
+	/// it re-arms the mute countdown, so a caller that means "change
+	/// nothing" must send nothing — see
+	/// [`BcCamera::set_ding_dong_cfg`](crate::bc_protocol::BcCamera::set_ding_dong_cfg).
+	#[serde(
+		default,
+		rename = "dingdongSilentMode",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub dingdong_silent_mode: Option<DingDongSilent>,
+	/// The NTP block, msgs 38 (read) / 39 (write).
+	#[serde(default, rename = "Ntp", skip_serializing_if = "Option::is_none")]
+	pub ntp: Option<Ntp>,
+	/// The automatic-reboot schedule, msgs 101 (read) / 100 (write).
+	#[serde(default, rename = "AutoReboot", skip_serializing_if = "Option::is_none")]
+	pub auto_reboot: Option<AutoReboot>,
+	/// The microphone AI-denoiser block, msgs 439 (read) / 440 (write).
+	#[serde(default, rename = "aiDenoise", skip_serializing_if = "Option::is_none")]
+	pub ai_denoise: Option<AiDenoise>,
+	/// The sleep state, msg 574 (read-only).
+	#[serde(default, rename = "sleepState", skip_serializing_if = "Option::is_none")]
+	pub sleep_state: Option<SleepState>,
+	/// The Wi-Fi signal report, msg 115 (read-only).
+	#[serde(default, rename = "WifiSignal", skip_serializing_if = "Option::is_none")]
+	pub wifi_signal: Option<WifiSignal>,
+	/// The image sliders, msg 26 (read) / 25 (write). Arrives in the same
+	/// reply as [`input_advance_cfg`](Self::input_advance_cfg); the 25 setter
+	/// wants both back.
+	#[serde(default, rename = "VideoInput", skip_serializing_if = "Option::is_none")]
+	pub video_input: Option<VideoInput>,
+	/// The advanced image block, companion of
+	/// [`video_input`](Self::video_input).
+	#[serde(
+		default,
+		rename = "InputAdvanceCfg",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub input_advance_cfg: Option<InputAdvanceCfg>,
+	/// The OSD timestamp block, msgs 44 (read) / 45 (write). Arrives in the
+	/// same reply as [`osd_channel_name`](Self::osd_channel_name).
+	#[serde(default, rename = "OsdDatetime", skip_serializing_if = "Option::is_none")]
+	pub osd_datetime: Option<OsdDatetime>,
+	/// The OSD channel-name block (and its watermark flag).
+	#[serde(
+		default,
+		rename = "OsdChannelName",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub osd_channel_name: Option<OsdChannelName>,
+	/// The privacy-mask block, msg 52 (read). See [`Shelter`] for why the
+	/// 53 setter is refused.
+	#[serde(default, rename = "Shelter", skip_serializing_if = "Option::is_none")]
+	pub shelter: Option<Shelter>,
+	/// The motion-detection block in the setter's shape, msg 46 (read) /
+	/// 47 (write). Mutually exclusive with [`md_alarm`](Self::md_alarm):
+	/// which one a firmware prints decides whether writing is allowed.
+	#[serde(default, rename = "MD", skip_serializing_if = "Option::is_none")]
+	pub md: Option<MdCfg>,
+	/// The motion-detection block in the getter's shape. Read-only.
+	#[serde(default, rename = "MdAlarm", skip_serializing_if = "Option::is_none")]
+	pub md_alarm: Option<MdAlarm>,
 }
 
 impl BcXml {
 	/// Parse a BcXml payload. See [`parse_lossy_utf8`] for the decoding rules.
 	pub(crate) fn try_parse(s: &[u8]) -> Result<Self, quick_xml::de::DeError> {
 		parse_lossy_utf8(s)
+	}
+	/// The `<audioCfg>` block, with [`AudioCfg::tag`] set to the spelling the
+	/// camera used for the element.
+	///
+	/// The two carrier fields ([`audio_cfg`](Self::audio_cfg) /
+	/// [`audio_cfg_camel`](Self::audio_cfg_camel)) exist only because
+	/// quick-xml matches tag names case-sensitively; this folds them back
+	/// into one answer so callers never have to know about the pair, and it
+	/// stamps the casing onto the returned block — which is what makes
+	/// [`BcXml::body_with_audio_cfg`] send the name back that the camera printed.
+	/// Reading through anything else is what leaves a block stamped with the
+	/// wrong spelling, so read through this.
+	pub fn audio_cfg_block(&self) -> Option<AudioCfg> {
+		let (cfg, tag) = if let Some(cfg) = self.audio_cfg.as_ref() {
+			(cfg, AudioCfgTag::Pascal)
+		} else {
+			(self.audio_cfg_camel.as_ref()?, AudioCfgTag::Camel)
+		};
+		Some(AudioCfg { tag, ..cfg.clone() })
+	}
+	/// A `<body>` carrying `cfg` under the exact spelling it was read with
+	/// ([`AudioCfg::tag`]), which is what msg 265 expects: this firmware
+	/// answers a SET whose element it doesn't recognise by ignoring it.
+	pub fn body_with_audio_cfg(cfg: &AudioCfg) -> Self {
+		let mut body = BcXml::default();
+		match cfg.tag {
+			AudioCfgTag::Pascal => body.audio_cfg = Some(cfg.clone()),
+			AudioCfgTag::Camel => body.audio_cfg_camel = Some(cfg.clone()),
+		}
+		body
+	}
+	/// The paired wireless chimes, whichever of the shapes the camera used:
+	/// `<dingdongDeviceInfo>` at the body root (the documented reply), or the
+	/// `<dingdongList>` container — entries inside its `<pairedList>` wrapper,
+	/// or printed directly under it (the reference client's note — msg 484 is
+	/// reply *and* push).
+	///
+	/// Folds the carriers exactly the way [`BcXml::audio_cfg_block`] folds the two
+	/// `<audioCfg>` casings, so no caller has to know the shapes exist.
+	/// Entries come back as read, including ones with no addressable id —
+	/// [`DingDongDevice::identifier`] is what decides whether an entry can be
+	/// talked to, and nothing here guesses an id.
+	pub fn dingdong_chimes(&self) -> &[DingDongDevice] {
+		if !self.dingdong_device_info.is_empty() {
+			return &self.dingdong_device_info;
+		}
+		let Some(list) = self.dingdong_list.as_ref() else {
+			return &[];
+		};
+		if list.device_info.is_empty() {
+			list.paired_list.as_ref().map(|p| p.device_info.as_slice()).unwrap_or(&[])
+		} else {
+			&list.device_info
+		}
+	}
+	/// The per-event chime blocks of a msg 486 reply, under either nesting:
+	/// printed bare at the body root, or wrapped in `<dingdongCfg>` — which is
+	/// what the field camera prints, and also the shape the 487 write frame
+	/// has always used, so the reply arrives in the very shape the camera
+	/// expects back.
+	pub fn dingdong_events(&self) -> &[DingDongDeviceCfg] {
+		if !self.device_cfg.is_empty() {
+			return &self.device_cfg;
+		}
+		self.dingdong_cfg.as_ref().map(|c| c.device_cfg.as_slice()).unwrap_or(&[])
+	}
+	/// The msg 483 read frame: `<dingdongCtrl><opt>machineStateGet</opt>`.
+	/// No id tag — the wired chime is per channel, and the channelId lives in
+	/// the message header/extension, like the other chime-family requests.
+	pub fn body_ding_dong_ctrl_get() -> Self {
+		BcXml {
+			dingdong_ctrl: Some(DingDongCtrl {
+				version: xml_ver(),
+				opt: Some("machineStateGet".into()),
+				..Default::default()
+			}),
+			..Default::default()
+		}
+	}
+	/// A `<body>` carrying `ctrl` under `<dingdongCtrl>` for msg 483's
+	/// `machineStateSet` write. The caller passes the block it read with the
+	/// patched tags — this builder only stamps `<opt>machineStateSet</opt>`
+	/// and, per the documented write frame, `<bsave>1</bsave>` when the read
+	/// didn't carry a `bsave` text of its own. It never adds a tag the read
+	/// omitted.
+	pub fn body_with_ding_dong_ctrl(ctrl: &DingDongCtrl) -> Self {
+		BcXml {
+			dingdong_ctrl: Some(DingDongCtrl {
+				opt: Some("machineStateSet".into()),
+				bsave: Some(ctrl.bsave.clone().unwrap_or_else(|| "1".into())),
+				..ctrl.clone()
+			}),
+			..Default::default()
+		}
+	}
+	/// The msg 485 `getParam` read frame for one chime.
+	pub fn body_ding_dong_opt_get(chime_id: &str) -> Self {
+		BcXml {
+			dingdong_device_opt: Some(DingDongDeviceOpt {
+				version: xml_ver(),
+				opt: Some("getParam".into()),
+				id: Some(chime_id.into()),
+				..Default::default()
+			}),
+			..Default::default()
+		}
+	}
+	/// A `<body>` carrying a msg 485 frame as-is. The caller builds either a
+	/// `setParam` block (the printed tags, patched — nothing invented) or a
+	/// `ringWithMusic` block (`<id>` + `<musicId>`); this wrapper adds
+	/// nothing, because "only the tags you pass" is the documented frame.
+	pub fn body_with_ding_dong_opt(opt: &DingDongDeviceOpt) -> Self {
+		BcXml {
+			dingdong_device_opt: Some(opt.clone()),
+			..Default::default()
+		}
+	}
+	/// The msg 609 silent-mode read frame for one chime.
+	pub fn body_ding_dong_silent_get(chime_id: &str) -> Self {
+		BcXml {
+			dingdong_silent_mode: Some(DingDongSilent {
+				version: xml_ver(),
+				id: Some(chime_id.into()),
+				..Default::default()
+			}),
+			..Default::default()
+		}
+	}
+	/// A `<body>` carrying `silent` under `<dingdongSilentMode>` for the msg
+	/// 610 write, stamping the hard-coded `<type>63</type>` the documented
+	/// write frame carries when the read didn't print a `type` of its own.
+	/// What 63 means is undocumented; it is sent because the reference
+	/// implementation sends it, and that is all anyone knows.
+	pub fn body_with_ding_dong_silent(silent: &DingDongSilent) -> Self {
+		BcXml {
+			dingdong_silent_mode: Some(DingDongSilent {
+				type_: Some(silent.type_.clone().unwrap_or_else(|| "63".into())),
+				..silent.clone()
+			}),
+			..Default::default()
+		}
+	}
+	/// A `<body>` wrapping one `cfg` block in `<dingdongCfg>` for msg 487.
+	pub fn body_with_ding_dong_cfg(cfg: &DingDongDeviceCfg) -> Self {
+		BcXml {
+			dingdong_cfg: Some(DingDongCfgReq {
+				version: xml_ver(),
+				device_cfg: vec![cfg.clone()],
+			}),
+			..Default::default()
+		}
 	}
 	pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::SeError> {
 		let mut buf: Vec<u8> = Vec::new();
@@ -677,7 +962,7 @@ impl Default for Extension {
 }
 
 /// SystemGeneral xml
-#[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
 pub struct SystemGeneral {
 	/// XML Version
 	#[serde(default, rename = "@version")]
@@ -726,6 +1011,36 @@ pub struct SystemGeneral {
 		skip_serializing_if = "Option::is_none"
 	)]
 	pub device_name: Option<String>,
+	/// Marker the firmware requires when a msg 105 payload only renames the
+	/// device: `<deviceNameOnly>1</deviceNameOnly>`. Absent otherwise, and
+	/// never invented — `set_general` sets it when, and only when, the patch
+	/// touched `deviceName` and nothing else.
+	#[serde(
+		default,
+		rename = "deviceNameOnly",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub device_name_only: Option<u8>,
+	/// Whether DST is currently in effect. **Read-only** on the firmware:
+	/// the writable DST switch is `<Dst><enable>` (msgs 106/107).
+	#[serde(default, rename = "isDst", skip_serializing_if = "Option::is_none")]
+	pub is_dst: Option<u8>,
+	/// Login-bruteforce lock flag, as printed.
+	#[serde(default, rename = "loginLock", skip_serializing_if = "Option::is_none")]
+	pub login_lock: Option<u8>,
+	/// Login lock duration, as printed.
+	#[serde(default, rename = "lockTime", skip_serializing_if = "Option::is_none")]
+	pub lock_time: Option<u32>,
+	/// Allowed failed attempts before the lock, as printed.
+	#[serde(
+		default,
+		rename = "allowedTimes",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub allowed_times: Option<u32>,
+	/// Device id the firmware reports, as printed.
+	#[serde(default, rename = "deviceId", skip_serializing_if = "Option::is_none")]
+	pub device_id: Option<String>,
 }
 
 /// Norm xml
@@ -1084,28 +1399,44 @@ pub struct TalkAbility {
 	pub audio_config_list: Vec<AudioConfigList>,
 }
 
-/// duplexList xml
+/// `<duplexList>` wrapper carrying the repeated `<duplex>` elements.
+///
+/// A collection, like [`AuthTypeList`] models the repeated `<authType>`:
+/// the tag is a *list*, so a camera advertising both `FDX` and `FBX` in one
+/// `<duplexList>` sends two `<duplex>` children, which a scalar field cannot
+/// hold (quick_xml fails the whole reply with ``duplicate field `duplex` ``).
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
 pub struct DuplexList {
-	/// The supported duplex known values are "FBX"
+	/// Each supported duplex mode, known values `"FDX"`, `"FBX"`.
 	#[serde(default)]
-	pub duplex: String,
+	pub duplex: Vec<String>,
 }
 
-/// audioStreamModeList xml
+/// `<audioStreamModeList>` wrapper carrying the repeated `<audioStreamMode>`
+/// elements.
+///
+/// Measured on hardware: one `<audioStreamModeList>` carrying *two*
+/// `<audioStreamMode>` children (`followVideoStream`, `mixAudioStream`),
+/// which is what made a scalar field drop the entire `<TalkAbility>` reply
+/// with ``duplicate field `audioStreamMode` ``.
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
 pub struct AudioStreamModeList {
-	/// The supported audio stream mode
+	/// Each supported audio stream mode, known values `"followVideoStream"`,
+	/// `"mixAudioStream"`.
 	#[serde(default, rename = "audioStreamMode")]
-	pub audio_stream_mode: String,
+	pub audio_stream_mode: Vec<String>,
 }
 
-/// audioConfigList xml
+/// `<audioConfigList>` wrapper carrying the repeated `<audioConfig>` elements.
+///
+/// Same reasoning as [`AudioStreamModeList`]: nothing stops a firmware from
+/// advertising several codecs (different `lengthPerEncoder`, say) inside one
+/// `<audioConfigList>`, and a scalar field would lose the whole reply.
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize)]
 pub struct AudioConfigList {
-	/// The supported audio configs
+	/// Each supported audio config.
 	#[serde(default, rename = "audioConfig")]
-	pub audio_config: AudioConfig,
+	pub audio_config: Vec<AudioConfig>,
 }
 
 /// An XML that desctibes a list of events such as motion detection
@@ -2323,6 +2654,908 @@ pub struct User {
 	pub user_set_state: String,
 }
 
+/// Which spelling the camera used for the loudspeaker-config element.
+///
+/// Not a field of the block: it is a property of the *envelope*, recorded by
+/// the read (264) and honoured by the write (265), because this firmware only
+/// re-accepts a block it recognises — and the name it printed is the name it
+/// matches. See [`BcXml::audio_cfg_block`].
+#[derive(PartialEq, Eq, Default, Debug, Clone, Copy)]
+pub enum AudioCfgTag {
+	/// `<audioCfg>` — the spelling the protocol note prints first, and the
+	/// one Reolink's own web UI sends. The default for a hand-built block.
+	#[default]
+	Camel,
+	/// `<AudioCfg>`.
+	Pascal,
+}
+
+impl AudioCfgTag {
+	/// The element name this spelling stands for — what the camera printed, and
+	/// therefore what a write has to print.
+	pub fn element_name(&self) -> &'static str {
+		match self {
+			AudioCfgTag::Camel => "audioCfg",
+			AudioCfgTag::Pascal => "AudioCfg",
+		}
+	}
+}
+
+/// The `<audioCfg>` loudspeaker / intercom block (read: msg 264, write:
+/// msg 265).
+///
+/// Every value is kept as the **text the camera sent**, never parsed into a
+/// number: the block is read, patched tag by tag and sent straight back, so
+/// re-serialising it has to reproduce the firmware's own text, and a value
+/// this crate doesn't understand must survive the round trip unchanged.
+/// Interpretation (volumes are 0-100 per the protocol note) belongs to the
+/// caller.
+///
+/// The three doorbell-only tags are `Option`: a camera that has no intercom
+/// does not print them, and inventing them on the way back is how a SET gets
+/// rejected. A camera that *does* print them always gets them back.
+///
+/// Caveat to keep in mind when reading a block off an unfamiliar model: serde
+/// drops what it doesn't model, so a tag absent from this struct is also
+/// absent from the block that gets written back. The tag list here is the one
+/// the internal protocol note documents.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct AudioCfg {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// The channel this block belongs to, as the camera wrote it.
+	#[serde(default, rename = "channelId")]
+	pub channel_id: String,
+	/// Unknown; documented as part of the block, never written by the web UI.
+	#[serde(default, rename = "timeout")]
+	pub timeout: String,
+	/// Unknown; documented as part of the block, never written by the web UI.
+	#[serde(default, rename = "audioSelect")]
+	pub audio_select: String,
+	/// The loudspeaker volume (0-100).
+	#[serde(default, rename = "volume")]
+	pub volume: String,
+	/// Unknown; documented as part of the block, never written by the web UI.
+	#[serde(default, rename = "preAlarm")]
+	pub pre_alarm: String,
+	/// Unknown; documented as part of the block, never written by the web UI.
+	#[serde(default, rename = "audioListId")]
+	pub audio_list_id: String,
+	/// The intercom volume (0-100): how loud the answer you speak through the
+	/// app comes out of the doorbell. Doorbell / intercom firmwares only.
+	#[serde(
+		default,
+		rename = "talkAndReplyVolume",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub talk_and_reply_volume: Option<String>,
+	/// How loud the pre-set greeting clips play (0-100). Doorbell only.
+	#[serde(
+		default,
+		rename = "visitorVolume",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub visitor_volume: Option<String>,
+	/// Whether the loudspeaker is live for a visitor (`0` / `1`). Doorbell only.
+	#[serde(
+		default,
+		rename = "visitorLoudspeaker",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub visitor_loudspeaker: Option<String>,
+	/// The spelling the camera used for this block, recorded by the read and
+	/// reused by the write. `#[serde(skip)]`: it is not a tag of the block,
+	/// and the read fills it from the [`BcXml`] field the block arrived in
+	/// (see [`BcXml::audio_cfg_block`]).
+	#[serde(skip)]
+	pub tag: AudioCfgTag,
+}
+
+/// The `<dingdongCtrl>` hardwired-chime block (msg 483: `machineStateGet`
+/// reads it, `machineStateSet` writes it).
+///
+/// Same law as [`AudioCfg`]: values are the camera's own text, and a tag the
+/// camera didn't print is never added on the way back. The on/off tag is
+/// documented under **two spellings** — `<bopen>` in the request frame,
+/// `<bopen>` or `<enable>` in replies — so both are modelled and only the one
+/// the camera printed goes back out (exactly one of them is set by a read).
+///
+/// What `<type>` selects (the documented example value is `dingdong`) and what
+/// unit `<time>` counts in are **undocumented**; both are echoed verbatim. The
+/// reference client warns that issuing the read can itself make a wired chime
+/// sound — reading this block is not physically silent.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongCtrl {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// `machineStateGet` / `machineStateSet`. Read as absent (replies don't
+	/// document it carrying one); stamped by the write builder.
+	#[serde(default, rename = "opt", skip_serializing_if = "Option::is_none")]
+	pub opt: Option<String>,
+	/// Present in some replies; the request keeps the channel in the header.
+	#[serde(default, rename = "channelId", skip_serializing_if = "Option::is_none")]
+	pub channel_id: Option<String>,
+	/// Chime type selector, documented example `dingdong`. Meaning unknown.
+	#[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+	pub type_: Option<String>,
+	/// The switch, `<bopen>` spelling (the one the write frame documents).
+	#[serde(default, rename = "bopen", skip_serializing_if = "Option::is_none")]
+	pub bopen: Option<String>,
+	/// The same switch, `<enable>` spelling. A write returns whichever the
+	/// camera printed, never both.
+	#[serde(default, rename = "enable", skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// Write frame only: `1` asks the camera to persist. Read as printed.
+	#[serde(default, rename = "bsave", skip_serializing_if = "Option::is_none")]
+	pub bsave: Option<String>,
+	/// Unit undocumented (reference client re-sends the read value as-is).
+	#[serde(default, rename = "time", skip_serializing_if = "Option::is_none")]
+	pub time: Option<String>,
+	/// A refusal reason instead of a switch. Measured on a battery doorbell
+	/// with no wired chime: 483 answers `200` with `<result>adptNotAC</result>`
+	/// next to `<bopen>0</bopen>` —"no mains adapter", that is: the wired chime
+	/// is not wired up. Reporting it is what turns a bare `bopen = 0`
+	/// from a setting into an explanation. Never written.
+	#[serde(default, rename = "result", skip_serializing_if = "Option::is_none")]
+	pub result: Option<String>,
+}
+
+impl DingDongCtrl {
+	/// The on/off switch text, under whichever spelling the camera used.
+	pub fn switch_state(&self) -> Option<&str> {
+		self.bopen.as_deref().or(self.enable.as_deref())
+	}
+}
+
+/// The `<dingdongList>` carrier of msg 484 — **a container, not the entries**.
+///
+/// Captured verbatim from a `v3.0.0.4636_25060550` doorbell with a paired
+/// chime:
+///
+/// ```xml
+/// <dingdongList version="1.1">
+///   <maxPairNumber>5</maxPairNumber>
+///   <pairedList>
+///     <dingdongDeviceInfo>
+///       <id>882092649</id><netstate>2</netstate><name>Reolink Chime</name>
+///     </dingdongDeviceInfo>
+///   </pairedList>
+/// </dingdongList>
+/// ```
+///
+/// Both nestings are modelled: the wrapper (measured) and entries printed
+/// directly under `<dingdongList>` (the pushed variant the protocol note
+/// mentions). Whichever the camera filled is what
+/// [`BcXml::dingdong_chimes`] returns.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongList {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// How many chimes the camera will pair (5 measured). Read-only ceiling,
+	/// never sent.
+	#[serde(default, rename = "maxPairNumber", skip_serializing_if = "Option::is_none")]
+	pub max_pair_number: Option<String>,
+	/// The measured wrapper the entries sit in.
+	#[serde(default, rename = "pairedList", skip_serializing_if = "Option::is_none")]
+	pub paired_list: Option<DingDongPairedList>,
+	/// Entries printed directly under the container instead.
+	#[serde(default, rename = "dingdongDeviceInfo", skip_serializing_if = "Vec::is_empty")]
+	pub device_info: Vec<DingDongDevice>,
+}
+
+/// The `<pairedList>` wrapper: nothing but repeated `<dingdongDeviceInfo>`.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongPairedList {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// The paired chimes, as printed.
+	#[serde(default, rename = "dingdongDeviceInfo")]
+	pub device_info: Vec<DingDongDevice>,
+}
+
+/// One `<dingdongDeviceInfo>` entry of the paired-chime list (msg 484).
+///
+/// Both documented spellings of each name are modelled (`deviceId`/`id`,
+/// `deviceName`/`name`, `netState`/`netstate`) because the reference client
+/// reads each tag with a fallback, and quick-xml matches names exactly. The
+/// values stay camera text.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongDevice {
+	/// `deviceId` spelling of the chime id.
+	#[serde(default, rename = "deviceId", skip_serializing_if = "Option::is_none")]
+	pub device_id: Option<String>,
+	/// `id` spelling of the chime id.
+	#[serde(default, rename = "id", skip_serializing_if = "Option::is_none")]
+	pub id: Option<String>,
+	/// `deviceName` spelling of the chime name (free text).
+	#[serde(default, rename = "deviceName", skip_serializing_if = "Option::is_none")]
+	pub device_name: Option<String>,
+	/// `name` spelling of the chime name.
+	#[serde(default, rename = "name", skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
+	/// `netState` spelling: documented as `0` offline, `1` online. The only
+	/// presence indicator the list offers — and the documentation is
+	/// incomplete: the field camera prints **`2`** for a chime that is paired
+	/// and answers its own per-chime reads. The value is kept as camera text;
+	/// nothing here reinterprets it.
+	#[serde(default, rename = "netState", skip_serializing_if = "Option::is_none")]
+	pub net_state: Option<String>,
+	/// `netstate` spelling of the same field.
+	#[serde(default, rename = "netstate", skip_serializing_if = "Option::is_none")]
+	pub netstate: Option<String>,
+}
+
+impl DingDongDevice {
+	/// The chime id — `deviceId` if present, else `id` — but **only when it
+	/// is a non-empty run of digits**: blocks without a numeric id are not
+	/// addressable, and the reference client skips them the same way.
+	pub fn identifier(&self) -> Option<&str> {
+		let raw = self.device_id.as_deref().or(self.id.as_deref())?;
+		let id = raw.trim();
+		if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+			Some(id)
+		} else {
+			None
+		}
+	}
+	/// The chime's display name, `deviceName` preferred, as camera text.
+	pub fn display_name(&self) -> Option<&str> {
+		self.device_name.as_deref().or(self.name.as_deref())
+	}
+	/// The online flag under whichever spelling arrived: `Some("1")` means
+	/// the chime answered its last keep-alive.
+	pub fn net_state(&self) -> Option<&str> {
+		self.net_state.as_deref().or(self.netstate.as_deref())
+	}
+	/// True only when the list says `1` — offline and unread both say no.
+	///
+	/// Strict on purpose, and **not** a presence test: this camera family also
+	/// prints `2` for a reachable chime, so a caller that wants "the chime to
+	/// talk to "must fall back to any entry with an
+	/// [`identifier`](Self::identifier) — which is what
+	/// [`crate::bc_protocol::BcCamera::get_ding_dong_cfg`] does.
+	pub fn is_online(&self) -> bool {
+		self.net_state() == Some("1")
+	}
+}
+
+/// The `<dingdongDeviceOpt>` carrier of msg 485. One element, three frames,
+/// told apart by `<opt>`: `getParam` (read; reply carries `name` / `volLevel`
+/// / `ledState`), `setParam` (write; **only the tags you pass** are sent) and
+/// `ringWithMusic` (`<id>` + `<musicId>`, makes the chime ring once).
+///
+/// `volLevel` is documented as "0-4 typical" — the firmware's real ceiling is
+/// **undocumented**. `musicId` is a free integer; **no melody list exists
+/// anywhere** in the protocol material, so the only guidance is the app's own
+/// picker. Values stay camera text like everywhere else in this module.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongDeviceOpt {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// `getParam` / `setParam` / `ringWithMusic`.
+	#[serde(default, rename = "opt", skip_serializing_if = "Option::is_none")]
+	pub opt: Option<String>,
+	/// The chime this frame addresses (a 484 list id).
+	#[serde(default, rename = "id", skip_serializing_if = "Option::is_none")]
+	pub id: Option<String>,
+	/// The chime's name — writable, free text, no documented length limit.
+	#[serde(default, rename = "name", skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
+	/// Chime volume, "0-4 typical"; true range undocumented.
+	#[serde(default, rename = "volLevel", skip_serializing_if = "Option::is_none")]
+	pub vol_level: Option<String>,
+	/// The chime's LED: `0` or `1`.
+	#[serde(default, rename = "ledState", skip_serializing_if = "Option::is_none")]
+	pub led_state: Option<String>,
+	/// Melody id for `ringWithMusic` / the event config. Integer, no list.
+	#[serde(default, rename = "musicId", skip_serializing_if = "Option::is_none")]
+	pub music_id: Option<String>,
+}
+
+/// The `<dingdongSilentMode>` block, msgs 609 (read: `<id>` in, `<time>`
+/// back) and 610 (write: `<id>` + `<time>` + hard-coded `<type>63</type>`).
+///
+/// `<time>` is the silent window; its unit is **undocumented** (seconds is
+/// what the app's mute picker appears to send, but nothing states it). The
+/// write RE-ARMS the countdown even for an unchanged value — which is why the
+/// core only sends this block when the text actually changed.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongSilent {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// The chime this applies to.
+	#[serde(default, rename = "id", skip_serializing_if = "Option::is_none")]
+	pub id: Option<String>,
+	/// The silent-mode value as the camera wrote it.
+	#[serde(default, rename = "time", skip_serializing_if = "Option::is_none")]
+	pub time: Option<String>,
+	/// Write frame only; `63` is copied from the reference client, meaning
+	/// unknown.
+	#[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+	pub type_: Option<String>,
+}
+
+/// One `<deviceCfg>` block of the per-event chime config (msg 486 reply;
+/// msg 487 writes one back inside a [`DingDongCfgReq`]).
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongDeviceCfg {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// The chime these events belong to (a 484 list id).
+	#[serde(default, rename = "id", skip_serializing_if = "Option::is_none")]
+	pub id: Option<String>,
+	/// Seen in 486 replies; role not established. Echoed by nothing — the
+	/// 487 write frame documents `id` only — so it is reported, not rewritten.
+	#[serde(default, rename = "ringId", skip_serializing_if = "Option::is_none")]
+	pub ring_id: Option<String>,
+	/// The chime's name, which the 486 reply prints beside its id (measured:
+	/// `Reolink Chime`). Read-only label — the writable name lives in the 485
+	/// frame.
+	#[serde(default, rename = "name", skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
+	/// The **chime's own firmware**, printed as the child `<version>` (measured
+	/// `00A2`). Not the XML `version` attribute this struct also carries, and
+	/// not writable: reported only.
+	#[serde(default, rename = "version", skip_serializing_if = "Option::is_none")]
+	pub firm_version: Option<String>,
+	/// One block per ringable event type the camera offers.
+	#[serde(default, rename = "alarminCfg", skip_serializing_if = "Vec::is_empty")]
+	pub alarmin_cfg: Vec<DingDongAlarmCfg>,
+}
+
+/// One `<alarminCfg>` entry: the ring switch and melody for one event type.
+///
+/// `<type>` is an event-type **string the camera chose** — passed verbatim
+/// into writes, no validation table exists (the recommendation is to only
+/// ever write types the camera itself returned). The switch arrives as
+/// `<valid>` in some paths and `<switch>` in others; both are modelled, and a
+/// write returns whichever arrived, under the `valid` spelling the 487 frame
+/// documents — omitted entirely if the camera printed neither.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongAlarmCfg {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Event type, camera-chosen string, passed verbatim everywhere.
+	#[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+	pub type_: Option<String>,
+	/// Switch, `valid` spelling (the 487 write frame's name).
+	#[serde(default, rename = "valid", skip_serializing_if = "Option::is_none")]
+	pub valid: Option<String>,
+	/// Same switch, `switch` spelling. (`switch_` in Rust — keyword.)
+	#[serde(default, rename = "switch", skip_serializing_if = "Option::is_none")]
+	pub switch_: Option<String>,
+	/// Melody id for this event. Integer, no documented list.
+	#[serde(default, rename = "musicId", skip_serializing_if = "Option::is_none")]
+	pub music_id: Option<String>,
+}
+
+impl DingDongAlarmCfg {
+	/// The ring switch text, `valid` preferred (its documented default when
+	/// the camera printed neither tag is effectively "off").
+	pub fn state(&self) -> Option<&str> {
+		self.valid.as_deref().or(self.switch_.as_deref())
+	}
+}
+
+/// The `<dingdongCfg>` wrapper — msg 487's request frame **and**, measured on
+/// the field camera, the root its 486 reply arrives under. The read therefore
+/// lands here rather than in the bare [`device_cfg`](Self::device_cfg) field,
+/// and [`BcXml::dingdong_events`] folds the two.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct DingDongCfgReq {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// The block(s) to store. This crate writes exactly one per request.
+	#[serde(default, rename = "deviceCfg")]
+	pub device_cfg: Vec<DingDongDeviceCfg>,
+}
+
+/// The whole chime configuration as one aggregate — the shape
+/// [`BcCamera::get_ding_dong_cfg`](crate::bc_protocol::BcCamera::get_ding_dong_cfg)
+/// returns and
+/// [`set_ding_dong_cfg`](crate::bc_protocol::BcCamera::set_ding_dong_cfg)
+/// accepts.
+///
+/// It is **not** one XML element: the firmware spreads the chime over five
+/// reads (484 list, 483 wired control, 485 params, 609 silent, 486 events),
+/// each of which a camera without that part may refuse. Every field is
+/// therefore an `Option`, and `Option<Vec>` distinguishes "the camera refused
+/// this part" (`None`) from "the camera answered with an empty list"
+/// (`Some(vec![])`). A `set` diffed against a fresh read writes **only the
+/// parts whose text differs** — the chime SETs carry side effects (the silent
+/// mode re-arms its countdown just by arriving), so "rewrite the received
+/// block" here means "re-send exactly the blocks whose tags changed, whole".
+#[derive(PartialEq, Eq, Default, Debug, Clone, Serialize)]
+pub struct DingDongCfg {
+	/// The chime the params/silent/event parts were read for: the first
+	/// numeric id in the 484 list, preferring one the list marks online.
+	/// `None` when no addressable chime is paired.
+	pub chime_id: Option<String>,
+	/// The 484 paired-chime list; `None` when the camera refused 484 **or**
+	/// answered it with no entries at all. Entries that carry a name but no
+	/// addressable id are **kept** — they are what the camera printed, and
+	/// [`list_answered_without_entry`](Self::list_answered_without_entry) is
+	/// what says none of them can be written to.
+	pub chimes: Option<Vec<DingDongDevice>>,
+	/// Msg 484 answered `200` and no entry — under either documented spelling
+	/// (`<dingdongDeviceInfo>`, `<dingdongList>`) or either id tag
+	/// (`<deviceId>`, `<id>`) — carried an id this bridge can address.
+	///
+	/// This is the field that separates "the camera has no paired wireless chime"
+	/// from "the camera answered 484, but in a shape this bridge cannot read"—
+	/// and it is the only honest way to
+	/// report a paired chime the inventory does not show. It publishes as
+	/// `status/chime/reason` next to an empty `status/chime/list`.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub list_answered_without_entry: bool,
+	/// The 483 hardwired-chime block; `None` when refused (normal on
+	/// wireless-only installs, where 483 is not answered as a block).
+	pub ctrl: Option<DingDongCtrl>,
+	/// The 485 `getParam` reply — the wireless chime's name/volume/LED;
+	/// `None` when refused or when no chime id could be picked.
+	pub params: Option<DingDongDeviceOpt>,
+	/// The 609 silent-mode block; same `None` conditions as
+	/// [`params`](Self::params).
+	pub silent: Option<DingDongSilent>,
+	/// The 486 per-event config; `None` when refused.
+	pub events: Option<Vec<DingDongDeviceCfg>>,
+}
+
+/// `<Ntp version="1.1">` — the clock-synchronisation block, read with msg
+/// **38** and written back with msg **39**.
+///
+/// Every value is kept as the **text the camera printed** (like
+/// [`AudioCfg`]): the setter is a read-modify-write of this same block, and a
+/// value that round-trips through an integer can come back formatted
+/// differently (`01`, `+01`) than the firmware wrote it, which is how a
+/// "successful" write silently changes a field nobody asked it to touch.
+/// `<synchronizeInterval>` is in **minutes** (the reference client's default
+/// is 1440, i.e. 24 h — inferred from its default, not from the camera).
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct Ntp {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel the block belongs to, as printed.
+	#[serde(
+		default,
+		rename = "channelId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub channel_id: Option<String>,
+	/// `1` = synchronise from the server, `0` = off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// NTP hostname, as the camera stored it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub server: Option<String>,
+	/// NTP port (the reference client's default is 123).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub port: Option<String>,
+	/// Re-sync period in **minutes**.
+	#[serde(
+		default,
+		rename = "synchronizeInterval",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub synchronize_interval: Option<String>,
+	/// Time zone the NTP sync should render in, printed as an offset in
+	/// seconds with the POSIX convention (UTC+1 → `-3600`).
+	#[serde(default, rename = "timeZone", skip_serializing_if = "Option::is_none")]
+	pub time_zone: Option<String>,
+}
+
+/// `<AutoReboot version="1.1">` — the weekly (or daily) automatic reboot,
+/// read with msg **101** and written with msg **100** (the ids are inverted
+/// relative to every other pair in this protocol: the setter is the lower).
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct AutoReboot {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// `1` = reboot on schedule, `0` = off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// `"Sunday"`…`"Saturday"`, or the special value `"everyday"`.
+	#[serde(default, rename = "weekDay", skip_serializing_if = "Option::is_none")]
+	pub week_day: Option<String>,
+	/// Hour of the reboot, `0`–`23`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub hour: Option<String>,
+	/// Minute of the reboot, `0`–`59`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub minute: Option<String>,
+	/// Second of the reboot, `0`–`59`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub second: Option<String>,
+}
+
+/// `<aiDenoise>` — the on-device denoiser applied to the camera microphone,
+/// read with msg **439** and written with msg **440**.
+///
+/// The element name is lower-case while its version attribute is documented
+/// as printed **capitalised** (`Version="1.1"`), so both spellings are
+/// carried: whichever the camera used comes back out, and the other stays
+/// absent. This block is the closest thing the protocol has to a microphone
+/// setting — no mic gain or mic mute exists anywhere in the surface that was
+/// measured on this doorbell).
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct AiDenoise {
+	/// XML Version, capitalised spelling (`<aiDenoise Version="1.1">`).
+	#[serde(default, rename = "@Version", skip_serializing_if = "Option::is_none")]
+	pub version_caps: Option<String>,
+	/// XML Version, lower-case spelling, for firmware that prints it that way.
+	#[serde(default, rename = "@version", skip_serializing_if = "Option::is_none")]
+	pub version: Option<String>,
+	/// `1` = denoiser on, `0` = off. The reference client notes that a
+	/// `level <= 0` also flips the denoiser off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// Strength, `1`–`100`; only applied while enabled.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub level: Option<String>,
+	/// Channel, where the firmware prints one.
+	#[serde(
+		default,
+		rename = "channelId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub channel_id: Option<String>,
+}
+
+/// `<sleepState>` — whether the (battery) camera is asleep, read with msg
+/// **574**. Read-only: no setter is documented, and putting a battery device
+/// to sleep from a settings write is not something this bridge does.
+///
+/// `<mode>` is numeric and its meaning is **undocumented**; it is relayed as
+/// text, never interpreted.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct SleepState {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// `1` = asleep, `0` = awake.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sleep: Option<String>,
+	/// Numeric, meaning undocumented.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mode: Option<String>,
+	/// PTZ park position (PTZ cameras only).
+	#[serde(default, rename = "panPos", skip_serializing_if = "Option::is_none")]
+	pub pan_pos: Option<String>,
+	/// PTZ park position (PTZ cameras only).
+	#[serde(default, rename = "tiltPos", skip_serializing_if = "Option::is_none")]
+	pub tilt_pos: Option<String>,
+	/// Image name the sleeping camera serves.
+	#[serde(default, rename = "imageName", skip_serializing_if = "Option::is_none")]
+	pub image_name: Option<String>,
+}
+
+/// `<WifiSignal>` — the Wi-Fi report, read with msg **115**.
+///
+/// `<signal>` is a number whose **unit is undocumented** (dBm or %; the
+/// reference client never converts it), so it is published as the camera's
+/// own text and no unit is claimed on the HA side.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct WifiSignal {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel, where printed.
+	#[serde(
+		default,
+		rename = "channelId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub channel_id: Option<String>,
+	/// Signal strength, unit undocumented.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub signal: Option<String>,
+}
+
+/// `<VideoInput>` — the image block, read with msg **26** and written with
+/// msg **25**. The five sliders (`bright`, `contrast`, `saturation`, `hue`,
+/// `sharpen`) are **0–255** on this family, defaults around 128.
+///
+/// The 26 reply carries this block **and** [`InputAdvanceCfg`]; the 25 setter
+/// wants both back, so [`BcCamera::set_image_cfg`](crate::bc_protocol::BcCamera::set_image_cfg)
+/// takes the pair as one [`crate::bc_protocol::ImageCfg`] carrier.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct VideoInput {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel the block belongs to, as printed.
+	#[serde(
+		default,
+		rename = "channelId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub channel_id: Option<String>,
+	/// Brightness slider, 0–255.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bright: Option<String>,
+	/// Contrast slider, 0–255.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub contrast: Option<String>,
+	/// Saturation slider, 0–255.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub saturation: Option<String>,
+	/// Hue slider, 0–255.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub hue: Option<String>,
+	/// Sharpness slider, 0–255.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sharpen: Option<String>,
+	/// IR-cut swap, as printed.
+	#[serde(default, rename = "irCutSwap", skip_serializing_if = "Option::is_none")]
+	pub ir_cut_swap: Option<String>,
+	/// Day/night mode, printed flat on this family (`color`, `auto`,
+	/// `blackAndWhite` are the values the reference client normalises to).
+	#[serde(default, rename = "dayNight", skip_serializing_if = "Option::is_none")]
+	pub day_night: Option<String>,
+	/// Whether the 9:16 corridor mode is available on this model.
+	#[serde(
+		default,
+		rename = "corridorAbility",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub corridor_ability: Option<String>,
+	/// Corridor (9:16 rotation) mode — the only mirror/rotation-shaped tag
+	/// the protocol has; no setter in the reference client writes it, so
+	/// `bairelay` only echoes what the camera printed.
+	#[serde(default, rename = "corridorMode", skip_serializing_if = "Option::is_none")]
+	pub corridor_mode: Option<String>,
+}
+
+/// `<InputAdvanceCfg>` — the second half of the image block, in the same 26
+/// reply as [`VideoInput`] and required by the same 25 setter. Field names
+/// keep the camera's mixed casing.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct InputAdvanceCfg {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel, where printed.
+	#[serde(
+		default,
+		rename = "channelId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub channel_id: Option<String>,
+	/// Exposure sub-block.
+	#[serde(default, rename = "Exposure", skip_serializing_if = "Option::is_none")]
+	pub exposure: Option<ExposureCfg>,
+	/// Scene mode, as printed.
+	#[serde(default, rename = "Scene", skip_serializing_if = "Option::is_none")]
+	pub scene: Option<String>,
+	/// Mains-frequency flicker suppression, as printed.
+	#[serde(
+		default,
+		rename = "PowerLineFrequency",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub power_line_frequency: Option<String>,
+	/// Digital channel marker, as printed.
+	#[serde(
+		default,
+		rename = "digitalChannel",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub digital_channel: Option<String>,
+}
+
+/// `<Exposure>` inside [`InputAdvanceCfg`].
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct ExposureCfg {
+	/// Exposure mode (lower-case on the wire).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mode: Option<String>,
+}
+
+/// `<OsdDatetime>` — the on-screen timestamp, read with msg **44** and
+/// written with msg **45**, in the same reply as [`OsdChannelName`].
+///
+/// `<topLeftX>`/`<topLeftY>` are **not pixels**: they are 16.16 normalised
+/// coordinates (`0` or `1` = start edge, `65536` = opposite edge). They are
+/// therefore kept as opaque camera text — this bridge never reinterprets or
+/// recomputes them.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct OsdDatetime {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel, as printed.
+	#[serde(default, rename = "channelId", skip_serializing_if = "Option::is_none")]
+	pub channel_id: Option<String>,
+	/// `1` = timestamp drawn, `0` = hidden.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// 16.16 normalised X, as printed.
+	#[serde(default, rename = "topLeftX", skip_serializing_if = "Option::is_none")]
+	pub top_left_x: Option<String>,
+	/// 16.16 normalised Y, as printed.
+	#[serde(default, rename = "topLeftY", skip_serializing_if = "Option::is_none")]
+	pub top_left_y: Option<String>,
+	/// Box width; the real unit behind it is undocumented.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub width: Option<String>,
+	/// Box height; the real unit behind it is undocumented.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub height: Option<String>,
+	/// OSD language, as printed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub language: Option<String>,
+}
+
+/// `<OsdChannelName>` — the on-screen camera name (and its watermark flag),
+/// in the same 44 reply as [`OsdDatetime`]. Not to be confused with the
+/// system device name (`<SystemGeneral><deviceName>`, msg 105).
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct OsdChannelName {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel, as printed.
+	#[serde(default, rename = "channelId", skip_serializing_if = "Option::is_none")]
+	pub channel_id: Option<String>,
+	/// The name drawn on the picture.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub name: Option<String>,
+	/// `1` = name drawn, `0` = hidden.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// 16.16 normalised X, as printed.
+	#[serde(default, rename = "topLeftX", skip_serializing_if = "Option::is_none")]
+	pub top_left_x: Option<String>,
+	/// 16.16 normalised Y, as printed.
+	#[serde(default, rename = "topLeftY", skip_serializing_if = "Option::is_none")]
+	pub top_left_y: Option<String>,
+	/// Watermark flag — a member of this block, not a root element.
+	#[serde(default, rename = "enWatermark", skip_serializing_if = "Option::is_none")]
+	pub en_watermark: Option<String>,
+	/// Background-colour flag, as printed.
+	#[serde(default, rename = "enBgcolor", skip_serializing_if = "Option::is_none")]
+	pub en_bgcolor: Option<String>,
+}
+
+/// `<Shelter>` — the privacy-mask block, read with msg **52**.
+///
+/// **Read-only here, deliberately.** The documented shape names a
+/// `shelterList` whose per-mask child tags (and the `pixel << 16 | canvas`
+/// coordinate coding) have no local capture, and the firmware "rejects, or
+/// silently cancels, a block that omits fields it sent"
+/// (observed on the operator's doorbell). Serialising this struct would therefore
+/// send back a block amputated of the masks themselves — exactly the failure
+/// the house rules forbid — so `set_privacy_masks` refuses instead of
+/// guessing. `enable`/`maxNum` are still worth reading.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct Shelter {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel, where printed.
+	#[serde(
+		default,
+		rename = "channelId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub channel_id: Option<String>,
+	/// `1` = masking active, `0` = off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// How many mask slots the model offers.
+	#[serde(default, rename = "maxNum", skip_serializing_if = "Option::is_none")]
+	pub max_num: Option<String>,
+	/// PTZ-only tracking masks: `bairelay` reads it to know the model has
+	/// them and never rewrites it.
+	#[serde(default, rename = "trackEnable", skip_serializing_if = "Option::is_none")]
+	pub track_enable: Option<String>,
+}
+
+/// `<MD version="1.1">` — the motion-detection block in the shape the msg
+/// **47** setter documents. Some firmwares print this same shape from the
+/// **46** getter; those may be written back. Others answer `<MdAlarm>`
+/// instead — see [`MdAlarm`] for why that carrier is read-only.
+///
+/// Sensitivity is **0–50, higher = more sensitive**, and lives in
+/// `<sensitivityDefault>`. The `<scope>` bitmap (96×64 = 6144 bits, base64)
+/// is kept as the camera's own text so a write of `enable`/`sensitivity`
+/// cannot damage the zones.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct MdCfg {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel, as printed.
+	#[serde(default, rename = "channelId", skip_serializing_if = "Option::is_none")]
+	pub channel_id: Option<String>,
+	/// `1` = motion detection on, `0` = off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// Whether the MD alarm is gated by the PIR, as printed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub usepir: Option<String>,
+	/// Zone-grid width in cells, as printed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub width: Option<String>,
+	/// Zone-grid height in cells, as printed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub height: Option<String>,
+	/// The zone bitmap carrier.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub scope: Option<MdScope>,
+	/// Sensitivity, 0–50, higher = more sensitive.
+	#[serde(
+		default,
+		rename = "sensitivityDefault",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub sensitivity_default: Option<String>,
+}
+
+/// `<scope>` inside [`MdCfg`]: the zone grid and its base64 bitmap.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct MdScope {
+	/// Grid columns, as printed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub columns: Option<String>,
+	/// Grid rows, as printed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rows: Option<String>,
+	/// Base64 bitmap, relayed untouched: 6144 bits the bridge does not decode.
+	#[serde(default, rename = "valueTable", skip_serializing_if = "Option::is_none")]
+	pub value_table: Option<String>,
+}
+
+/// `<MdAlarm>` — the shape the msg **46** getter is documented to answer on
+/// the firmwares measured on the operator's doorbell. Readable, **never
+/// written**: the block's "champs libres" are not enumerated anywhere, and a
+/// write built from this struct would drop them.
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct MdAlarm {
+	/// XML Version
+	#[serde(default, rename = "@version")]
+	pub version: String,
+	/// Channel, where printed.
+	#[serde(
+		default,
+		rename = "channelId",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub channel_id: Option<String>,
+	/// The enable/sensitivity pair this shape exposes.
+	#[serde(
+		default,
+		rename = "sensInfoNew",
+		skip_serializing_if = "Option::is_none"
+	)]
+	pub sens_info_new: Option<SensInfoNew>,
+}
+
+/// `<sensInfoNew>` inside [`MdAlarm`].
+#[derive(PartialEq, Eq, Default, Debug, Clone, Deserialize, Serialize)]
+pub struct SensInfoNew {
+	/// `1` = motion detection on, `0` = off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub enable: Option<String>,
+	/// Sensitivity, as printed (0–50 on the shapes that document a range).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sensitivity: Option<String>,
+	/// Alarm type, as printed.
+	#[serde(default, rename = "alarmType", skip_serializing_if = "Option::is_none")]
+	pub alarm_type: Option<String>,
+}
+
 /// Convience function to return the xml version used throughout the library
 pub fn xml_ver() -> String {
 	"1.1".to_string()
@@ -3074,4 +4307,254 @@ fn deeply_nested_input_does_not_overflow() {
 	xml.push_str("</body>");
 	let parsed = BcXml::try_parse(xml.as_bytes());
 	assert!(parsed.is_ok(), "unexpected parse error: {parsed:?}");
+}
+
+/// The 484 list arrives with either spelling of every name, and blocks
+/// without an addressable id must drop out — the reference client skips
+/// them, and an unaddressable chime would otherwise poison the pick.
+#[test]
+fn dingdong_list_decodes_both_spellings_and_skips_idless_blocks() {
+	let sample = indoc!(
+		r#"
+        <?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <dingdongDeviceInfo version="1.1">
+        <deviceId>1</deviceId>
+        <deviceName>Carillon</deviceName>
+        <netState>1</netState>
+        </dingdongDeviceInfo>
+        <dingdongDeviceInfo version="1.1">
+        <id>2</id>
+        <name>Second</name>
+        <netstate>0</netstate>
+        </dingdongDeviceInfo>
+        <dingdongDeviceInfo version="1.1">
+        <name>no id at all</name>
+        </dingdongDeviceInfo>
+        </body>
+    "#
+	);
+	let parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+	assert_eq!(parsed.dingdong_device_info.len(), 3);
+	let first = &parsed.dingdong_device_info[0];
+	assert_eq!(first.identifier(), Some("1"));
+	assert_eq!(first.display_name(), Some("Carillon"));
+	assert!(first.is_online());
+	let second = &parsed.dingdong_device_info[1];
+	assert_eq!(second.identifier(), Some("2"));
+	assert_eq!(second.display_name(), Some("Second"));
+	assert_eq!(second.net_state(), Some("0"));
+	assert!(!second.is_online());
+	// Skipped, not defaulted: neither tag, so no id is invented.
+	assert_eq!(parsed.dingdong_device_info[2].identifier(), None);
+}
+
+/// The msg 484 reply of a `v3.0.0.4636_25060550` doorbell with a paired chime,
+/// captured off the wire and copied here unedited. This exact block is what
+/// this model used to turn into the empty `{}` published as
+/// `status/chime/json`: `<dingdongList>` is a **container** whose entries sit
+/// under `<pairedList>`. The test is pinned to the field text, not to what the
+/// reference client's types imply.
+#[test]
+fn dingdong_list_container_decodes_the_field_capture() {
+	let capture = indoc!(
+		r#"
+        <?xml version="1.0" encoding="UTF-8" ?>
+        <body>
+        <dingdongList version="1.1">
+        <maxPairNumber>5</maxPairNumber>
+        <pairedList>
+        <dingdongDeviceInfo>
+        <id>882092649</id>
+        <netstate>2</netstate>
+        <name>Reolink Chime</name>
+        </dingdongDeviceInfo>
+        </pairedList>
+        </dingdongList>
+        </body>
+    "#
+	);
+	let parsed = BcXml::try_parse(capture.as_bytes()).unwrap();
+	let list = parsed.dingdong_list.as_ref().expect("the container itself decodes");
+	assert_eq!(list.max_pair_number.as_deref(), Some("5"), "how many chimes it will pair");
+	let chimes = parsed.dingdong_chimes();
+	assert_eq!(chimes.len(), 1, "one paired chime — not the empty block we used to read");
+	let chime = &chimes[0];
+	assert_eq!(chime.identifier(), Some("882092649"), "the id that unlocks 485 / 609");
+	assert_eq!(chime.display_name(), Some("Reolink Chime"));
+	assert_eq!(chime.net_state(), Some("2"));
+	// `2` is NOT the documented `1`. Kept as printed and called what it is:
+	// this camera's way of describing a chime that answers its own per-chime
+	// reads. Nothing here is allowed to quietly redefine the flag.
+	assert!(!chime.is_online(), "2 must not be silently read as online");
+}
+
+/// The msg 486 reply of the same camera, same capture session: the block
+/// arrives **wrapped in `<dingdongCfg>`** — the root the 487 write has always
+/// used — carrying the chime's name and its own firmware beside the id. Read
+/// only as bare `<deviceCfg>` elements at the body root, this reply decoded to
+/// nothing, which is how a camera that had just enumerated its melodies was
+/// reported as having none.
+#[test]
+fn dingdong_events_decode_the_wrapped_field_capture() {
+	let capture = indoc!(
+		r#"
+        <body>
+        <dingdongCfg version="1.1">
+        <deviceCfg>
+        <id>882092649</id>
+        <name>Reolink Chime</name>
+        <version>00A2</version>
+        <alarminCfg><type>visitor</type><valid>1</valid><musicId>0</musicId></alarminCfg>
+        <alarminCfg><type>people</type><valid>0</valid><musicId>0</musicId></alarminCfg>
+        <alarminCfg><type>vehicle</type><valid>0</valid><musicId>0</musicId></alarminCfg>
+        <alarminCfg><type>package</type><valid>0</valid><musicId>0</musicId></alarminCfg>
+        </deviceCfg>
+        </dingdongCfg>
+        </body>"#
+	);
+	let parsed = BcXml::try_parse(capture.as_bytes()).unwrap();
+	let events = parsed.dingdong_events();
+	assert_eq!(events.len(), 1, "the wrapped reply IS the reply");
+	assert!(parsed.device_cfg.is_empty(), "and the bare-root field stays untouched by it");
+	let dev = &events[0];
+	assert_eq!(dev.id.as_deref(), Some("882092649"));
+	assert_eq!(dev.name.as_deref(), Some("Reolink Chime"));
+	assert_eq!(dev.firm_version.as_deref(), Some("00A2"), "the child <version>, not the attribute");
+	assert_eq!(dev.version, "", "the reply carries no version attribute on deviceCfg");
+	let melodies = &dev.alarmin_cfg;
+	assert_eq!(melodies.len(), 4);
+	assert_eq!(melodies[0].type_.as_deref(), Some("visitor"));
+	assert_eq!(melodies[0].state(), Some("1"), "the chime rings on a visit");
+	assert_eq!(melodies[1].state(), Some("0"), "and not on a person");
+	assert_eq!(melodies[0].music_id.as_deref(), Some("0"));
+}
+
+/// A 483 refusal arrives as `<result>`, next to a `<bopen>0</bopen>` that is
+/// NOT a setting the operator made: on a battery doorbell with no wired chime
+/// the camera answers `adptNotAC`. The reason is reported, and a write frame
+/// built from such a read must not carry it back.
+#[test]
+fn dingdong_ctrl_reports_a_refusal_reason_without_returning_it() {
+	let parsed = BcXml::try_parse(
+		br#"<body><dingdongCtrl version="1.1"><opt>machineStateGet</opt><type>unknow</type><bopen>0</bopen><time>0</time><bsave>0</bsave><result>adptNotAC</result></dingdongCtrl></body>"#,
+	)
+	.unwrap();
+	let ctrl = parsed.dingdong_ctrl.unwrap();
+	assert_eq!(ctrl.result.as_deref(), Some("adptNotAC"));
+	assert_eq!(ctrl.switch_state(), Some("0"));
+	assert_eq!(ctrl.type_.as_deref(), Some("unknow"));
+}
+
+/// The 483 switch exists under two spellings and the read must record
+/// which one it saw, because a write sends back only the spelling the
+/// camera printed.
+#[test]
+fn dingdong_ctrl_accepts_bopen_and_enable_without_inventing_the_other() {
+	let parsed = BcXml::try_parse(
+		br#"<body><dingdongCtrl version="1.1"><enable>1</enable><time>30</time></dingdongCtrl></body>"#,
+	)
+	.unwrap();
+	let ctrl = parsed.dingdong_ctrl.unwrap();
+	assert_eq!(ctrl.enable.as_deref(), Some("1"));
+	assert_eq!(ctrl.bopen, None, "a camera that said `enable` never gets a `bopen` back");
+	assert_eq!(ctrl.switch_state(), Some("1"));
+	assert_eq!(ctrl.time.as_deref(), Some("30"));
+
+	let parsed = BcXml::try_parse(
+		br#"<body><dingdongCtrl version="1.1"><type>dingdong</type><bopen>0</bopen></dingdongCtrl></body>"#,
+	)
+	.unwrap();
+	let ctrl = parsed.dingdong_ctrl.unwrap();
+	assert_eq!(ctrl.switch_state(), Some("0"));
+	assert_eq!(ctrl.enable, None);
+
+	// The write keeps the spelling and stamps the documented frame tags.
+	let wire = String::from_utf8(BcXml::body_with_ding_dong_ctrl(&ctrl).serialize(vec![]).unwrap()).unwrap();
+	assert!(wire.contains("<opt>machineStateSet</opt>"), "{wire}");
+	assert!(wire.contains("<bopen>0</bopen>"), "{wire}");
+	assert!(wire.contains("<bsave>1</bsave>"), "{wire}");
+	assert!(!wire.contains("<enable>"), "must not add the spelling the camera didn't use: {wire}");
+	assert!(!wire.contains("<time>"), "must not invent a tag the read omitted: {wire}");
+}
+
+/// The 486 reply repeats `<deviceCfg>`, each with repeated `<alarminCfg>`,
+/// and the switch may arrive as `valid` or as `switch`.
+#[test]
+fn dingdong_device_cfg_decodes_repeated_blocks_and_both_switch_spellings() {
+	let sample = r#"
+        <body>
+        <deviceCfg version="1.1">
+        <id>1</id>
+        <ringId>7</ringId>
+        <alarminCfg version="1.1"><type>people</type><valid>1</valid><musicId>2</musicId></alarminCfg>
+        <alarminCfg version="1.1"><type>visitor</type><switch>0</switch><musicId>0</musicId></alarminCfg>
+        </deviceCfg>
+        <deviceCfg version="1.1">
+        <id>2</id>
+        <alarminCfg version="1.1"><type>car</type><valid>0</valid></alarminCfg>
+        </deviceCfg>
+        </body>"#;
+	let parsed = BcXml::try_parse(sample.as_bytes()).unwrap();
+	assert_eq!(parsed.device_cfg.len(), 2);
+	assert_eq!(parsed.device_cfg[0].id.as_deref(), Some("1"));
+	assert_eq!(parsed.device_cfg[0].ring_id.as_deref(), Some("7"));
+	let events = &parsed.device_cfg[0].alarmin_cfg;
+	assert_eq!(events.len(), 2);
+	assert_eq!(events[0].type_.as_deref(), Some("people"));
+	assert_eq!(events[0].state(), Some("1"));
+	assert_eq!(events[0].music_id.as_deref(), Some("2"));
+	assert_eq!(events[1].state(), Some("0"));
+	assert_eq!(events[1].valid, None, "the `switch` spelling must not be mirrored into `valid`");
+	// A missing musicId stays missing — the melody of an entry the camera
+	// didn't print is never implied.
+	assert_eq!(parsed.device_cfg[1].alarmin_cfg[0].music_id, None);
+
+	// The 487 request wraps exactly one block in <dingdongCfg>. The builder
+	// passes the frame through untouched (same law as the other chime
+	// builders), so the write path in `ding_dong.rs` builds its frame
+	// WITHOUT the read-only `ringId` — verified there against the wire.
+	let mut write_frame = parsed.device_cfg[0].clone();
+	write_frame.ring_id = None;
+	let wire =
+		String::from_utf8(BcXml::body_with_ding_dong_cfg(&write_frame).serialize(vec![]).unwrap())
+			.unwrap();
+	assert!(wire.contains("<dingdongCfg"), "{wire}");
+	assert!(wire.contains("<id>1</id>"), "{wire}");
+	assert!(wire.contains("<musicId>2</musicId>"), "{wire}");
+	assert!(!wire.contains("<ringId>"), "ringId is not part of the documented write frame: {wire}");
+}
+
+/// The 485 frames are exactly the documented tag sets: the read asks with
+/// `<opt>getParam</opt><id>`, the silent read asks with `<id>`, and the
+/// silent write stamps the hard-coded type but no `<opt>`.
+#[test]
+fn dingdong_request_frames_carry_only_the_documented_tags() {
+	let wire = String::from_utf8(BcXml::body_ding_dong_opt_get("1").serialize(vec![]).unwrap()).unwrap();
+	assert!(wire.contains("<dingdongDeviceOpt"), "{wire}");
+	assert!(wire.contains("<opt>getParam</opt>"), "{wire}");
+	assert!(wire.contains("<id>1</id>"), "{wire}");
+	assert!(!wire.contains("<volLevel>"), "a read must not carry writable tags: {wire}");
+
+	let wire = String::from_utf8(BcXml::body_ding_dong_ctrl_get().serialize(vec![]).unwrap()).unwrap();
+	assert!(wire.contains("<opt>machineStateGet</opt>"), "{wire}");
+
+	let wire = String::from_utf8(BcXml::body_ding_dong_silent_get("1").serialize(vec![]).unwrap()).unwrap();
+	assert!(wire.contains("<dingdongSilentMode"), "{wire}");
+	assert!(!wire.contains("<time>"), "the read carries only the id: {wire}");
+
+	let wire = String::from_utf8(
+		BcXml::body_with_ding_dong_silent(&DingDongSilent {
+			version: xml_ver(),
+			id: Some("1".into()),
+			time: Some("0".into()),
+			type_: None,
+		})
+		.serialize(vec![])
+		.unwrap(),
+	)
+	.unwrap();
+	assert!(wire.contains("<id>1</id>"), "{wire}");
+	assert!(wire.contains("<time>0</time>"), "{wire}");
+	assert!(wire.contains("<type>63</type>"), "the documented frame type must survive: {wire}");
 }

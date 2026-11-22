@@ -285,3 +285,24 @@ Bairelay release artefacts are bit-for-bit reproducible from `(commit, target tr
 - `SOURCE_DATE_EPOCH` is not consulted because no build date is embedded; the contract is the env-var-free baseline. Any future build-time date must go through `SOURCE_DATE_EPOCH` rather than `SystemTime::now()`.
 
 Out-of-tree caveat: `aws-lc-rs` (pulled via `rustls = "0.23"`) compiles C code whose `__DATE__`/`__TIME__` may leak into the static archive. If Debian packaging surfaces it, the documented fallback is the rustls `ring` feature flag — one call site in `crates/rtsp/src/server/tls.rs::install_*`.
+
+---
+
+## Two-way-audio and settings branch (modules)
+
+Modules added by the `two-way-audio-and-settings` branch, so the map stays true:
+
+| module | role |
+| --- | --- |
+| `src/oneshot/talk.rs` | `talk` one-shot: PCM/WAV file → ADPCM → camera speaker over the live session |
+| `src/oneshot/audio_bridge.rs` | `audio-bridge` one-shot: stdin/stdout PCM pipe for go2rtc backchannel sessions, silence keepalive, end-of-call preview publish |
+| `src/oneshot/talk_capability.rs` | probe: whether a camera answers the talk family at all |
+| `src/audio_control.rs` | talk-session audio plumbing (gain, framing, pacing) |
+| `src/settings.rs` + `crates/mqtt/src/settings.rs` | settings command family; MQTT switch/read/write entities |
+| `crates/mqtt/src/discovery/settings.rs` | discovery payloads for every settings entity |
+| `src/published_text_guard.rs` + `crates/mqtt/src/published_text_guard.rs` | last-mile sanitizer: text published on a firmware refusal can never carry raw payloads or credentials |
+| `src/wake_announcements.rs` + `crates/core/src/bcudp/announcement.rs` | permissive 0x31 wake-announcement decoding and event mapping |
+| `src/burst.rs` + `src/family_state.rs` | wake-burst budgeting and proven-command-family memory |
+| `src/polling.rs` | availability polling that survives doorbell sleep |
+| `src/startup_discovery.rs` | opt-in startup UID discovery (disabled by default) |
+| `src/oneshot/audio_settings.rs` / `chime_settings.rs` / `input.rs` / `pcm.rs` | settings one-shot surfaces and PCM input parsing |

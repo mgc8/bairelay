@@ -56,6 +56,31 @@ pub enum Error {
 		code: u16,
 	},
 
+	/// Refusal of a **settings read**, together with what the camera wrote in
+	/// answer.
+	///
+	/// Twin of [`Error::CameraServiceUnavailable`] extended with `detail`: the text of
+	/// the block received in answer to the refusal, where the twin returns only the
+	/// code. It is not one more field on the twin - its thirty-two construction sites
+	/// mostly have no XML block at hand (stream, login, PTZ, snapshot), and imposing
+	/// `detail: String::new()` everywhere to serve one family of commands would pay the
+	/// orchestra for one instrument.
+	/// soliste.
+	///
+	/// The `detail` is **already bounded** (see `cut` on the settings side); it is
+	/// never published as it arrives, `publishable_reason` handles that higher up.
+	#[error(
+		"Camera refused msg {id} with code {code}: {detail}"
+	)]
+	CameraRefused {
+		/// The message ID
+		id: u32,
+		/// The return code — same scale as [`Self::CameraServiceUnavailable`]
+		code: u16,
+		/// What the camera answered, one line, bounded
+		detail: String,
+	},
+
 	/// Raised when the camera responds with a status code over than OK during login
 	#[error("Camera responded with Err during login")]
 	CameraLoginFail,
@@ -253,6 +278,15 @@ pub enum Error {
 	/// A generic catch all error
 	#[error("Other error: {0}")]
 	Other(&'static str),
+
+	/// The caller asked for something the protocol forbids — a tag the
+	/// camera never printed, an id it never listed. Nothing went on the
+	/// wire. Not a camera fault and not a network fault: the caller fixes
+	/// it by not asking. (The chime family raises this from code that must
+	/// phrase the refusal per tag, so the text is dynamic; `Other` is
+	/// `&'static str` and cannot carry that.)
+	#[error("Usage error: {0}")]
+	Usage(String),
 
 	/// Cloud ("account camera") bundle minting against apis.reolink.com failed.
 	#[error("Cloud bundle mint failed: {0}")]
@@ -585,7 +619,7 @@ mod tests {
 	}
 
 	#[test]
-	fn nom_error_conversion_branches() {
+	fn name_error_conversion_branches() {
 		use nom::Needed;
 		// Incomplete(Size) → NomIncomplete(n)
 		let e: Error = nom::Err::Incomplete::<NomErrorType>(Needed::new(42)).into();

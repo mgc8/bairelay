@@ -16,6 +16,7 @@ use bairelay_rtsp::provider::{StreamError, StreamProvider, SubscriptionHandle};
 use bairelay_rtsp::url::StreamKind;
 
 use crate::camera::CameraHandle;
+use crate::config::StreamConfig;
 use crate::wake_lock::WakeLockGuard;
 
 /// Deadline the provider waits for the first video SDP parameters before
@@ -39,6 +40,65 @@ pub(crate) fn classify_presence(
 		AudioPresence::Absent => (false, std::time::Duration::ZERO),
 		AudioPresence::Unknown => (false, std::time::Duration::from_secs(2)),
 	}
+}
+
+/// How the `stream` option spells itself, so a refusal can quote the line the
+/// operator has to change.
+fn stream_option(config: StreamConfig) -> &'static str {
+	match config {
+		StreamConfig::None => "none",
+		StreamConfig::All => "all",
+		StreamConfig::Main => "main",
+		StreamConfig::Sub => "sub",
+		StreamConfig::Extern => "extern",
+	}
+}
+
+/// Answer a subscribe only for the streams this camera was configured to serve.
+///
+/// The URL suffix picks which stream a client *asks for*; `stream` in the
+/// camera's config block decides which ones the camera will *answer*. That split
+/// is the whole point of the option, and on a battery doorbell it is not a
+/// cosmetic one: a main-stream request nobody configured wakes the radio,
+/// brings the sensor up at full bitrate and holds the wake lock for the length
+/// of the session.
+///
+/// `all` is the default, and what every configuration that never mentioned the
+/// option gets, so this changes nothing for anyone who left it alone.
+///
+/// The refusal is `Unavailable` rather than a new error because that is the
+/// signal the RTSP server already acts on: an `extern` request answered
+/// unavailable is retried as `sub`. A camera configured `sub` therefore still
+/// serves `/extern`, on the substream, through that retry; a camera configured
+/// `main` refuses both halves of it and the client sees the error.
+fn serve_stream(
+	camera: &str,
+	configured: StreamConfig,
+	requested: StreamKind,
+) -> Result<(), StreamError> {
+	let allowed = match configured {
+		StreamConfig::All => true,
+		StreamConfig::None => false,
+		StreamConfig::Main => requested == StreamKind::Main,
+		StreamConfig::Sub => requested == StreamKind::Sub,
+		StreamConfig::Extern => requested == StreamKind::Extern,
+	};
+	if allowed {
+		return Ok(());
+	}
+	let message = if configured == StreamConfig::None {
+		format!(
+			"camera {camera:?} is configured with stream = \"none\" and serves no RTSP stream; \
+			 set stream = \"all\" (or the stream it should serve) to answer {requested}"
+		)
+	} else {
+		format!(
+			"camera {camera:?} is configured with stream = \"{}\"; refusing {requested}; \
+			 set stream = \"all\" to serve every stream",
+			stream_option(configured)
+		)
+	};
+	Err(StreamError::Unavailable(message))
 }
 
 /// Provider that adapts a camera registry into the RTSP `StreamProvider`
@@ -75,6 +135,11 @@ impl StreamProvider for CameraProvider {
 				return Err(StreamError::AccessDenied);
 			}
 		}
+
+		// Which streams this camera may serve. Before the wake lock on purpose:
+		// a request the camera will not serve must not cost a sleeping camera a
+		// wake-up, nor hold a reference that keeps it awake while it is refused.
+		serve_stream(camera, handle.config().stream, kind)?;
 
 		// Acquire a wake lock for the session. The guard rides inside
 		// the returned `SubscriptionHandle` and is dropped by the RTSP
@@ -215,5 +280,112 @@ mod tests {
 			.err()
 			.expect("acl denies bob");
 		assert!(matches!(err, StreamError::AccessDenied));
+	}
+
+	/// A provider around one camera configured with `stream`. The camera's
+	/// cancellation token is already cancelled, so a request that *passes* the
+	/// stream gate gets as far as `stream_source` and fails there, naming the
+	/// shutdown: that is how these tests tell "refused by the option" apart from
+	/// "allowed, and then no session behind it".
+	fn provider_serving(stream: StreamConfig) -> CameraProvider {
+		use crate::config::test_helpers::minimal_camera_config;
+		use tokio_util::sync::CancellationToken;
+		let mut cfg = minimal_camera_config("cam");
+		cfg.stream = stream;
+		let cancel = CancellationToken::new();
+		cancel.cancel();
+		let mut map = HashMap::new();
+		map.insert("cam".to_string(), Arc::new(CameraHandle::new(cfg, cancel, None)));
+		CameraProvider::new(Arc::new(map))
+	}
+
+	/// Subscribe and report why it failed. `pass` marks the shutdown failure: the
+	/// request cleared the gate and there was simply no session to serve it.
+	async fn outcome(provider: &CameraProvider, kind: StreamKind) -> String {
+		match provider.subscribe("cam", kind, None).await {
+			Ok(_) => "subscribed".to_string(),
+			Err(StreamError::Unavailable(msg)) if msg.contains("shutting down") => "pass".to_string(),
+			Err(StreamError::Unavailable(msg)) => msg,
+			Err(e) => format!("other: {e:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn stream_all_serves_every_stream() {
+		let provider = provider_serving(StreamConfig::All);
+		for kind in [StreamKind::Main, StreamKind::Sub, StreamKind::Extern] {
+			assert_eq!(outcome(&provider, kind).await, "pass", "{kind} is configured");
+		}
+	}
+
+	#[tokio::test]
+	async fn stream_none_refuses_every_stream_and_names_the_option() {
+		let provider = provider_serving(StreamConfig::None);
+		for kind in [StreamKind::Main, StreamKind::Sub, StreamKind::Extern] {
+			let why = outcome(&provider, kind).await;
+			assert!(why.contains("stream = \"none\""), "{kind}: {why}");
+			assert!(why.contains("stream = \"all\""), "{why} should name the line to change");
+		}
+	}
+
+	#[tokio::test]
+	async fn stream_main_serves_main_only() {
+		let provider = provider_serving(StreamConfig::Main);
+		assert_eq!(outcome(&provider, StreamKind::Main).await, "pass");
+		for kind in [StreamKind::Sub, StreamKind::Extern] {
+			let why = outcome(&provider, kind).await;
+			assert!(why.contains("stream = \"main\""), "{kind}: {why}");
+			assert!(why.contains(&format!("refusing {kind}")), "{kind}: {why}");
+		}
+	}
+
+	#[tokio::test]
+	async fn stream_sub_serves_sub_only() {
+		let provider = provider_serving(StreamConfig::Sub);
+		assert_eq!(outcome(&provider, StreamKind::Sub).await, "pass");
+		let why = outcome(&provider, StreamKind::Main).await;
+		assert!(why.contains("stream = \"sub\""), "the refusal quotes the option: {why}");
+		assert!(why.contains("refusing main"), "and names what it refused: {why}");
+		assert!(why.contains("stream = \"all\""), "and the way to allow it: {why}");
+	}
+
+	#[tokio::test]
+	async fn stream_extern_serves_extern_only() {
+		let provider = provider_serving(StreamConfig::Extern);
+		assert_eq!(outcome(&provider, StreamKind::Extern).await, "pass");
+		for kind in [StreamKind::Main, StreamKind::Sub] {
+			let why = outcome(&provider, kind).await;
+			assert!(why.contains("stream = \"extern\""), "{kind}: {why}");
+		}
+	}
+
+	/// The fallback the RTSP server runs on its side: an `extern` request that
+	/// comes back `Unavailable` is retried as `sub`. A camera configured for the
+	/// substream therefore *does* serve `/extern`, on the substream — the refusal
+	/// above is what routes it there, not what breaks it.
+	#[tokio::test]
+	async fn extern_on_a_sub_camera_ends_up_on_the_substream() {
+		let provider = provider_serving(StreamConfig::Sub);
+		let refused = outcome(&provider, StreamKind::Extern).await;
+		assert!(refused.contains("refusing extern"), "extern is refused: {refused}");
+		assert_eq!(
+			outcome(&provider, StreamKind::Sub).await,
+			"pass",
+			"the server's retry as sub must clear the gate, or /extern breaks"
+		);
+	}
+
+	/// The other half of the same rule: with `stream = "main"` there is nothing
+	/// for the fallback to fall back to, so both halves fail and the client gets
+	/// the error — twice the same reason, which is what the operator reads.
+	#[tokio::test]
+	async fn extern_on_a_main_camera_fails_twice() {
+		let provider = provider_serving(StreamConfig::Main);
+		let first = outcome(&provider, StreamKind::Extern).await;
+		let second = outcome(&provider, StreamKind::Sub).await;
+		for why in [&first, &second] {
+			assert!(why.contains("stream = \"main\""), "both halves name the option: {why}");
+		}
+		assert!(first.contains("refusing extern") && second.contains("refusing sub"));
 	}
 }

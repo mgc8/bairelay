@@ -11,7 +11,8 @@ use bairelay::cli::{Cli, Command};
 use bairelay::cli_convert::{should_emit_ansi, verbosity_env_filter};
 use bairelay::config::{
 	warn_deprecated_pause_fields, warn_idle_timeout_below_prune_floor,
-	warn_loopback_webhook_advertise, warn_neolink_compat_fields, warn_wire_debug_enabled,
+	warn_loopback_webhook_advertise, warn_neolink_compat_fields,
+	warn_startup_discovery_without_credentials, warn_uid_beyond_local, warn_wire_debug_enabled,
 };
 use bairelay::local_time::LocalTimer;
 use bairelay::mqtt_loop::{
@@ -101,6 +102,40 @@ async fn async_main() -> Result<()> {
 		return Ok(());
 	}
 
+	// `audio-check` is the local-only audio check: it reads one file, runs
+	// the talk encoder and the project's own decoder over it, and prints the
+	// numbers. Like `render-hassio-config` it must not read the config file or
+	// touch a camera, so it is dispatched here as well.
+	if let Command::AudioCheck {
+		file,
+		raw,
+		header,
+		compare,
+		block_length,
+		bench,
+	} = &cli.command
+	{
+		let outcome = bairelay::audio_control::command(
+			file.clone(),
+			*raw,
+			header.clone(),
+			*block_length,
+			*bench,
+			*compare,
+		)
+		.await;
+		if let Err(e) = outcome {
+			eprintln!("{e}");
+			// Same exit table the one-shot commands use: 2 for a bad
+			// invocation, 1 for anything else.
+			let usage = e
+				.downcast_ref::<bairelay::oneshot::errors::UsageError>()
+				.is_some();
+			std::process::exit(if usage { 2 } else { 1 });
+		}
+		return Ok(());
+	}
+
 	// One-shot subcommands exit before any MQTT / RTSP / orchestrator
 	// bring-up; service modes fall through to the existing pipeline.
 	if cli.is_oneshot() {
@@ -130,6 +165,13 @@ async fn async_main() -> Result<()> {
 	// than the global `stream_prune_grace_secs`; the runtime clamps
 	// silently, this warning makes the override visible.
 	warn_idle_timeout_below_prune_floor(&config);
+	// Which of the twelve relay hostnames this camera's uid will reach, and why that is
+	// the network's DNS business rather than ours.
+	warn_uid_beyond_local(&config);
+	// The startup scan is armed but has no credentials to adopt anything with: said
+	// before the first broadcast goes out, because the alternative is that a camera
+	// answers and the log reads as though the LAN were empty.
+	warn_startup_discovery_without_credentials(&config);
 
 	info!(
 		cameras = config.cameras.len(),
@@ -139,6 +181,21 @@ async fn async_main() -> Result<()> {
 
 	// Set up cancellation token (shutdown-signal handler registered after MQTT is ready).
 	let token = CancellationToken::new();
+
+	// Ask the network who is there, once, before anything reads the camera list: the
+	// orchestrator's map, the wake server's list of declared UIDs, the MQTT discovery
+	// payloads and the "Managing N camera(s)" line are all built from what comes back,
+	// so a camera that is discovered has to be in the list before they are. Returns
+	// immediately, having done nothing at all, unless `[startup_discovery]` says
+	// `enable = true`; the wait is bounded and shutdown cuts it short.
+	let config = bairelay::startup_discovery::adopt(config, &token).await;
+
+	// The wake server explains a refused wake request when it names a camera this
+	// bridge declares, so the list is collected here — after the scan above, so that
+	// a camera the scan adopted is one this bridge will explain a wake for rather than
+	// refuse as unknown — and before `config` is moved into the orchestrator.
+	let declared_uids: Vec<String> =
+		config.cameras.iter().filter_map(|c| c.uid.clone()).collect();
 
 	// Capture the MQTT topic prefix (default "bairelay") — must be read
 	// before `config` is consumed by the orchestrator below. The
@@ -517,6 +574,24 @@ async fn async_main() -> Result<()> {
 			let runtime =
 				bairelay_wake_server::config::RuntimeConfig::from_block(&ws_block, bind_ip)
 					.map_err(|e| anyhow::anyhow!("[wake_server] {e}"))?;
+			let runtime = runtime.with_declared_uids(declared_uids);
+			// The consumer has to be running before the register loop starts: an
+			// announcement heard while no observer is installed is a wake that
+			// nobody will ever read. It takes the same camera map the MQTT dispatch
+			// uses, so an announcement is routed by the same uid rules as everything
+			// else.
+			let cameras_for_announcements = orchestrator.cameras_arc();
+			let mqtt_for_announcements = orchestrator.mqtt_client().cloned();
+			let prefix_for_announcements = topic_prefix.clone();
+			sup.spawn("wake_announcements", move |cancel| async move {
+				bairelay::wake_announcements::run(
+					cameras_for_announcements,
+					mqtt_for_announcements,
+					prefix_for_announcements,
+					cancel,
+				)
+				.await;
+			});
 			let middleman_addr = std::net::SocketAddr::new(runtime.bind, runtime.middleman_port);
 			let register_addr = std::net::SocketAddr::new(runtime.bind, runtime.register_port);
 			let middleman_sock = tokio::net::UdpSocket::bind(middleman_addr)

@@ -21,7 +21,9 @@ impl AiObject {
 		AiObject::Package,
 	];
 
-	/// Lower-case name used in topics and unique-id suffixes.
+	/// Lower-case name used in topics and unique-id suffixes. **Wire surface**:
+	/// these strings are MQTT topics and Home Assistant `unique_id`s, so changing
+	/// one moves the entity instead of renaming it. They are not labels.
 	pub fn topic_name(self) -> &'static str {
 		match self {
 			AiObject::Person => "person",
@@ -32,7 +34,9 @@ impl AiObject {
 		}
 	}
 
-	/// Entity display name in Home Assistant.
+	/// Entity display name in Home Assistant: the class word inside the
+	/// label (`Person detection`). Capitalised because Home Assistant shows it as
+	/// the entity's name.
 	pub fn display_name(self) -> &'static str {
 		match self {
 			AiObject::Person => "Person",
@@ -42,6 +46,7 @@ impl AiObject {
 			AiObject::Package => "Package",
 		}
 	}
+
 
 	/// Material Design icon of the entity.
 	pub fn icon(self) -> &'static str {

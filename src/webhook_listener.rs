@@ -622,7 +622,13 @@ async fn dispatch(
 			}
 			// A press is news even when a push edge already woke the camera.
 			if let Some(publisher) = &publisher {
-				report_doorbell_press(handle.name(), publisher, &handle.status_cache()).await;
+				report_doorbell_press(
+					handle.name(),
+					publisher,
+					&handle.status_cache(),
+					Some(&handle),
+				)
+				.await;
 			}
 		}
 		Action::Wake(WakeReason::Pir) => {
@@ -679,6 +685,7 @@ async fn dispatch(
 					caps,
 					&mut stream.report,
 					&update,
+					None,
 				)
 				.await;
 			}
@@ -1361,6 +1368,7 @@ mod tests {
 			Default::default(),
 			&mut AlarmReport::default(),
 			&press,
+			None,
 		)
 		.await;
 		assert_eq!(local.presses(), 1);
@@ -1532,7 +1540,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn eof_before_a_complete_request_gets_400() {
+	async fn eof_before_a_completes_request_gets_400() {
 		let rig = rig().await;
 		let mut sock = TcpStream::connect(("127.0.0.1", rig.port)).await.unwrap();
 		sock.write_all(format!("POST {} HTTP/1.1\r\n", rig.hook_path()).as_bytes())
@@ -1774,7 +1782,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_request_read_one_byte_at_a_time_is_read_whole() {
+	async fn a_request_streamed_byte_by_byte_is_still_read_whole() {
 		let raw = post_request("/hook/x", WAKE_DOORBELL);
 		let mut reader = Chunks(raw.iter().map(|b| vec![*b]).collect());
 		assert_eq!(read_request(&mut reader).await, Ok(raw));

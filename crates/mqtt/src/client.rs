@@ -123,7 +123,7 @@ impl SharedMqttClient {
 	/// to attach an observable capture sink. Not part of the public
 	/// API — the double-underscore prefix flags it as internal.
 	#[doc(hidden)]
-	pub fn __test_new_with_capture(client: AsyncClient, capture: CaptureSink) -> Self {
+	pub fn test_new_with_capture(client: AsyncClient, capture: CaptureSink) -> Self {
 		Self {
 			client,
 			capture: Some(capture),
@@ -241,7 +241,7 @@ pub fn connect(
 ) -> Result<(SharedMqttClient, MqttEventLoop), MqttError> {
 	let mut opts = config.to_mqtt_options(client_id);
 	opts.set_last_will(LastWill::new(
-		format!("{topic_prefix}/status"),
+		crate::topics::bridge_status(topic_prefix),
 		"offline",
 		QoS::AtLeastOnce,
 		true,

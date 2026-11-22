@@ -119,6 +119,32 @@ pub async fn resolve_host(host: &str) -> anyhow::Result<Vec<IpAddr>> {
 	Ok(ips)
 }
 
+/// Why a configured `address` failed to contribute a known IP address **and nobody
+/// else says so**.
+///
+/// That is a narrower question than "why is there no address", and the narrower answer
+/// is the honest one: a host name is already reported by `build_bc_opts_resolved`,
+/// which owns that case and has a rule about how loudly to report it. What is left is
+/// the value that does not parse, which no path mentions at all — the `if let Some(Ok(
+/// ..))` above swallows it, discovery quietly loses its unicast destination, and the
+/// operator's file appears to name a camera that the bridge then cannot wake.
+///
+/// `None` therefore means: no address configured (a choice), a usable IP literal, or a
+/// name (owned elsewhere).
+fn unusable_address_reason(cfg: &CameraConfig) -> Option<&'static str> {
+	let raw = cfg.address.as_deref()?;
+	match parse_address(raw) {
+		// A name is not this path's to report. `build_bc_opts_resolved` owns that
+		// case: it warns once when resolution fails and a uid can carry the attempt,
+		// and it stays deliberately silent when there is no uid, because the error it
+		// returns names the host and the caller logs it. Two tests pin both halves of
+		// that contract, and a second warning here would contradict the silence that
+		// one of them asserts.
+		Ok(_) => None,
+		Err(_) => Some("the value is not a parseable address"),
+	}
+}
+
 /// Build a `BcCameraOpt` from the service `CameraConfig` using the same
 /// rules the long-running camera connect loop uses. Hostnames are not
 /// resolved here; see [`build_bc_opts_resolved`].
@@ -132,8 +158,24 @@ pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
 		}
 		port = parsed.port;
 	}
+	// An address that cannot be used as a known address is not a TCP problem: the
+	// TCP connect path resolves names elsewhere. It is a wake problem, and a quiet
+	// one. Local discovery sends its client-initiated packet to the broadcasts on
+	// 2015/2018 plus every address in this list, so with an empty list it broadcasts
+	// and nothing more — and a doorbell on battery that is asleep does not hear a
+	// broadcast. Say so once, loudly, at the level the operator reads, instead of
+	// letting the field evidence be a camera that never answers.
+	if let Some(reason) = unusable_address_reason(cfg) {
+		tracing::warn!(
+			name = %cfg.name,
+			address = cfg.address.as_deref().unwrap_or(""),
+			reason,
+			"camera address gives the bridge no known IP address: local discovery will 			 broadcast only, which a sleeping battery camera cannot hear"
+		);
+	}
 
 	let discovery = match cfg.discovery {
+		config::DiscoveryMethod::None => DiscoveryMethods::None,
 		config::DiscoveryMethod::Local => DiscoveryMethods::Local,
 		config::DiscoveryMethod::Remote => DiscoveryMethods::Remote,
 		config::DiscoveryMethod::Map => DiscoveryMethods::Map,
@@ -164,6 +206,43 @@ pub fn build_bc_opts(cfg: &CameraConfig) -> BcCameraOpt {
 		cloud_refresh_token: cfg.cloud_refresh_token.clone(),
 		debug: cfg.debug.unwrap_or(false),
 	}
+}
+
+/// The options for the one deferred attempt a parked camera is allowed.
+///
+/// Unlike [`build_bc_opts`] this builder takes the addresses from the caller
+/// and pins everything that could put a packet on the air:
+///
+/// * `addrs` is exactly the addresses the caller can prove, and an empty list
+///   means no attempt at all. This function returns `None` in that case rather
+///   than build options that would fall through to discovery.
+/// * `protocol` is TCP. The UDP arm of `find_camera_with_discoverer` needs a
+///   uid, and the uid is dropped below, so discovery cannot be entered even if
+///   the two guards below were somehow removed.
+/// * `uid` is dropped. With no uid there is nothing to look up, so the local
+///   broadcast, the remote lookup, the map and the relay are all unreachable.
+/// * `discovery` is `DiscoveryMethods::None`, documented upstream as "Forbid
+///   all discovery methods. Only TCP connections with known addresses will
+///   work". This is not belt-and-braces over the previous point, it is the
+///   reason the previous point holds: the operator's `discovery` key is not
+///   inherited here, so a configuration that says `relay` cannot make the
+///   automatic path contact a Reolink server. The default for that key is
+///   `Relay`, so inheriting it would mean shipping an unbounded path to the
+///   real cloud on every failed attempt.
+///
+/// What a user asked for is a different matter and keeps the full reach: this
+/// function is only for the attempt the timer takes on the operator's behalf.
+pub fn build_retry_bc_opts(cfg: &CameraConfig, proven: &[IpAddr]) -> Option<BcCameraOpt> {
+	let mut opts = build_bc_opts(cfg);
+	if proven.is_empty() {
+		return None;
+	}
+	opts.addrs = proven.to_vec();
+	opts.uid = None;
+	opts.protocol = ConnectionProtocol::Tcp;
+	opts.discovery = DiscoveryMethods::None;
+	opts.max_discovery_retries = 0;
+	Some(opts)
 }
 
 /// [`build_bc_opts`] plus DNS resolution of a hostname `address`, run
@@ -202,6 +281,54 @@ pub fn max_encryption(cfg: &CameraConfig) -> MaxEncryption {
 
 #[cfg(test)]
 mod tests {
+	/// The three shapes an operator writes, and what this path can do with them.
+	#[test]
+	fn an_address_that_yields_no_known_ip_says_which_kind_it_is() {
+		let base = CameraConfig {
+			name: "Doorbell".into(),
+			..CameraConfig::default()
+		};
+		let mut ip = base.clone();
+		ip.address = Some("192.0.2.10:9000".into());
+		assert_eq!(unusable_address_reason(&ip), None, "an IP literal is usable");
+
+		// A name is not ours to report: `build_bc_opts_resolved` warns once when it
+		// cannot resolve one and a uid can carry the attempt, and asserts its own
+		// silence when there is no uid. A second warning here would make that
+		// deliberate silence false, which is what two existing tests are for.
+		let mut named = base.clone();
+		named.address = Some("doorbell.lan:9000".into());
+		assert_eq!(unusable_address_reason(&named), None, "the name belongs to the resolved builder");
+
+		let mut broken = base.clone();
+		broken.address = Some("192.0.2.10:9000:extra".into());
+		assert_eq!(
+			unusable_address_reason(&broken),
+			Some("the value is not a parseable address"),
+			"a malformed value must be named as such"
+		);
+
+		// No address at all is a choice, not a mistake: nothing to warn about.
+		assert_eq!(unusable_address_reason(&base), None);
+	}
+
+	/// The warning must not fire on the path that does resolve names, because that
+	/// path does get an address: the guard is about this builder, not about the file.
+	#[test]
+	fn a_hostname_still_reaches_the_resolved_builder() {
+		let mut cfg = CameraConfig {
+			name: "Doorbell".into(),
+			address: Some("doorbell.lan".into()),
+			..CameraConfig::default()
+		};
+		let opts = build_bc_opts(&cfg);
+		assert!(opts.addrs.is_empty(), "this builder does not resolve names");
+		cfg.address = Some("192.0.2.10".into());
+		let opts = build_bc_opts(&cfg);
+		assert_eq!(opts.addrs.len(), 1, "an IP literal is carried to discovery");
+		assert_eq!(opts.port, None, "no port written means no port forced");
+	}
+
 	use super::*;
 
 	fn sample_cfg() -> CameraConfig {
@@ -481,5 +608,45 @@ mod tests {
 		assert_eq!(opts.uid.as_deref(), Some("UIDCAM1"));
 		assert_eq!(logs.matches("WARN").count(), 1, "{logs}");
 		assert!(logs.contains("trying UID discovery"), "{logs}");
+	}
+
+	/// The deferred attempt must be structurally incapable of reaching a
+	/// server, so the test sets the configuration to the widest reach the
+	/// operator can ask for and checks what survives.
+	#[test]
+	fn the_deferred_attempt_cannot_reach_a_server_even_when_the_toml_asks_for_the_relay() {
+		let mut cfg = sample_cfg();
+		cfg.address = Some("192.168.1.9:9000".into());
+		cfg.uid = Some("UIDCAM1".into());
+		cfg.discovery = config::DiscoveryMethod::Relay;
+		let proven: Vec<std::net::IpAddr> = vec!["192.168.1.9".parse().unwrap()];
+		let opts = build_retry_bc_opts(&cfg, &proven).expect("one proven address is enough");
+		assert!(opts.uid.is_none(), "nothing to look up, so nothing to broadcast");
+		assert!(
+			matches!(opts.protocol, ConnectionProtocol::Tcp),
+			"TCP only: {:?}",
+			opts.protocol
+		);
+		assert_eq!(
+			opts.discovery,
+			DiscoveryMethods::None,
+			"the operator's relay is not inherited"
+		);
+		assert_eq!(opts.addrs, proven, "only the addresses that were handed in");
+		assert_eq!(opts.max_discovery_retries, 0);
+		// The same configuration, on the normal path, still has its reach: the
+		// narrowing belongs to the deferred attempt and to nothing else.
+		let normal = build_bc_opts(&cfg);
+		assert_eq!(normal.uid.as_deref(), Some("UIDCAM1"));
+		assert_eq!(normal.discovery, DiscoveryMethods::Relay);
+	}
+
+	#[test]
+	fn the_deferred_attempt_is_not_built_without_a_proven_address() {
+		let cfg = sample_cfg();
+		assert!(
+			build_retry_bc_opts(&cfg, &[]).is_none(),
+			"no address means no attempt, not an attempt that goes looking"
+		);
 	}
 }

@@ -1509,6 +1509,32 @@ async fn connect() -> Result<UdpSocket> {
 	Ok(socket)
 }
 
+/// Where a local discovery broadcast has to go: the global broadcast address plus
+/// each interface's own broadcast address, once per port.
+///
+/// Published for the one caller that has to speak discovery without a uid — the
+/// binary's startup scan, which cannot look a camera up because looking one up is
+/// what it is trying to avoid. Which addresses reach the LAN is a property of the
+/// host's interfaces, not of that caller, so the list is derived here instead of
+/// being rebuilt there: a second implementation would be free to drift, and the
+/// day it did, the scan would quietly stop covering the network it claims to
+/// cover while still reporting that nothing answered.
+pub fn broadcast_destinations(ports: &[u16]) -> Result<Vec<SocketAddr>> {
+	get_broadcasts(ports)
+}
+
+/// A socket able to send [`broadcast_destinations`]: bound inside the port range
+/// discovery uses, with `SO_BROADCAST` set.
+///
+/// Same reasoning as for the destinations. The bind range is not incidental — it
+/// is where a camera has been seen to expect a client, and a firewall opened for
+/// discovery is opened for it — so a scan that bound its own socket elsewhere
+/// could send the right packet from a port the camera's own rules drop, and fail
+/// in a way that looks like an empty network.
+pub async fn broadcast_socket() -> Result<UdpSocket> {
+	connect().await
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
 	//! Scripted `CameraDiscoverer` for driving `find_camera_with_discoverer`

@@ -244,6 +244,18 @@ pub async fn handle_connack(
 	topic_prefix: &str,
 ) {
 	tracing::info!("MQTT broker connected");
+	// The bridge declares its own availability before any re-publication of discovery:
+	// every entity attaches it to `{prefix}/status`, so publishing this first keeps Home
+	// Assistant from transiently seeing entities whose availability topic still
+	// carries the old
+	// `offline`. Pure MQTT traffic: no command to the device, which a battery chime
+	// requires.
+	if let Err(e) = mqtt
+		.publish_retained(&bairelay_mqtt::topics::bridge_status(topic_prefix), b"online")
+		.await
+	{
+		tracing::warn!(error = %e, "Le pont n'a pas pu publish_now sa disponibilite");
+	}
 	// Subscribe all cameras (not just connected ones — we need to
 	// receive wakeup commands for sleeping cameras too). When the
 	// broker is misbehaving every camera fails in the same way; log

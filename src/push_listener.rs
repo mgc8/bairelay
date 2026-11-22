@@ -108,6 +108,8 @@ pub async fn run_with_listener(
 		"Push listener started"
 	);
 
+	// One report per source per window: see [`Misses`].
+	let mut misses = Misses::default();
 	loop {
 		tokio::select! {
 			_ = cancel.cancelled() => {
@@ -118,7 +120,16 @@ pub async fn run_with_listener(
 				match accept {
 					Ok((sock, peer)) => {
 						drop(sock);
-						handle_push(peer.ip(), &registry, &cameras, mqtt.as_ref(), &topic_prefix, &cfg, &cancel);
+						handle_push(
+							peer.ip(),
+							&registry,
+							&cameras,
+							mqtt.as_ref(),
+							&topic_prefix,
+							&cfg,
+							&cancel,
+							&mut misses,
+						);
 					}
 					Err(e) => {
 						tracing::warn!(error = %e, "push listener accept failed");
@@ -141,20 +152,33 @@ fn handle_push(
 	topic_prefix: &str,
 	cfg: &RuntimeConfig,
 	cancel: &CancellationToken,
+	misses: &mut Misses,
 ) {
 	let Some((registry_uid, _entry)) =
 		registry.lookup_by_ip(peer_ip, Instant::now(), cfg.stale_after)
 	else {
-		tracing::debug!(peer_ip = %peer_ip, "push from unknown IP — no registry match");
+		// This is where a doorbell press dies quietly. The registry lives in RAM,
+		// so between a module restart and this camera's next beat every push is
+		// unmatchable: that has to be said at the level the operator reads, naming
+		// the address and saying what was thrown away.
+		if misses.report(peer_ip, Instant::now()) {
+			tracing::info!(
+				peer_ip = %peer_ip,
+				fresh_window_ms = cfg.stale_after.as_millis() as u64,
+				"push listener discarded a connection: no camera is registered from 				 this address inside the freshness window, so no motion event was 				 published and no wake was held. The registry is memory-only: it is 				 empty after a restart until this camera's next beat."
+			);
+		}
 		return;
 	};
 
 	let Some(handle) = match_camera_by_uid(cameras, &registry_uid) else {
-		tracing::debug!(
-			peer_ip = %peer_ip,
-			registry_uid = %registry_uid,
-			"push matched registry UID but no camera handle has a matching configured UID"
-		);
+		if misses.report(peer_ip, Instant::now()) {
+			tracing::info!(
+				peer_ip = %peer_ip,
+				registry_uid = %registry_uid,
+				"push listener discarded a connection: the address belongs to a 				 registered camera but no configured camera carries that UID, so no 				 motion event was published and no wake was held"
+			);
+		}
 		return;
 	};
 
@@ -173,7 +197,53 @@ fn handle_push(
 	}
 }
 
+/// Report rate limit for discarded pushes: one line per source address per
+/// window, and a bounded number of addresses remembered. A camera retrying a push
+/// it will never get would otherwise write one line per connection, and a peer
+/// spraying addresses must not be able to grow this map. The reasoning is the one
+/// the register server's retransmission memory uses.
+#[derive(Default)]
+struct Misses {
+	last: HashMap<IpAddr, Instant>,
+}
+
+impl Misses {
+	/// Window between two reports for one address: long enough that a burst of
+	/// retries is a single line, short enough that an outage keeps showing up
+	/// while it lasts.
+	const WINDOW: Duration = Duration::from_secs(30);
+	/// Cap on remembered addresses; the oldest gives way.
+	const HOSTS: usize = 64;
+
+	fn report(&mut self, peer_ip: IpAddr, now: Instant) -> bool {
+		if let Some(seen) = self.last.get(&peer_ip) {
+			if now - *seen < Self::WINDOW {
+				return false;
+			}
+		}
+		if !self.last.contains_key(&peer_ip) && self.last.len() >= Self::HOSTS {
+			let oldest = self.last.iter().min_by_key(|(_, when)| **when).map(|(ip, _)| *ip);
+			if let Some(ip) = oldest {
+				self.last.remove(&ip);
+			}
+		}
+		self.last.insert(peer_ip, now);
+		true
+	}
+}
+
 /// Resolve a `(name → CameraHandle)` map entry from a registry-side UID.
+///
+/// The uid a camera writes on the network is the short form: 16 characters, no
+/// firmware suffix. A configured uid may be that same form or the long form that
+/// carries the suffix, depending on where the operator copied it from. So the two
+/// relate by prefix **in either direction**, and testing one direction only — which
+/// this function used to do — silently matches nothing when the configuration
+/// carries the long form: a 16-character registry uid is never prefixed by a
+/// 20-character configured one, and the event that arrived is thrown away as if
+/// nobody owned it. The longest shared prefix wins, so two cameras whose uids share
+/// a root cannot quietly cross, and the name breaks a tie so the answer does not
+/// depend on hash order.
 /// Long-form (firmware-suffixed) UIDs from `D2R_HB` need to match short
 /// configured UIDs via `starts_with`, mirroring
 /// [`CameraRegistry::lookup_fresh`].
@@ -193,13 +263,19 @@ pub(crate) fn match_camera_by_uid<'a>(
 ) -> Option<&'a Arc<CameraHandle>> {
 	cameras
 		.values()
-		.filter(|h| {
-			h.config()
-				.uid
-				.as_deref()
-				.is_some_and(|cfg_uid| registry_uid.starts_with(cfg_uid))
+		.filter_map(|h| {
+			let configured = h.config().uid.as_deref()?;
+			let related =
+				registry_uid.starts_with(configured) || configured.starts_with(registry_uid);
+			related.then(|| (common_prefix_len(configured, registry_uid), h.name(), h))
 		})
-		.max_by_key(|h| h.config().uid.as_deref().map_or(0, str::len))
+		.max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+		.map(|(_, _, handle)| handle)
+}
+
+/// Length of the shared prefix of two strings, in bytes.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+	a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]
@@ -214,6 +290,72 @@ mod tests {
 		let mut cfg = minimal_camera_config(name);
 		cfg.uid = uid.map(str::to_string);
 		Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None))
+	}
+
+	#[test]
+	fn a_discarded_push_is_reported_once_per_source_per_window() {
+		let mut misses = Misses::default();
+		let a: IpAddr = "192.0.2.10".parse().unwrap();
+		let now = Instant::now();
+		assert!(misses.report(a, now), "the first discard has to be said out loud");
+		assert!(
+			!misses.report(a, now + Duration::from_millis(1)),
+			"a retrying camera must not write a line per connection"
+		);
+		assert!(
+			!misses.report(a, now + Misses::WINDOW - Duration::from_secs(1)),
+			"still inside the window"
+		);
+		assert!(
+			misses.report(a, now + Misses::WINDOW),
+			"an outage that is still going has to keep showing up"
+		);
+	}
+
+	#[test]
+	fn each_source_gets_its_own_report() {
+		let mut misses = Misses::default();
+		let now = Instant::now();
+		let a: IpAddr = "192.0.2.10".parse().unwrap();
+		let b: IpAddr = "192.0.2.11".parse().unwrap();
+		assert!(misses.report(a, now));
+		assert!(misses.report(b, now), "a second camera is not silenced by the first");
+		assert!(!misses.report(a, now + Duration::from_secs(1)));
+	}
+
+	#[test]
+	fn the_report_map_stays_bounded() {
+		// A peer spraying source addresses must not be able to grow this map.
+		let mut misses = Misses::default();
+		let now = Instant::now();
+		for i in 0..(Misses::HOSTS as u32 + 40) {
+			let ip: IpAddr = format!("192.0.2.{}", i % 251).parse().unwrap();
+			misses.report(ip, now + Duration::from_secs(i as u64));
+		}
+		assert!(misses.last.len() <= Misses::HOSTS, "{} entries", misses.last.len());
+	}
+
+	#[test]
+	fn a_short_registry_uid_matches_a_long_configured_uid() {
+		// The form the camera actually writes (16 characters) against the form an
+		// operator's file carries (the long one). While the rule was one-directional
+		// this matched nothing, and the push was discarded as unowned.
+		let mut cameras = HashMap::new();
+		cameras.insert("front".into(), handle_with_uid("front", Some("9527000FRONT0123-FW")));
+		let h = match_camera_by_uid(&cameras, "9527000FRONT0123")
+			.expect("the short wire form matches the long configuration");
+		assert_eq!(h.name(), "front");
+	}
+
+	#[test]
+	fn two_cameras_sharing_a_uid_root_do_not_cross() {
+		let mut cameras = HashMap::new();
+		cameras.insert("short".into(), handle_with_uid("short", Some("9527000A")));
+		cameras.insert("long".into(), handle_with_uid("long", Some("9527000ABCDEFG")));
+		let h = match_camera_by_uid(&cameras, "9527000ABCDEFG").expect("the longest overlap wins");
+		assert_eq!(h.name(), "long");
+		let h = match_camera_by_uid(&cameras, "9527000A").expect("the exact one still wins");
+		assert_eq!(h.name(), "short");
 	}
 
 	#[test]

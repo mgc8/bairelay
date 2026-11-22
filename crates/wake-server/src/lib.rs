@@ -15,6 +15,7 @@ use std::io;
 use std::net::SocketAddr;
 
 pub use config::WakeServerConfig;
+pub use register::set_observer;
 
 /// Public error type at the library boundary.
 #[derive(Debug, thiserror::Error)]

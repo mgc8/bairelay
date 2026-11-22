@@ -44,7 +44,24 @@ impl BcCamera {
 		};
 
 		sub.send(msg).await?;
-		let msg = sub.recv().await?;
+		// The msg 11 sent above is what releases the doorbell's talk slot;
+		// whether this firmware answers it is another matter — the same battery
+		// doorbell never answers msg 202 either. Waiting without a bound here
+		// meant that on any firmware staying silent the caller never returned,
+		// so every cleanup placed after `talk_stop` was skipped and the camera
+		// kept holding the session (observed: a talk slot still occupied eight
+		// minutes after the caller had hung up). Wait briefly for the 200 and
+		// treat silence as the release it asked for.
+		let reply = tokio::time::timeout(std::time::Duration::from_millis(1500), sub.recv()).await;
+		let msg = match reply {
+			Ok(msg) => msg?,
+			Err(_elapsed) => {
+				// Silent firmware: the 11 went out, which is the part that
+				// mattered. Let the caller finish its cleanup.
+				log::debug!("talk stop: no reply to msg 11 within 1.5 s, assuming the camera let go");
+				return Ok(());
+			}
+		};
 
 		if let BcMeta {
 			response_code: 200, ..
@@ -107,6 +124,81 @@ impl BcCamera {
 				reply: std::sync::Arc::new(msg),
 				why: "Expected TalkAbility xml but it was not received",
 			})
+		}
+	}
+
+	///
+	/// Diagnostic TalkAbility probe: sends the very same
+	/// [`MSG_ID_TALKABILITY`] request as [`Self::talk_ability`] but does
+	/// **not** consult the ability table first.
+	///
+	/// This exists for exactly one purpose. `AbilityInfo` is known to
+	/// under-report what a box actually answers — a `<HaCfg>` read returning
+	/// `405` on firmware that happily accepts `<Email>` is the in-tree
+	/// example — so on a camera whose ability list carries no
+	/// `two_way_audio` the gated [`Self::talk_ability`] can never tell
+	/// "no talk hardware" apart from "talk present, not advertised". The
+	/// only way to tell them apart is to send the read and look at the raw
+	/// reply, which is what this does.
+	///
+	/// Deliberately narrow:
+	///
+	/// * The gate in [`Self::talk_ability`], [`Self::talk`],
+	///   [`Self::talk_stream`] and [`Self::talk_stop`] is untouched. Normal
+	///   callers keep getting [`Error::MissingAbility`] without spending a
+	///   round trip; only this diagnostic bypasses it.
+	/// * It sends msg id 10 and nothing else — no `TalkConfig` (201), no
+	///   audio (202), no talk reset (11). Read-only, like `abilityInfo`.
+	/// * Nothing is swallowed: the reply's header `response_code` is handed
+	///   back verbatim so the operator can see `405` / `400` / `482` /
+	///   whatever this firmware uses, rather than a normalised error.
+	///
+	/// Errors from the transport (connect, subscribe, send, recv, timeout)
+	/// propagate as `Err`; that is the "no answer at all" case, kept
+	/// separate from "answered with an error code" by the [`Ok`] variants.
+	///
+	pub async fn talk_ability_probe(&self) -> Result<TalkAbilityProbe> {
+		let connection = self.get_connection();
+		let msg_num = self.new_message_num();
+		let mut sub_get = connection.subscribe(MSG_ID_TALKABILITY, msg_num).await?;
+		let get = Bc {
+			meta: BcMeta {
+				msg_id: MSG_ID_TALKABILITY,
+				channel_id: self.channel_id,
+				msg_num,
+				response_code: 0,
+				stream_type: 0,
+				class: 0x6414,
+			},
+			body: BcBody::ModernMsg(ModernMsg {
+				extension: Some(Extension {
+					channel_id: Some(self.channel_id),
+					..Default::default()
+				}),
+				payload: None,
+			}),
+		};
+
+		sub_get.send(get).await?;
+		let msg = sub_get.recv().await?;
+
+		let code = msg.meta.response_code;
+		// Describe the payload before consuming `msg.body` so the
+		// "answered, but not with TalkAbility" case can say what did come
+		// back instead of just "nothing".
+		let payload = describe_payload(&msg.body);
+
+		match msg.body {
+			BcBody::ModernMsg(ModernMsg {
+				payload:
+					Some(BcPayloads::BcXml(BcXml {
+						talk_ability: Some(ability),
+						..
+					})),
+				..
+			}) => Ok(TalkAbilityProbe::Xml { code, ability }),
+			_ if code != 200 => Ok(TalkAbilityProbe::ErrorCode { code, payload }),
+			_ => Ok(TalkAbilityProbe::NoXml { code, payload }),
 		}
 	}
 
@@ -197,6 +289,19 @@ impl BcCamera {
 		const BLOCK_HEADER_SIZE: usize = 4;
 		const SAMPLES_PER_BYTE: usize = 2;
 
+		// Pace against one absolute deadline, never a relative sleep per payload.
+		//
+		// Measured on this machine with `bairelay audio-check --bench 51` (no
+		// camera, no network): a relative `sleep(64 ms)` lands 9.3 ms late on
+		// average (worst 16.8 ms) because Windows resolves sleep timers on its
+		// ~15.6 ms system tick — and a *relative* sleep keeps that lateness, so
+		// 51 payloads drift +430 to +500 ms and 200 of them +1862 ms. The same
+		// steps as deadlines computed from one start instant drift +2.8 ms over
+		// the whole 200 steps. A sender that runs 13 % slow starves the camera's
+		// playback buffer, which is an audible artifact all by itself, and it
+		// stretches a melody: 3.26 s of audio went out in 3.71 s on hardware.
+		let mut next_deadline = std::time::Instant::now();
+
 		for payload_bytes in adpcm.chunks(full_block_size as usize * BLOCK_PER_PAYLOAD) {
 			let mut payload = vec![];
 			for bytes in payload_bytes.chunks(full_block_size as usize) {
@@ -240,7 +345,26 @@ impl BcCamera {
 
 			// Time to play the sample in seconds
 			let play_length = samples_sent as f32 / sample_rate as f32;
-			tokio::time::sleep(std::time::Duration::from_secs_f32(play_length)).await;
+			// Deadline pacing, see `next_deadline` above: the wait is whatever is
+			// left until the schedule says this payload should be over, so a
+			// timer that fires 9 ms late is paid back by the *next* payload's
+			// wait instead of being added to the stream forever.
+			let play_duration = std::time::Duration::from_secs_f32(play_length);
+			let now = std::time::Instant::now();
+			if now.saturating_duration_since(next_deadline) > play_duration {
+				// Behind by more than this payload's own playback time: the
+				// camera has already run dry, so this audio can no longer be
+				// heard on time. Re-anchor the schedule here rather than try to
+				// catch up on sound that is already late — but only here, so a
+				// single timer hiccup never moves the timeline.
+				next_deadline = now + play_duration;
+			} else {
+				next_deadline += play_duration;
+				let now = std::time::Instant::now();
+				if next_deadline > now {
+					tokio::time::sleep(next_deadline.saturating_duration_since(now)).await;
+				}
+			}
 		}
 
 		self.talk_stop().await?;
@@ -407,12 +531,71 @@ impl BcCamera {
 			let time_sent = std::time::Instant::now();
 			sub.send(msg).await?;
 			let play_length = std::time::Duration::from_secs_f32(play_length);
-			if time_sent > expected_stream_end {
+			// Keep the timeline unless we are behind by more than a whole block.
+			//
+			// This branch used to fire on *any* lateness (`time_sent >
+			// expected_stream_end`), which turns the system's sleep granularity
+			// into permanent drift: every wait fires ~9 ms late on Windows
+			// (measured with `bairelay audio-check --bench 51`: mean +9.3 ms,
+			// worst +16.8 ms, and a 15.6 ms system tick explains it), each late
+			// send then pushed `expected_stream_end` to `time_sent + play_length`,
+			// and the lateness was never paid back — 51 blocks of a 3.26 s stream
+			// left the sender ~0.45 s behind the audio, which is what the operator
+			// measured as "51 blocs en 3,71 s". Advancing the anchor by
+			// `play_length` instead lets the next wait be shorter by exactly that
+			// lateness, so the stream ends when the audio says it should.
+			// Re-anchoring is still right when the producer stalled for more than
+			// a block: that audio cannot be heard on time any more, and pushing
+			// the schedule avoids bursting the rest of the stream at the camera.
+			if time_sent.saturating_duration_since(expected_stream_end) > play_length {
 				expected_stream_end = time_sent + play_length;
 			} else {
 				expected_stream_end += play_length;
 			}
-			let _ = sub.recv().await?;
+			// Pace on the camera's per-payload ack *when it sends one*, but never
+			// block on it unconditionally: this used to be `sub.recv().await?`,
+			// which hangs forever on firmware that accepts the TalkConfig (200 to
+			// msg 201) and then stays silent about every msg 202 — measured on a
+			// battery doorbell with 32 blocks written, no ack ever arriving, so
+			// the flush and the `talk_stop()` below were never reached and the
+			// talk session was left open for the camera to time out on its own.
+			// `talk()` never had that problem because it sleeps out the playback
+			// duration instead of waiting for feedback (`talk()` is the path the
+			// same camera answers).
+			//
+			// The window is exactly the playback time still scheduled for what we
+			// have already sent, so an acking camera still drives the loop at its
+			// own pace (unchanged behaviour there), and a silent camera is paced at
+			// wall-clock speed, which is what this loop was always meant to do.
+			// Dropping the pending `recv()` on timeout is safe: it is an mpsc
+			// receiver, so a cancelled receive loses nothing but the wait.
+			// The clock is the only authority on *when* the next block may go
+			// out. An ack may tell us the camera is unhappy, it may never come,
+			// but it must never set the pace: 1025 samples at 16 kHz take 64 ms
+			// to play on this doorbell's speaker no matter how fast its firmware
+			// answers.
+			//
+			// Measured on the battery doorbell with the bridge's per-second
+			// probe: answering the ack and moving on immediately drained the
+			// producer's queue at ~20.6 blocks per second while the microphone
+			// produced 15.6 — the camera was fed 1.32x as much audio as it could
+			// play, its buffer ran dry about six seconds in, and the loudspeaker
+			// went silent mid-call with the session still open. The same loop
+			// under WebRTC died at 14 to 28 s, which is the same starvation with
+			// a different amount of pre-buffered audio in front of it.
+			let deadline = tokio::time::Instant::from_std(expected_stream_end);
+			tokio::select! {
+				reply = sub.recv() => {
+					reply?;
+				}
+				_ = tokio::time::sleep_until(deadline) => {}
+			}
+			// A reply that arrived early says nothing about playback: still wait
+			// out the block's own playback time before sending the next one.
+			let maintenant = tokio::time::Instant::now();
+			if deadline > maintenant {
+				tokio::time::sleep_until(deadline).await;
+			}
 		}
 
 		// Chunks are still being played, while talk_stop will interrupt them. Wait until we expect
@@ -427,6 +610,64 @@ impl BcCamera {
 		self.talk_stop().await?;
 
 		Ok(())
+	}
+}
+
+/// What an ungated [`BcCamera::talk_ability_probe`] got back.
+///
+/// The three `Ok` shapes are deliberately kept apart from the `Err` case:
+/// "the camera refused", "the camera answered with something else" and "we
+/// never got an answer" are three different diagnoses, and collapsing them
+/// into one error is what made the gated path useless for this question.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TalkAbilityProbe {
+	/// The reply carried a `<TalkAbility>` element. `code` is the header
+	/// `response_code` (200 on the happy path — a non-200 that still
+	/// carries the XML is reported here rather than as a refusal, because
+	/// the payload is what the operator came for).
+	Xml {
+		/// Header response code, verbatim.
+		code: u16,
+		/// The parsed element.
+		ability: TalkAbility,
+	},
+	/// A non-200 reply that carried no `<TalkAbility>`, i.e. the camera
+	/// refused the command. `code` is the raw refusal (`405` is "unknown
+	/// command" on this family, `400` bad request, `482` appears on other
+	/// firmware) — deliberately not mapped onto an enum of known codes.
+	ErrorCode {
+		/// Header response code, verbatim.
+		code: u16,
+		/// What the payload did contain (`"none"`, `"xml"`,
+		/// `"binary(N bytes)"`, `"legacy"`).
+		payload: String,
+	},
+	/// A 200 reply with no `<TalkAbility>` element: an ack-only reply
+	/// (`payload: "none"`) or an XML body that simply lacks the element
+	/// (`payload: "xml"`).
+	NoXml {
+		/// Header response code, verbatim (200 by construction).
+		code: u16,
+		/// What the payload did contain.
+		payload: String,
+	},
+}
+
+/// One-line description of a reply body's payload, for
+/// [`TalkAbilityProbe::ErrorCode`] / [`TalkAbilityProbe::NoXml`]. Borrows,
+/// so it can run before the body is destructured.
+fn describe_payload(body: &BcBody) -> String {
+	match body {
+		BcBody::LegacyMsg(_) => "legacy".to_string(),
+		BcBody::ModernMsg(ModernMsg { payload: None, .. }) => "none".to_string(),
+		BcBody::ModernMsg(ModernMsg {
+			payload: Some(BcPayloads::BcXml(_)),
+			..
+		}) => "xml".to_string(),
+		BcBody::ModernMsg(ModernMsg {
+			payload: Some(BcPayloads::Binary(b)),
+			..
+		}) => format!("binary({} bytes)", b.len()),
 	}
 }
 
@@ -476,9 +717,20 @@ impl BufRead for BufferedStream {
 			self.consumed = 0;
 		}
 		while self.buffer.len() <= self.consumed {
+			// A bounded wait, not `recv()`. This is a blocking crossbeam receive
+			// called from an `async fn`, so while it waits it parks a runtime
+			// worker and cannot be interrupted by a timeout or a cancellation
+			// token. Measured on the battery doorbell: the microphone was 4 %
+			// short of real time, the queue emptied nine seconds in, and this
+			// line held the whole talk task — including the caller's own select
+			// loop and the stdin reader behind it — until the process was
+			// killed, so msg 11 was never sent. A producer that has nothing to
+			// say for this long has stopped saying anything: return an error,
+			// which the caller already treats as end of stream, and the session
+			// closes properly.
 			let data = self
 				.rx
-				.recv()
+				.recv_timeout(std::time::Duration::from_secs(3))
 				.map_err(|err| IoError::new(ErrorKind::ConnectionReset, err))?;
 			self.buffer.extend(data);
 		}
@@ -569,13 +821,13 @@ mod tests {
 						talk_ability: Some(TalkAbility {
 							version: "1.1".to_string(),
 							duplex_list: vec![DuplexList {
-								duplex: "FDX".to_string(),
+								duplex: vec!["FDX".to_string()],
 							}],
 							audio_stream_mode_list: vec![AudioStreamModeList {
-								audio_stream_mode: "followVideoStream".to_string(),
+								audio_stream_mode: vec!["followVideoStream".to_string()],
 							}],
 							audio_config_list: vec![AudioConfigList {
-								audio_config: ok_talk_config().audio_config,
+								audio_config: vec![ok_talk_config().audio_config],
 							}],
 						}),
 						..Default::default()
@@ -590,6 +842,15 @@ mod tests {
 		assert_eq!(ability.version, "1.1");
 		assert_eq!(ability.duplex_list.len(), 1);
 		assert_eq!(ability.audio_config_list.len(), 1);
+		// Each wrapper holds a collection now, so a `<duplexList>` carrying a
+		// single `<duplex>` still reads back as exactly that one value.
+		assert_eq!(ability.duplex_list[0].duplex, vec!["FDX".to_string()]);
+		assert_eq!(
+			ability.audio_stream_mode_list[0].audio_stream_mode,
+			vec!["followVideoStream".to_string()]
+		);
+		assert_eq!(ability.audio_config_list[0].audio_config.len(), 1);
+		assert_eq!(ability.audio_config_list[0].audio_config[0].audio_type, "adpcm");
 	}
 
 	#[tokio::test]

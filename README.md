@@ -4,6 +4,45 @@
 
 A pure-Rust bridge between Reolink **battery** cameras (proprietary "Baichuan" protocol on TCP/9000) and standard RTSP / MQTT, with a local replacement for Reolink's wake-up cloud and motion-push channel.
 
+## What this branch adds
+
+This branch (`two-way-audio-and-settings`) extends bairelay in four areas, all
+verified against a real battery doorbell and its wired chime in a live Home
+Assistant installation running cloud-free:
+
+- **Two-way audio.** `bairelay talk` streams microphone audio (PCM / WAV) to
+  the camera speaker over the existing authenticated Baichuan session, and
+  `bairelay audio-bridge` connects a go2rtc/WebRTC call channel straight to
+  the doorbell so a Home Assistant voice call reaches the visitor side. Gain
+  control, silence keepalive and a talk-capability probe included.
+  See [docs/two-way-audio.md](docs/two-way-audio.md).
+- **Settings family.** Camera and wired-chime settings are read, published and
+  written through MQTT discovery switches (volumes, audio DSP, image controls,
+  motion / PIR tuning, LED, privacy mask, chime pairing and volume), each write
+  carrying exactly the firmware tag the camera printed. Error text published on
+  a refusal is sanitised at the boundary and can never leak firmware payloads.
+  See [docs/settings.md](docs/settings.md).
+- **Local wake-server announcements.** The `0x31` wake announcement frame is
+  decoded permissively — unexpected shapes are logged, never silently dropped —
+  and doorbell press / burst events reach Home Assistant with no cloud
+  involvement. See [docs/wake-local-addressing.md](docs/wake-local-addressing.md).
+**Verified hardware.** Everything in this section was developed and tested on
+a real Reolink **Video Doorbell (battery)** — product class D340B, hardware
+version `DB_560MIXDB32M35DBB14MP`, firmware `v3.0.0.4636_25060550` —
+permanently cut off from Reolink's cloud (DNS-level), paired over the
+proprietary radio with a mains-powered Reolink Chime, driven by this bridge
+inside Home Assistant. Notably, this firmware has no HaCfg webhook (code 405),
+so press events ride the wake-server announcement path instead. Firmware
+differences between doorbell generations (battery vs PoE, Gen 1 vs Gen 2) are
+called out inline in `docs/settings.md`.
+- **Per-camera media pacer tuning.** `video_pacer_latency_ms` /
+  `video_pacer_max_lead_ms` and their audio counterparts replace the
+  previously hard-coded pacing constants. See [sample_config.toml](sample_config.toml).
+
+Availability semantics (online/offline entities that survive doorbell sleep,
+wake-budget accounting) are in [docs/availability.md](docs/availability.md).
+
+---
 ## Acknowledgements
 
 Bairelay stands on the shoulders of [Neolink](https://github.com/QuantumEntangledAndy/neolink), the project that originally reverse-engineered the Baichuan protocol and proved that a local-only alternative to Reolink's cloud was possible. Enormous thanks to:
@@ -185,7 +224,7 @@ Bairelay's config is **a deliberate near-superset of Neolink's** so existing con
    features = ["floodlight", "camera", "motion", "led", "ir", "reboot", "pt", "battery", "siren", "ai", "doorbell"]
    ```
 
-7. **Talk (two-way audio) is not implemented.** If you used `neolink talk`, bairelay has no equivalent yet — see the future-development notes.
+7. **Talk (two-way audio)** is implemented on this branch: `bairelay talk <camera> <file>` streams PCM/WAV to the camera speaker and `audio-bridge` carries a live WebRTC call channel to the doorbell — see `docs/two-way-audio.md`.
 
 ### From-scratch config
 
@@ -532,7 +571,7 @@ The workspace ships thousands of tests across the four crates plus the binary. T
 
 A short, unordered, non-committed list of features bairelay does not have today but might grow into:
 
-- Two-way audio (talk client) — sending audio to the camera speaker via ADPCM.
+- Talk-path polish — on-camera message playback scheduling and mixed-source talk streams.
 - Multicast RTSP — extra transport for fan-out to many concurrent LAN viewers.
 - Periodic background refresh of the PTZ preset cache (currently query-driven).
 - On-board email notifications via the camera's built-in SMTP client.
@@ -552,3 +591,9 @@ Bairelay is provided **"as is", without warranty of any kind** (see `LICENSE` fo
 ## License
 
 Bairelay is free software, released under the **GNU Affero General Public License v3** — see `LICENSE`. This means that if you incorporate bairelay into a piece of software available over the network, you must offer that software's source code to your users.
+
+## Attribution
+
+The two-way audio, settings and local-wake work added on this branch was developed with AI assistance.
+
+Co-authored by Qwen3.8 Flash Next IQ4, powered by radiance

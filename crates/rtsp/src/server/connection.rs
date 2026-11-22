@@ -7,16 +7,18 @@
 //! request-handling side and each track's send path can both frame
 //! packets onto it without tearing the connection.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::provider::StreamProvider;
 use crate::rtsp::auth::{Nonce, UserCred};
-use crate::server::registry::SessionRegistry;
+use crate::server::registry::{KeyframeGate, SessionRegistry};
 use crate::server::udp_pool::UdpPortPool;
 
 /// Shared per-connection state.
@@ -47,10 +49,103 @@ pub(crate) struct ConnectionState {
 	/// messages identify the transport.
 	pub is_tls: bool,
 	pub writer: Arc<Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>,
+	/// Interleaved RTCP channels negotiated by SETUP: RTSP channel number →
+	/// the session that owns it and the gate its requests belong to.
+	///
+	/// `std::sync::Mutex`, not tokio's: every critical section here is a map
+	/// lookup or insert that never spans an await — the same convention as
+	/// the session registry's entry map. The read loop consults it for every
+	/// `$`-framed packet it drains.
+	pub rtcp_channels: std::sync::Mutex<HashMap<u8, InterleavedRtcpTarget>>,
+}
+
+/// What an inbound `$`-framed RTCP packet on one interleaved channel routes
+/// to: the session it belongs to (for the log line and the liveness check)
+/// and the gate that turns the request into a replay.
+pub(crate) struct InterleavedRtcpTarget {
+	pub session_id: String,
+	pub gate: Arc<KeyframeGate>,
+}
+
+impl ConnectionState {
+	/// Record that inbound RTCP arriving on interleaved channel
+	/// `channel_rtcp` belongs to `session_id`. Called by SETUP for the video
+	/// track's RTCP channel; the RTP channel is deliberately not registered
+	/// (a client sending us RTP is not something we serve).
+	pub(crate) fn remember_rtcp_channel(
+		&self,
+		channel_rtcp: u8,
+		session_id: &str,
+		gate: Arc<KeyframeGate>,
+	) {
+		self.rtcp_channels
+			.lock()
+			.expect("rtcp channel map poisoned")
+			.insert(
+				channel_rtcp,
+				InterleavedRtcpTarget {
+					session_id: session_id.to_string(),
+					gate,
+				},
+			);
+	}
+
+	/// Drop every channel owned by `session_id`. Called on TEARDOWN so a
+	/// late packet on a freed channel cannot be attributed to a session that
+	/// no longer exists.
+	pub(crate) fn forget_rtcp_channels(&self, session_id: &str) {
+		self.rtcp_channels
+			.lock()
+			.expect("rtcp channel map poisoned")
+			.retain(|_, target| target.session_id != session_id);
+	}
+
+	/// Hand one `$`-framed payload to the session owning its channel.
+	///
+	/// Anything on an unregistered channel — RTP (clients do not send us
+	/// any), or a channel no SETUP claimed — is consumed and dropped without
+	/// a word: a confused peer can send thousands of these and the journal
+	/// on the Pi must not pay for it. Only recognised RTCP reaches a log
+	/// line, and only through the gate, which rate-limits it.
+	fn route_interleaved_packet(&self, channel: u8, payload: &[u8]) {
+		let target = self
+			.rtcp_channels
+			.lock()
+			.expect("rtcp channel map poisoned")
+			.get(&channel)
+			.map(|t| (t.session_id.clone(), Arc::clone(&t.gate)));
+		// Lock released before routing: `handle_inbound_rtcp` takes the gate's
+		// own mutex and must never run under the channel map's.
+		let Some((session_id, gate)) = target else {
+			return;
+		};
+		if !self.sessions.contains(&session_id) {
+			// Session torn down without a TEARDOWN we saw (swept by the
+			// keepalive, for instance). Nothing to answer, and no storm to
+			// answer it with.
+			return;
+		}
+		gate.handle_inbound_rtcp(payload, &session_id, "tcp-interleaved");
+	}
 }
 
 /// Maximum bytes we'll read into the RTSP request buffer.
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// First octet of a `$`-framed interleaved packet (RTSP 1.0 §10.12 "RTP
+/// Stream via the control connection", repeated by RFC 7826 §14): `$`,
+/// channel, 16-bit payload length, payload. A real RTSP request starts with
+/// an uppercase method token, so this octet at the head of the read buffer
+/// is unambiguous.
+const INTERLEAVED_MAGIC: u8 = 0x24;
+
+/// Largest RTCP packet buffered at once, for both transports (one UDP
+/// datagram, one interleaved frame's payload). RTCP is bounded by RFC 3550
+/// §6.1 to a few percent of session bandwidth, so a real compound packet is
+/// well under a few hundred bytes; the cap exists so a hostile or confused
+/// peer cannot make this task grow a buffer on a Raspberry Pi. A frame
+/// bigger than the cap is consumed and dropped whole.
+const MAX_RTCP_DATAGRAM_BYTES: usize = 2048;
 
 /// Lifetime of a Digest nonce before the server forces a fresh one.
 /// Five minutes balances replay-window vs. challenge-storm: short enough
@@ -106,6 +201,7 @@ pub async fn handle_connection<S>(
 		local_ip,
 		is_tls,
 		writer: Arc::clone(&writer),
+		rtcp_channels: std::sync::Mutex::new(HashMap::new()),
 	});
 
 	let mut buf = Vec::with_capacity(4096);
@@ -152,6 +248,31 @@ pub async fn handle_connection<S>(
 						break;
 					}
 					Ok(_) => {
+						// Inbound RTCP first, before the request scanner
+						// looks at these bytes: the scanner searches for
+						// `\r\n\r\n`, and an RTCP payload is free to
+						// contain exactly that. Draining `$` frames here is
+						// what makes a client's PLI/FIR visible on this
+						// transport at all.
+						let (routed, frame_incomplete) =
+							drain_interleaved_packets(&state, &mut buf);
+						if routed > 0 {
+							// The peer is talking to us: refresh the
+							// slow-loris clock as for any other activity.
+							last_activity = tokio::time::Instant::now();
+						}
+						if frame_incomplete {
+							// A `$` frame's payload is still arriving. Its
+							// bytes are not a request and must not be
+							// scanned as one, so wait for the rest.
+							if buf.len() > MAX_REQUEST_BYTES {
+								tracing::warn!(
+									"interleaved frame buffer exceeded limit, closing"
+								);
+								break;
+							}
+							continue;
+						}
 						// Try to parse a complete RTSP request.
 						match try_consume_request(&mut buf) {
 							Ok(Some(req_bytes)) => {
@@ -166,6 +287,12 @@ pub async fn handle_connection<S>(
 								// give it another full window before
 								// the slow-loris arm can fire.
 								last_activity = tokio::time::Instant::now();
+								// A client may pipeline its next RTCP packet
+								// in the same segment as the request just
+								// handled; route those bytes now instead of
+								// holding them until the next read wakes this
+								// task.
+								drain_interleaved_packets(&state, &mut buf);
 							}
 							Ok(None) => {
 								// Need more bytes.
@@ -201,6 +328,138 @@ pub async fn handle_connection<S>(
 
 	// Connection closing — tear down any live sessions to release wake locks.
 	state.sessions.clear();
+}
+
+/// Consume every complete `$`-framed packet at the head of `buf`, routing
+/// each to the session that owns its channel.
+///
+/// Returns `(routed, incomplete)`:
+/// - `routed` — how many frames were consumed (the caller refreshes the
+///   connection's activity clock when non-zero);
+/// - `incomplete` — the head of `buf` is a `$` frame whose payload has not
+///   fully arrived. The caller must then not try to slice a request out of
+///   `buf`: the request scanner locates the header end by searching for
+///   `\r\n\r\n`, and RTCP payload bytes are not text.
+///
+/// Interleaved RTP from a client is consumed and dropped: this server sends
+/// media, it does not receive it, and answering nothing still requires
+/// removing the bytes so the request scanner never sees them.
+fn drain_interleaved_packets(state: &Arc<ConnectionState>, buf: &mut Vec<u8>) -> (usize, bool) {
+	let mut routed = 0usize;
+	loop {
+		let Some(&magic) = buf.first() else {
+			return (routed, false);
+		};
+		if magic != INTERLEAVED_MAGIC {
+			// Not an interleaved packet: RTSP request bytes, or nothing.
+			return (routed, false);
+		}
+		if buf.len() < 4 {
+			return (routed, true);
+		}
+		let channel = buf[1];
+		let payload_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+		let total = 4usize.saturating_add(payload_len);
+		if buf.len() < total {
+			return (routed, true);
+		}
+		if payload_len > MAX_RTCP_DATAGRAM_BYTES {
+			// Framing is valid but the payload is absurd: consume it so the
+			// stream stays parseable, route nothing, say nothing (a peer can
+			// do this thousands of times per second).
+			buf.drain(..total);
+			routed = routed.wrapping_add(1);
+			continue;
+		}
+		state.route_interleaved_packet(channel, &buf[4..total]);
+		buf.drain(..total);
+		routed = routed.wrapping_add(1);
+	}
+}
+
+/// Point one session's inbound RTCP at the gate that turns key frame
+/// requests into burst replays.
+///
+/// Only video tracks are wired. A PLI/FIR asks for a key frame; audio has
+/// none to give (G.711 / AAC frames are independently decodable), so on an
+/// audio track there is nothing to answer and no reason to keep reading that
+/// socket at all.
+///
+/// TCP interleaved: the connection read loop needs no task — it already owns
+/// the read half, so registering the channel is enough. UDP: a reader task
+/// per track, holding a clone of the session's cancellation token so it exits
+/// exactly when the session does (TEARDOWN, sweep, connection close) and
+/// never outlives the RTCP port it reads.
+fn wire_inbound_rtcp(
+	state: &Arc<ConnectionState>,
+	session_id: &str,
+	track_kind: crate::server::registry::TrackKind,
+	inbound: InboundRtcp,
+) {
+	if track_kind != crate::server::registry::TrackKind::Video {
+		return;
+	}
+	let Some(gate) = state.sessions.keyframe_gate(session_id) else {
+		// A TEARDOWN raced us between the registry insert and here.
+		tracing::debug!(session = %session_id, "inbound rtcp not wired: session gone");
+		return;
+	};
+	match inbound {
+		InboundRtcp::TcpInterleaved { channel_rtcp } => {
+			state.remember_rtcp_channel(channel_rtcp, session_id, gate);
+		}
+		InboundRtcp::Udp(socket) => {
+			let Some(cancel) = state.sessions.cancel_token(session_id) else {
+				return;
+			};
+			tokio::spawn(udp_rtcp_reader(
+				socket,
+				session_id.to_string(),
+				gate,
+				cancel,
+			));
+		}
+	}
+}
+
+/// Read RTCP datagrams for one session's video track until the session ends.
+///
+/// `select!` with `biased` so cancellation is checked first: the session can
+/// be swept by the keepalive while a client is silent, and this task must not
+/// hold the UDP lease's RTCP socket open out of spite.
+async fn udp_rtcp_reader(
+	socket: Arc<UdpSocket>,
+	session_id: String,
+	gate: Arc<KeyframeGate>,
+	cancel: CancellationToken,
+) {
+	let mut buf = [0u8; MAX_RTCP_DATAGRAM_BYTES];
+	loop {
+		tokio::select! {
+			biased;
+			_ = cancel.cancelled() => return,
+			result = socket.recv(&mut buf) => match result {
+				Ok(n) => {
+					// The gate decides whether this is a key frame request,
+					// logs the one line it deserves, and rate-limits the
+					// rest. Its return value is not needed here: the video
+					// dispatch loop is the one that replays.
+					gate.handle_inbound_rtcp(&buf[..n], &session_id, "udp");
+				}
+				Err(e) => {
+					// A closed / unusable socket means the lease is gone with
+					// the session; exiting is correct, and this is the only
+					// line this task can ever write.
+					tracing::debug!(
+						session = %session_id,
+						error = %e,
+						"udp rtcp reader stopping"
+					);
+					return;
+				}
+			},
+		}
+	}
 }
 
 async fn read_once_or_more<R>(read_half: &mut R, buf: &mut Vec<u8>) -> io::Result<usize>
@@ -274,7 +533,7 @@ fn parse_content_length(headers: &[u8]) -> Option<usize> {
 /// Dispatch a parsed request to the right handler.
 ///
 /// Parses `req_bytes` as a single RTSP request, then matches on
-/// [`RtspMethod`] to invoke the per-method handler. On a parse failure
+/// [`crate::rtsp::message::RtspMethod`] to invoke the per-method handler. On a parse failure
 /// we emit a `400 Bad Request` with `CSeq: 0` and return an error so
 /// the connection loop closes the socket.
 #[tracing::instrument(skip_all)]
@@ -701,7 +960,7 @@ async fn handle_setup(
 	//
 	// Note: the UDP port lease is folded into UdpUnicastTransport
 	// itself, so no separate Option<UdpPortLease> is threaded here.
-	let (transport_impl, transport_response) =
+	let (transport_impl, transport_response, inbound_rtcp) =
 		match build_transport(state, transport_spec, track_ssrc).await {
 			Ok(v) => v,
 			Err(status) => {
@@ -759,6 +1018,9 @@ async fn handle_setup(
 			clock_rate: track_clock_rate,
 		};
 		state.sessions.append_track(&session_id, track);
+		// Wire this track's inbound RTCP (no-op for audio — see
+		// `wire_inbound_rtcp`).
+		wire_inbound_rtcp(state, &session_id, track_kind, inbound_rtcp);
 		let resp = crate::rtsp::message::build_response(
 			rtsp_types::StatusCode::Ok,
 			cseq,
@@ -868,6 +1130,14 @@ async fn handle_setup(
 		.sessions
 		.play_gate_arc(&session_id)
 		.expect("session just inserted");
+	let keyframe_gate_for_task = state
+		.sessions
+		.keyframe_gate(&session_id)
+		.expect("session just inserted");
+	// Point the client's inbound RTCP at that gate before the 200 OK goes
+	// out: a client that asks for a key frame in its very first RTCP packet
+	// after SETUP must already have somewhere to land.
+	wire_inbound_rtcp(state, &session_id, track_kind, inbound_rtcp);
 
 	tokio::spawn(async move {
 		crate::server::session_task::run(
@@ -877,6 +1147,7 @@ async fn handle_setup(
 			sessions_for_task,
 			session_id_for_task,
 			first_video_rtp_for_task,
+			keyframe_gate_for_task,
 			cancel_for_task,
 			tracks_changed_for_task,
 			play_signal_for_task,
@@ -905,11 +1176,30 @@ async fn handle_setup(
 ///
 /// Returns `Err(InternalServerError)` on UDP bind failure — the caller
 /// folds that into a 500 response via `build_response`.
+/// Returned alongside the transport so the caller knows where that track's
+/// inbound RTCP arrives. Each SETUP picks one arm by negotiating the
+/// transport; the video track's arm is then handed to `wire_inbound_rtcp`.
+enum InboundRtcp {
+	/// `$`-framed on the RTSP connection itself, on this interleaved channel
+	/// number (RTSP 1.0 §10.12). Routed by the connection read loop.
+	TcpInterleaved { channel_rtcp: u8 },
+	/// Datagrams on the server's RTCP socket for this track. Read by a task
+	/// spawned per track and cancelled with the session.
+	Udp(Arc<UdpSocket>),
+}
+
 async fn build_transport(
 	state: &Arc<ConnectionState>,
 	transport_spec: crate::rtsp::transport::TransportSpec,
 	track_ssrc: u32,
-) -> Result<(Arc<dyn crate::server::transport::Transport>, String), rtsp_types::StatusCode> {
+) -> Result<
+	(
+		Arc<dyn crate::server::transport::Transport>,
+		String,
+		InboundRtcp,
+	),
+	rtsp_types::StatusCode,
+> {
 	use crate::rtsp::transport as transport_mod;
 	match transport_spec {
 		transport_mod::TransportSpec::TcpInterleaved {
@@ -922,7 +1212,11 @@ async fn build_transport(
 				channel_rtcp,
 			);
 			let response = transport_mod::build_tcp_response(channel_rtp, channel_rtcp, track_ssrc);
-			Ok((Arc::new(t), response))
+			Ok((
+				Arc::new(t),
+				response,
+				InboundRtcp::TcpInterleaved { channel_rtcp },
+			))
 		}
 		transport_mod::TransportSpec::UdpUnicast {
 			client_rtp_port,
@@ -957,7 +1251,11 @@ async fn build_transport(
 				t.server_rtcp_port(),
 				track_ssrc,
 			);
-			Ok((Arc::new(t), response))
+			// Keep a handle on the RTCP socket: SETUP needs it to read the
+			// client's RTCP, and `t` is moved into the `dyn Transport`
+			// box below.
+			let rtcp_sock = Arc::clone(&t.rtcp_sock);
+			Ok((Arc::new(t), response, InboundRtcp::Udp(rtcp_sock)))
 		}
 	}
 }
@@ -1077,6 +1375,9 @@ async fn handle_teardown(
 		return write_response(state, &resp).await;
 	};
 	let removed = state.sessions.remove(sid);
+	// Free this session's interleaved RTCP channels: a packet still in
+	// flight must not be attributed to a session that no longer exists.
+	state.forget_rtcp_channels(sid);
 	// Only echo the Session header when the session was actually torn
 	// down. RFC 7826 §13.1 says the Session header in a response should
 	// refer to an extant session — echoing an unknown session ID on a 454
@@ -1093,6 +1394,216 @@ async fn handle_teardown(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	// ====== Inbound RTCP: TCP interleaved + UDP reader ======
+
+	/// `$`-framed interleaved packet exactly as a client writes it: magic,
+	/// channel, 16-bit payload length, payload.
+	fn interleaved(channel: u8, payload: &[u8]) -> Vec<u8> {
+		let mut v = vec![INTERLEAVED_MAGIC, channel];
+		v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+		v.extend_from_slice(payload);
+		v
+	}
+
+	/// PLI (RFC 4585 §6.3.1, 12 octets).
+	fn pli_frame(sender: u32, media_ssrc: u32) -> Vec<u8> {
+		let mut p = vec![0x81, 206, 0x00, 0x02];
+		p.extend_from_slice(&sender.to_be_bytes());
+		p.extend_from_slice(&media_ssrc.to_be_bytes());
+		p
+	}
+
+	/// RR (RFC 3550 §6.4.2, one report block). Its first octet is byte
+	/// identical to a PLI's; only the payload type differs — this is what a
+	/// client really sends about once a second.
+	fn rr_frame(sender: u32, reported: u32) -> Vec<u8> {
+		let mut p = vec![0x81, 201, 0x00, 0x07];
+		p.extend_from_slice(&sender.to_be_bytes());
+		p.extend_from_slice(&reported.to_be_bytes());
+		p.extend_from_slice(&[0u8; 20]);
+		p
+	}
+
+	/// Minimal subscription handle, enough to build a registry entry.
+	fn stub_subscription_for_connection() -> crate::provider::SubscriptionHandle {
+		use crate::buffer::LastFrameBuffer;
+		use crate::provider::{Frame, SubscriptionHandle};
+		use crate::sdp::SdpParams;
+		let (_tx, rx) = tokio::sync::broadcast::channel::<Frame>(1);
+		SubscriptionHandle {
+			frames: rx,
+			sdp_params: SdpParams {
+				server_ip: "0".into(),
+				session_id: "0".into(),
+				session_name: "test".into(),
+				video: None,
+				audio: None,
+			},
+			last_frame: Arc::new(LastFrameBuffer::new()),
+			guard: Box::new(()),
+		}
+	}
+
+	/// Register a live session in `state` and return the gate its video
+	/// track's inbound RTCP would reach.
+	fn session_with_gate(state: &Arc<ConnectionState>, id: &str) -> Arc<KeyframeGate> {
+		state.sessions.insert(
+			id.to_string(),
+			crate::server::registry::SessionEntry::new(
+				CancellationToken::new(),
+				stub_subscription_for_connection(),
+				vec![],
+			),
+		);
+		state.sessions.keyframe_gate(id).expect("just inserted")
+	}
+
+	fn rtcp_test_state() -> Arc<ConnectionState> {
+		let provider = MockProv::with_cameras(&["cam1"]);
+		let (state, _client) = make_state_with_users(provider, vec![]);
+		state
+	}
+
+	#[test]
+	fn interleaved_rtcp_channel_routes_a_pli_to_the_session_gate() {
+		let state = rtcp_test_state();
+		let gate = session_with_gate(&state, "sess-ice");
+		state.remember_rtcp_channel(3, "sess-ice", Arc::clone(&gate));
+
+		let mut buf = interleaved(3, &pli_frame(9, 0xfeed_face));
+		let (routed, incomplete) = drain_interleaved_packets(&state, &mut buf);
+		assert_eq!(routed, 1, "the frame must be consumed");
+		assert!(!incomplete, "the frame was complete");
+		assert!(
+			buf.is_empty(),
+			"the frame must leave the request buffer, got {buf:?}",
+		);
+		assert_eq!(gate.accepted(), 1, "the PLI must reach the session gate");
+	}
+
+	#[test]
+	fn interleaved_drain_leaves_a_following_request_untouched() {
+		// Clients coalesce request + RTCP into one segment; the request must
+		// survive the drain byte for byte.
+		let state = rtcp_test_state();
+		let gate = session_with_gate(&state, "sess-ice2");
+		state.remember_rtcp_channel(3, "sess-ice2", Arc::clone(&gate));
+		let request = b"OPTIONS / RTSP/1.0\r\nCSeq: 7\r\n\r\n";
+		let mut buf = interleaved(3, &pli_frame(1, 2));
+		buf.extend_from_slice(request);
+
+		let (routed, incomplete) = drain_interleaved_packets(&state, &mut buf);
+		assert_eq!(routed, 1);
+		assert!(!incomplete);
+		assert_eq!(buf.as_slice(), request, "the request must stay intact");
+		assert_eq!(gate.accepted(), 1);
+	}
+
+	#[test]
+	fn interleaved_rtp_and_unknown_channels_are_dropped_without_opening_anything() {
+		let state = rtcp_test_state();
+		let gate = session_with_gate(&state, "sess-ice3");
+		state.remember_rtcp_channel(3, "sess-ice3", Arc::clone(&gate));
+		let mut buf = interleaved(2, &[0x80, 0x60, 0x00, 0x01]); // RTP channel
+		buf.extend_from_slice(&interleaved(99, &pli_frame(1, 2))); // nobody's channel
+		buf.extend_from_slice(&interleaved(3, &rr_frame(1, 2))); // a report, not a request
+
+		let (routed, incomplete) = drain_interleaved_packets(&state, &mut buf);
+		assert_eq!(routed, 3, "every frame must be consumed");
+		assert!(!incomplete);
+		assert!(buf.is_empty());
+		assert_eq!(
+			gate.accepted(),
+			0,
+			"RTP, unregistered channels and reports must open no gate",
+		);
+	}
+
+	#[test]
+	fn incomplete_interleaved_frame_stops_the_drain_and_the_request_scan() {
+		let state = rtcp_test_state();
+		let _gate = session_with_gate(&state, "sess-ice4");
+		let full = interleaved(3, &pli_frame(1, 2));
+		let mut buf = full[..5].to_vec(); // header + one payload byte
+
+		let (routed, incomplete) = drain_interleaved_packets(&state, &mut buf);
+		assert_eq!(routed, 0, "a partial frame is not routable");
+		assert!(
+			incomplete,
+			"the caller must skip the request scan while a frame is half here"
+		);
+		assert_eq!(buf.len(), 5, "the partial frame stays for the next read");
+	}
+
+	#[test]
+	fn rtcp_payload_carrying_double_crlf_never_reaches_the_request_scanner() {
+		// The hazard the drain exists for: an RTCP payload containing the
+		// exact bytes the request scanner hunts for.
+		let state = rtcp_test_state();
+		let gate = session_with_gate(&state, "sess-ice5");
+		state.remember_rtcp_channel(3, "sess-ice5", Arc::clone(&gate));
+		let mut buf = interleaved(3, b"\x81\xce\r\n\r\n\x00\x00");
+
+		let (routed, _) = drain_interleaved_packets(&state, &mut buf);
+		assert_eq!(routed, 1);
+		assert_eq!(
+			try_consume_request(&mut buf).unwrap(),
+			None,
+			"nothing must be left for the scanner to mis-read",
+		);
+		assert_eq!(gate.accepted(), 0, "that payload is not a PLI anyway");
+	}
+
+	#[test]
+	fn teardown_frees_the_sessions_interleaved_channels() {
+		let state = rtcp_test_state();
+		let gate = session_with_gate(&state, "sess-ice6");
+		state.remember_rtcp_channel(3, "sess-ice6", Arc::clone(&gate));
+		state.forget_rtcp_channels("sess-ice6");
+
+		let mut buf = interleaved(3, &pli_frame(1, 2));
+		let (routed, _) = drain_interleaved_packets(&state, &mut buf);
+		assert_eq!(routed, 1, "the frame is still consumed off the wire");
+		assert!(buf.is_empty());
+		assert_eq!(gate.accepted(), 0, "a freed channel routes to nobody");
+	}
+
+	#[tokio::test]
+	async fn udp_rtcp_reader_feeds_the_gate_and_stops_with_the_session() {
+		let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+		let addr = socket.local_addr().unwrap();
+		let gate = Arc::new(KeyframeGate::new());
+		let cancel = CancellationToken::new();
+		let reader = tokio::spawn(udp_rtcp_reader(
+			Arc::clone(&socket),
+			"sess-udp".to_string(),
+			Arc::clone(&gate),
+			cancel.clone(),
+		));
+
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		// The report a client sends every second, then the request.
+		client.send_to(&rr_frame(1, 2), addr).await.unwrap();
+		client.send_to(&pli_frame(1, 2), addr).await.unwrap();
+
+		let mut ticks = 0u32;
+		while gate.accepted() == 0 && ticks < 100 {
+			tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+			ticks += 1;
+		}
+		assert_eq!(
+			gate.accepted(),
+			1,
+			"the report must not count and the PLI must, after {ticks} polls",
+		);
+
+		cancel.cancel();
+		tokio::time::timeout(std::time::Duration::from_millis(500), reader)
+			.await
+			.expect("the reader must exit when the session is cancelled")
+			.unwrap();
+	}
 
 	#[test]
 	fn find_double_crlf_locates_header_end() {
@@ -1291,6 +1802,7 @@ mod tests {
 			local_ip: std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
 			is_tls: false,
 			writer,
+			rtcp_channels: std::sync::Mutex::new(HashMap::new()),
 		});
 		(state, client)
 	}
@@ -1853,6 +2365,7 @@ mod tests {
 			local_ip: std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
 			is_tls: false,
 			writer,
+			rtcp_channels: std::sync::Mutex::new(HashMap::new()),
 		});
 		assert_eq!(advertised_server_ip(&state), explicit);
 	}
@@ -1876,6 +2389,7 @@ mod tests {
 			local_ip: local,
 			is_tls: false,
 			writer,
+			rtcp_channels: std::sync::Mutex::new(HashMap::new()),
 		});
 		assert_eq!(advertised_server_ip(&state), local);
 	}

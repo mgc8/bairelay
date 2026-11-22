@@ -80,8 +80,15 @@ pub fn merge_cameras(base: Vec<CameraConfig>, overlay: Vec<CameraConfig>) -> Vec
 			overlay_field!(entry, over, defs, idle_disconnect);
 			overlay_field!(entry, over, idle_disconnect_timeout_secs @opt);
 			overlay_field!(entry, over, defs, motion_wake_hold_secs);
+			overlay_field!(entry, over, defs, probe_session_secs);
+			overlay_field!(entry, over, defs, retry_after_secs);
 			overlay_field!(entry, over, defs, enabled);
 			overlay_field!(entry, over, defs, webhook);
+			// Media pacer tuning (see the pacer keys on `CameraConfig`).
+			overlay_field!(entry, over, defs, video_pacer_latency_ms);
+			overlay_field!(entry, over, defs, video_pacer_max_lead_ms);
+			overlay_field!(entry, over, defs, audio_pacer_latency_ms);
+			overlay_field!(entry, over, defs, audio_pacer_max_lead_ms);
 			// Whole-struct override: relies on build_base_config leaving
 			// per-camera mqtt + pause at default. If HA options ever start
 			// populating these, switch to a field-level deep merge or this
@@ -175,20 +182,98 @@ pub fn merge_top_level(mut base: Config, overlay: Config) -> Config {
 		base.users = overlay.users;
 	}
 	base.mqtt = merge_mqtt(base.mqtt, overlay.mqtt);
-	if overlay.wake_server.is_some() {
-		base.wake_server = overlay.wake_server;
-	}
+	base.wake_server = merge_wake_server(base.wake_server, overlay.wake_server);
 	if overlay.push_listener.is_some() {
 		base.push_listener = overlay.push_listener;
 	}
 	if overlay.webhook.is_some() {
 		base.webhook = overlay.webhook;
 	}
+	// Whole block, like `[webhook]` just above. The form has no field for the startup
+	// scan, so the overlay file is the only place it can come from; and unlike
+	// `[wake_server]`, there is no form-side half to merge field by field against, so a
+	// field-level merge would have nothing to fall back to. What that costs is stated
+	// once, in the note on [`merge_wake_server`]: a block written here cannot switch off
+	// something the form turned on, and it cannot inherit a credential the operator
+	// wrote in a different block.
+	if overlay.startup_discovery.is_some() {
+		base.startup_discovery = overlay.startup_discovery;
+	}
 	if overlay.stream_prune_grace_secs != defaults.stream_prune_grace_secs {
 		base.stream_prune_grace_secs = overlay.stream_prune_grace_secs;
 	}
 
 	base
+}
+
+/// Field-level merge of the `[wake_server]` section.
+///
+/// The form now fills this section, so the whole-block replace this used to do
+/// would have thrown away every rhythm the operator did not bother to repeat:
+/// writing one key in the overlay file is not a statement about the other five.
+/// Each field is taken from the overlay when it differs from the built-in value,
+/// and from the form otherwise.
+///
+/// One limitation has to be said out loud, because it bites exactly once and
+/// that once is at night: with serde defaults there is no way to tell "the
+/// operator wrote the built-in value" from "the operator wrote nothing", so a
+/// switch the form turned on cannot be turned back off by restating the default
+/// in the overlay. The way to turn something off is to leave it off in the form,
+/// or to name the value actually wanted. The same limitation already governs
+/// `tls_client_auth` above; it comes from defaults, not from this function.
+fn merge_wake_server(
+	base: Option<bairelay_wake_server::WakeServerConfig>,
+	overlay: Option<bairelay_wake_server::WakeServerConfig>,
+) -> Option<bairelay_wake_server::WakeServerConfig> {
+	use bairelay_wake_server::WakeServerConfig as W;
+	let (base, over) = match (base, overlay) {
+		(b, None) => return b,
+		(None, o) => return o,
+		(Some(b), Some(o)) => (b, o),
+	};
+	let d = W::default();
+	Some(W {
+		enable: pick(over.enable != d.enable, over.enable, base.enable),
+		middleman_port: pick(
+			over.middleman_port != d.middleman_port,
+			over.middleman_port,
+			base.middleman_port,
+		),
+		register_port: pick(
+			over.register_port != d.register_port,
+			over.register_port,
+			base.register_port,
+		),
+		heartbeat_ms: pick(
+			over.heartbeat_ms != d.heartbeat_ms,
+			over.heartbeat_ms,
+			base.heartbeat_ms,
+		),
+		// `None` here means "advertise the cadence above", which is a value of
+		// its own, so the form keeps it unless the overlay named one.
+		hb_advice_ms: over.hb_advice_ms.or(base.hb_advice_ms),
+		stale_after_ms: pick(
+			over.stale_after_ms != d.stale_after_ms,
+			over.stale_after_ms,
+			base.stale_after_ms,
+		),
+		explain_declared_uid: pick(
+			over.explain_declared_uid != d.explain_declared_uid,
+			over.explain_declared_uid,
+			base.explain_declared_uid,
+		),
+		bind: base.bind.or(over.bind),
+	})
+}
+
+/// Take the overlay's value when the operator said something, the base's
+/// otherwise. Written once so every field above reads the same way.
+fn pick<T>(asked: bool, overlay: T, base: T) -> T {
+	if asked {
+		overlay
+	} else {
+		base
+	}
 }
 
 #[cfg(test)]
@@ -380,7 +465,9 @@ mod tests {
 				username: "admin".into(),
 				password: "secret".into(),
 				idle_disconnect: true,
+				..Default::default()
 			}],
+		..Default::default()
 		};
 		let mqtt = MqttServiceFlags {
 			host: Some("core-mosquitto".into()),
@@ -497,5 +584,196 @@ mod tests {
 		assert_eq!(merged.bind_addr, "127.0.0.1");
 		assert_eq!(merged.bind_port, 9000);
 		assert_eq!(merged.stream_prune_grace_secs, 45);
+	}
+
+	/// The form has to reach the config, or the add-on is a decoration.
+	#[test]
+	fn the_form_rhythms_reach_the_config() {
+		use crate::hassio::options::{
+			build_base_config, HassioCadence, HassioCamera, HassioOptions, MqttServiceFlags,
+		};
+		let opts = HassioOptions {
+			wake_server: Some(HassioCadence {
+				enable: Some(true),
+				heartbeat_ms: Some(60000),
+				stale_after_ms: Some(150000),
+				hb_advice_ms: Some(10000),
+				explain_declared_uid: Some(true),
+			}),
+			cameras: vec![HassioCamera {
+				name: "Hallway".into(),
+				password: "secret".into(),
+				idle_disconnect_timeout_secs: Some(60.0),
+				probe_session_secs: Some(7),
+				motion_wake_hold_secs: Some(12.0),
+				discovery: Some("local".into()),
+				..Default::default()
+			}],
+			..Default::default()
+		};
+		let cfg = build_base_config(&opts, &MqttServiceFlags::default());
+		let ws = cfg.wake_server.as_ref().expect("the group reaches the config");
+		assert!(ws.enable);
+		assert_eq!(ws.heartbeat_ms, 60000);
+		assert_eq!(ws.stale_after_ms, 150000);
+		assert_eq!(ws.hb_advice_ms, Some(10000));
+		assert!(ws.explain_declared_uid);
+		let cam = &cfg.cameras[0];
+		assert_eq!(cam.idle_disconnect_timeout_secs, Some(60.0));
+		assert_eq!(cam.probe_session_secs, 7);
+		assert_eq!(cam.motion_wake_hold_secs, 12.0);
+		assert_eq!(cam.discovery, crate::config::DiscoveryMethod::Local);
+	}
+
+	/// A blank field is not a decision, and an absent group is not either: both
+	/// have to leave today's behaviour untouched, which is the only reason these
+	/// keys can be added without touching one existing installation.
+	#[test]
+	fn nothing_asked_for_changes_nothing() {
+		use crate::hassio::options::{
+			build_base_config, HassioCamera, HassioOptions, MqttServiceFlags,
+		};
+		let cfg = build_base_config(
+			&HassioOptions {
+				cameras: vec![HassioCamera {
+					name: "Hallway".into(),
+					password: "secret".into(),
+					..Default::default()
+				}],
+				..Default::default()
+			},
+			&MqttServiceFlags::default(),
+		);
+		assert!(cfg.wake_server.is_none(), "no group, no wake server");
+		let cam = &cfg.cameras[0];
+		let defs = crate::config::CameraConfig::default();
+		assert_eq!(cam.probe_session_secs, defs.probe_session_secs);
+		assert_eq!(cam.motion_wake_hold_secs, defs.motion_wake_hold_secs);
+		assert_eq!(cam.idle_disconnect_timeout_secs, None);
+		assert_eq!(cam.discovery, defs.discovery);
+	}
+
+	/// The operator's file always wins, and wins key by key: restating one
+	/// rhythm does not silently undo the ones the form set.
+	#[test]
+	fn the_operator_file_wins_and_the_rest_survives() {
+		use crate::hassio::options::{
+			build_base_config, HassioCadence, HassioCamera, HassioOptions, MqttServiceFlags,
+		};
+		let opts = HassioOptions {
+			wake_server: Some(HassioCadence {
+				enable: Some(true),
+				heartbeat_ms: Some(60000),
+				stale_after_ms: Some(150000),
+				..Default::default()
+			}),
+			cameras: vec![HassioCamera {
+				name: "Hallway".into(),
+				password: "secret".into(),
+				probe_session_secs: Some(7),
+				..Default::default()
+			}],
+			..Default::default()
+		};
+		let base = build_base_config(&opts, &MqttServiceFlags::default());
+		let overlay = parse_overlay(
+			r#"
+			[wake_server]
+			stale_after_ms = 240000
+
+			[[cameras]]
+			name = "Hallway"
+			probe_session_secs = 20
+			"#,
+		)
+		.unwrap();
+		// merge, not merge_top_level: per-camera rhythms are handled apart.
+		let merged = merge(base, overlay);
+		let ws = merged
+			.wake_server
+			.as_ref()
+			.expect("the section survives the merge");
+		assert_eq!(ws.stale_after_ms, 240000, "the operator's number wins");
+		assert_eq!(ws.heartbeat_ms, 60000, "the form's other key survives it");
+		assert!(ws.enable, "and so does the switch the form asked for");
+		assert_eq!(
+			merged.cameras[0].probe_session_secs,
+			20,
+			"per-camera rhythms merge the same way"
+		);
+	}
+
+	/// The cap the manifest promises has to be in the code too, because a schema
+	/// is only as strong as the mapping behind it.
+	#[test]
+	fn the_form_cannot_ask_for_a_scope_that_leaves_the_network() {
+		use crate::config::DiscoveryMethod as D;
+		use crate::hassio::options::discovery_from_form;
+		assert_eq!(discovery_from_form(Some("local")), Some(D::Local));
+		assert_eq!(discovery_from_form(Some("none")), Some(D::None));
+		for asked in ["relay", "remote", "map", "cellular", "cloud", "", "  "] {
+			assert_eq!(
+				discovery_from_form(Some(asked)),
+				None,
+				"{asked} must not be reachable from the form"
+			);
+		}
+		assert_eq!(discovery_from_form(None), None);
+	}
+
+	/// The startup scan can only be armed from the operator's file, and arming it must
+	/// not disturb anything the form filled. The reverse half matters just as much: an
+	/// overlay that says nothing about the mode leaves the rendered config exactly as it
+	/// was, which is what "off by default" has to mean for the add-on too — the add-on's
+	/// rendered file is generated, so a field that appeared in it whenever the merge ran
+	/// would be a mode switched on by the packaging rather than by the operator.
+	#[test]
+	fn the_startup_scan_survives_the_merge_and_its_absence_does_nothing() {
+		use crate::hassio::options::{
+			build_base_config, HassioCamera, HassioOptions, MqttServiceFlags,
+		};
+		let opts = HassioOptions {
+			cameras: vec![HassioCamera {
+				name: "Hallway".into(),
+				password: "secret".into(),
+				..Default::default()
+			}],
+			..Default::default()
+		};
+
+		let without = merge(
+			build_base_config(&opts, &MqttServiceFlags::default()),
+			parse_overlay("bind_port = 8555\n").unwrap(),
+		);
+		assert!(
+			without.startup_discovery.is_none(),
+			"an overlay that does not mention the mode leaves it out"
+		);
+
+		let armed = merge(
+			build_base_config(&opts, &MqttServiceFlags::default()),
+			parse_overlay(
+				r#"
+				bind_port = 8555
+
+				[startup_discovery]
+				enable = true
+				wait_secs = 8
+				username = "admin"
+				password = "shared-lan-password"
+				"#,
+			)
+			.unwrap(),
+		);
+		let scan = armed
+			.startup_discovery
+			.as_ref()
+			.expect("the operator's file arms the scan");
+		assert!(scan.enable);
+		assert_eq!(scan.wait_secs, 8);
+		assert_eq!(scan.username.as_deref(), Some("admin"));
+		assert_eq!(scan.password.as_deref(), Some("shared-lan-password"));
+		assert_eq!(armed.cameras.len(), 1, "the form's camera is still there");
+		assert_eq!(armed.bind_port, 8555, "and so is the rest of the overlay");
 	}
 }

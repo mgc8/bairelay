@@ -81,7 +81,7 @@ pub fn mock_client() -> (SharedMqttClient, MockHandle) {
 	let (client, event_loop) =
 		AsyncClient::new(MqttOptions::new("mock-client", "127.0.0.1", 1883), 1024);
 	Box::leak(Box::new(event_loop));
-	let shared = SharedMqttClient::__test_new_with_capture(client, Arc::clone(&buf));
+	let shared = SharedMqttClient::test_new_with_capture(client, Arc::clone(&buf));
 	(shared, MockHandle { buf })
 }
 

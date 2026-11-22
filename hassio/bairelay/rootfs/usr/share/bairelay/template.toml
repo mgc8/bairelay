@@ -61,7 +61,28 @@ bind = "0.0.0.0"
 # middleman_port = 9999      # UDP, C2M_Q listener
 # register_port = 58200      # UDP, D2R_HB / C2R_C / D2R_DISC listener
 # heartbeat_ms = 20000       # echoed to cameras in R2D_HB_R
+# hb_advice_ms = 10000       # what to advertise instead of heartbeat_ms
+#   Advice only. The firmware sets its own pace (about 10 s observed on this
+#   network), so this changes what this bridge says, never what it hears. It is
+#   here because advertising a cadence the camera ignores makes the advertising
+#   useless, not because a camera obeys it.
+# explain_declared_uid = false # spell out why a refused wake request named a
+#   # camera this bridge declares, instead of the generic unknown-or-stale line.
+#   The answer to the client does not change: it stays rsp = -1.
 # stale_after_ms = 80000     # registry entries older than this read as None
+#   One window, three jobs, which is why it is not a knob to push up casually:
+#   it is how long a camera stays listed between beats, how long the motion-push
+#   listener still reconciles a connection to a camera by source IP, and the real
+#   lifetime of the anchor a camera leaves behind.
+#   Measured in this tree on 2026-11-14, not assumed: the cloud-facing middleman
+#   answers for an anchor up to one hour old (its lookup uses a fixed one-hour
+#   window, `lookup_ttl`), while a wake request is refused as soon as the
+#   registry entry passes `stale_after_ms`, which is 80 s at the default
+#   (`lookup_fresh`). A client that trusts the hour it was given therefore asks
+#   for a wake 81 seconds after the last beat, is refused, and the camera stays
+#   asleep with nothing in the log that names the reason. Widening this keeps
+#   cameras listed longer, including ones that have changed address; read the
+#   three jobs above before you do it.
 
 
 # Motion-push listener.
@@ -84,6 +105,23 @@ bind = "0.0.0.0"
 # motion_wake_hold_secs = 30           # wake-lock window per webhook event
 
 
+# Ask the LAN which cameras exist, instead of writing them in the form.
+# The form has no field for this one, because it is not a rhythm to tune:
+# it broadcasts the protocol's any-camera request once at startup, listens
+# `wait_secs`, and manages whatever answers and names itself — at the
+# address it answered from, with `discovery = "local"`, using the
+# credentials below. A camera you put in the form is never added twice.
+# Without both username and password here, a camera that answers is named
+# in the log and left alone: its credentials cannot be guessed. The
+# broadcast can wake a sleeping battery camera, so it is off until you say
+# otherwise. See docs/settings.md ("Cameras discovered at startup").
+# [startup_discovery]
+# enable = false                       # opt-in; off means nothing is broadcast
+# wait_secs = 5                        # 1..=60; startup waits this long, no longer
+# username = "admin"                   # both halves are needed to adopt a camera
+# password = "camera-password"
+
+
 # ── Cameras ──
 # Cameras come from the bairelay app's options form. Add a [[cameras]]
 # block here only when you need to override per-camera fields the form
@@ -95,10 +133,21 @@ bind = "0.0.0.0"
 # name = "Cam1"                      # must match the form's `name`
 # channel_id = 0
 # stream = "all"                     # none | all | main | sub | extern
+#   Which streams this camera may serve, whatever the URL suffix asks
+#   for. "sub" still answers /extern (on the substream); "main" refuses
+#   it. A refused request never wakes the camera.
 # discovery = "local"                # local | remote | map | relay | cellular
 # max_encryption = "aes"             # none | aes | bcencrypt
 # idle_disconnect_timeout_secs = 45  # grace period before sleep
 # motion_wake_hold_secs = 30         # wake-lock hold after motion stops
+# probe_session_secs = 5     # how often a live session is checked; 0 = never
+#   With 0 a session that dies silently is not noticed by this bridge: it closes
+#   on the grace period or on an explicit disconnect only.
+# retry_after_secs = 0       # one further attempt, this many seconds after a
+#   # failed contact, then stop. 0 = no further attempt. Applies only while the
+#   # camera is parked, so it needs idle_disconnect = true; the attempt is TCP
+#   # only, at an address this bridge can prove, and it never searches for the
+#   # camera. A retry somebody asked for by hand keeps the full reach.
 # permitted_users = ["me"]
 # webhook = false                    # report wake reasons via [webhook]; needs [webhook] enable
 #
