@@ -21,6 +21,8 @@
 //! be split accross multiple UDP Data packets
 //!
 
+/// Decodes the camera's unsolicited event announcement packet (`0x31`)
+pub mod announcement;
 pub(crate) mod codex;
 mod crc;
 /// Functions to deserialize udp packets

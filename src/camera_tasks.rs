@@ -250,10 +250,17 @@ pub(crate) struct AlarmReport {
 /// Publish a doorbell press, unless another source (the session, the
 /// webhook or a forwarded alarm) published one within
 /// [`crate::status_cache::DOORBELL_PRESS_DEDUPE_WINDOW`].
+///
+/// The camera's wake handle, when the caller holds one: a published press is a
+/// wake of the sleeping camera, so the one chance to read its battery without
+/// paying for a wake. The burst is offered **after** the `press` is published -
+/// never before: the operator's automation must receive the press before the
+/// noise of the read ([`crate::burst`]).
 pub(crate) async fn report_doorbell_press(
 	camera_name: &str,
 	publisher: &StatusPublisher<'_>,
 	status_cache: &StatusCache,
+	wake: Option<&std::sync::Arc<crate::camera::CameraHandle>>,
 ) {
 	if !status_cache.claim_doorbell_press(tokio::time::Instant::now()) {
 		tracing::debug!(camera = %camera_name, "Doorbell press already reported");
@@ -262,6 +269,9 @@ pub(crate) async fn report_doorbell_press(
 	tracing::info!(camera = %camera_name, "Doorbell pressed");
 	if let Err(e) = publisher.publish_doorbell_press().await {
 		tracing::warn!(camera = %camera_name, error = %e, "publish_doorbell_press failed");
+	}
+	if let Some(handle) = wake {
+		crate::burst::trigger(std::sync::Arc::clone(handle), crate::burst::Wake::Press);
 	}
 }
 
@@ -283,6 +293,7 @@ pub(crate) async fn report_alarm_update(
 	ai_caps: CameraCapabilitiesView,
 	report: &mut AlarmReport,
 	update: &AlarmUpdate,
+	wake: Option<&std::sync::Arc<crate::camera::CameraHandle>>,
 ) {
 	match update.motion {
 		MotionStatus::Start(_) => {
@@ -294,6 +305,14 @@ pub(crate) async fn report_alarm_update(
 				true,
 			)
 			.await;
+			// Motion has been published: that is a wake, so a read window opens.
+			// After the publication, as with the press.
+			if let Some(handle) = wake {
+				crate::burst::trigger(
+					std::sync::Arc::clone(handle),
+					crate::burst::Wake::Motion,
+				);
+			}
 		}
 		MotionStatus::Stop(_) => {
 			report_motion(
@@ -322,8 +341,42 @@ pub(crate) async fn report_alarm_update(
 			*last = Some(objects);
 		}
 	}
+	// One line per alarm push. It was the absence of this very line that let a
+	// press published at 13:13 be judged, blind, a false positive: without the
+	// raw push there is no way to know what the camera actually said. The
+	// format fits on one line and keeps the three pieces that decide
+	// everything: the motion state, the raw visitor state, and what the rising
+	// edge made of them.
+	let motion_state = match update.motion {
+		MotionStatus::Start(_) => "on",
+		MotionStatus::Stop(_) => "off",
+		MotionStatus::NoChange(_) => "—",
+	};
+	let visitor_state = match update.visitor {
+		Some(true) => "1",
+		Some(false) => "0",
+		None => "?",
+	};
+	let object_state = match update.objects {
+		Some(o) => format!("{o:?}"),
+		None => "—".to_owned(),
+	};
+	tracing::debug!(
+		camera = %camera_name,
+		motion = motion_state,
+		visitor = visitor_state,
+		objects = %object_state,
+		doorbell = update.doorbell_press,
+		"Alarm push"
+	);
 	if update.doorbell_press {
-		report_doorbell_press(camera_name, publisher, status_cache).await;
+		report_doorbell_press(
+			camera_name,
+			publisher,
+			status_cache,
+			wake,
+		)
+		.await;
 	}
 }
 
@@ -339,6 +392,11 @@ pub async fn motion_listener(
 	status_cache: Arc<StatusCache>,
 	caps: CameraCapabilities,
 	held_press_window: Option<Duration>,
+	// The camera's handle, when the caller has one: a spontaneous wake heard on
+	// the session alarm (motion, press) must be able to offer the read burst.
+	// `None` in tests that have no complete camera - the burst is then simply
+	// absent.
+	wake: Option<Arc<crate::camera::CameraHandle>>,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	// Sustained network flap with N cameras × M retries/min produces a
@@ -430,6 +488,7 @@ pub async fn motion_listener(
 						ai_caps,
 						&mut report,
 						&update,
+						wake.as_ref(),
 					)
 					.await;
 					wake_hold.apply(&update);
@@ -1385,6 +1444,7 @@ mod tests {
 			empty_cache(),
 			CameraCapabilities::default(),
 			None,
+			None,
 		));
 
 		// Push a Start event and wait briefly for the publish to
@@ -2065,6 +2125,7 @@ mod tests {
 			empty_cache(),
 			CameraCapabilities::default(),
 			None,
+			None,
 		));
 
 		// Start then Stop in quick succession.
@@ -2126,6 +2187,7 @@ mod tests {
 			hold,
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 			None,
 		));
 
@@ -2199,6 +2261,7 @@ mod tests {
 			empty_cache(),
 			CameraCapabilities::default(),
 			None,
+			None,
 		));
 
 		// Start → Stop → Start, all within the hold-down window.
@@ -2267,6 +2330,7 @@ mod tests {
 			empty_cache(),
 			CameraCapabilities::default(),
 			None,
+			None,
 		));
 
 		motion_tx
@@ -2326,6 +2390,7 @@ mod tests {
 			Duration::from_secs(30),
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 			None,
 		));
 
@@ -2423,6 +2488,7 @@ mod tests {
 				Arc::clone(&cache),
 				caps,
 				held_press_window,
+				None,
 			));
 			Self {
 				txs,
@@ -2691,7 +2757,7 @@ mod tests {
 
 	/// A press during active motion leaves the release to the Stop.
 	#[tokio::test(start_paused = true)]
-	async fn motion_listener_doorbell_press_never_shortens_active_motion() {
+	async fn motion_listener_doorbell_press_never_shortens_enables_motion() {
 		let rig = AlarmRig::spawn(Duration::from_secs(30));
 
 		rig.send(now_start(), None, false).await;
@@ -3237,6 +3303,7 @@ mod tests {
 			Duration::from_secs(30),
 			empty_cache(),
 			CameraCapabilities::default(),
+			None,
 			None,
 		));
 
@@ -4103,6 +4170,8 @@ mod tests {
 			("http://exa mple.com/x", None),
 			("http://example.com\u{1b}[31m/x", None),
 			("http://ex\nample.com/x", None),
+			// This module keeps non-ASCII values on purpose: they stand in for what an operator
+			// would type or a camera would answer, so they are data being tested, not prose to translate.
 			("http://éxample.com/x", None),
 		] {
 			assert_eq!(url_host(url), want, "{url:?}");

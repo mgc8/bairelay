@@ -31,6 +31,11 @@ pub enum StreamConfig {
 #[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DiscoveryMethod {
+	/// Do not search for the camera at all: only a configured address works, and a
+	/// failure to reach it is reported instead of turning into a hunt. The only scope
+	/// that cannot put a discovery packet on the network, which is why the add-on
+	/// form offers it next to `local` and nothing else.
+	None,
 	Local,
 	Remote,
 	Map,
@@ -115,6 +120,13 @@ pub struct Config {
 	#[serde(default)]
 	pub webhook: Option<WebhookConfig>,
 
+	/// Optional `[startup_discovery]` block. Disabled by default. When enabled,
+	/// the cameras that answer the LAN discovery broadcast are added to
+	/// `cameras` once at startup, without having been declared — see
+	/// [`StartupDiscoveryConfig`].
+	#[serde(default)]
+	pub startup_discovery: Option<StartupDiscoveryConfig>,
+
 	/// Neolink-compat: tokio-console debugging knob. Bairelay does not
 	/// integrate `tokio-console`; verbosity is driven by `RUST_LOG`
 	/// (or `-v` / `-vv` / `-vvv` on the CLI). Accepted so old configs
@@ -172,12 +184,27 @@ impl Default for Config {
 			wake_server: None,
 			push_listener: None,
 			webhook: None,
+			startup_discovery: None,
 			tokio_console: None,
 			stream_prune_grace_secs: default_prune_grace_secs(),
 			cloud_account: None,
 			cloud_password: None,
 			cameras: Vec::new(),
 		}
+	}
+}
+
+impl Config {
+	/// The `[startup_discovery]` block, but only when it is switched on.
+	///
+	/// `None` covers both "the file has no such table" and "the table says
+	/// `enable = false`", because to the startup path those are the same request: do
+	/// not go looking. Every consumer asks this instead of matching on the field, so
+	/// the off switch lives in one place and an operator turning it off cannot leave
+	/// a half-armed scan behind — the rest of the table (a wait, a pair of
+	/// credentials) is inert the moment `enable` is not `true`.
+	pub fn startup_discovery_active(&self) -> Option<&StartupDiscoveryConfig> {
+		self.startup_discovery.as_ref().filter(|s| s.enable)
 	}
 }
 
@@ -321,6 +348,81 @@ impl WebhookAdvertise {
 /// Warn when `[webhook] webhook_advertise` names a loopback host: only
 /// a camera on this host (a simulator) can reach it. Called once at
 /// startup and by `check-config`, alongside [`warn_wire_debug_enabled`].
+/// Whether a camera's configured discovery scope puts its uid on the network beyond
+/// this machine's own broadcast domain.
+///
+/// `local` is the only scope that sends nothing outside: it addresses the LAN and the
+/// camera's own configured address. Everything above it (`remote`, `map`, `relay`,
+/// `cellular`, `cloud`) asks the relay hostnames where the uid lives, and the uid is the
+/// content of that question.
+fn uid_travels_beyond_local(method: DiscoveryMethod) -> bool {
+	!matches!(method, DiscoveryMethod::None | DiscoveryMethod::Local)
+}
+
+/// Say once per camera, at startup, what leaving the relay scope does to the camera's
+/// uid. Said at startup because it is a property of the network, not of an event: the
+/// uid is handed to twelve hostnames on every lookup, and which of them end up on this
+/// LAN and which on somebody else's server is decided by a DNS this project does not
+/// own and cannot see.
+///
+/// Called once at startup alongside [`warn_neolink_compat_fields`], and by
+/// `check-config`, so the same words are visible without starting the bridge.
+///
+/// The message itself is quoted verbatim in `docs/settings.md`, under "The twelve relay
+/// hostnames", so that the journal and the documentation cannot drift apart. If you edit
+/// one, edit the other in the same commit.
+pub fn warn_uid_beyond_local(config: &Config) {
+	for cam in &config.cameras {
+		let Some(uid) = cam.uid.as_deref() else { continue };
+		if !uid_travels_beyond_local(cam.discovery) {
+			continue;
+		}
+		tracing::warn!(
+			name = %cam.name,
+			uid_tail = %&uid[uid.len().saturating_sub(6)..],
+			discovery = ?cam.discovery,
+			"camera uid is sent outside this network: a lookup asks the twelve relay \
+			 hostnames (p2p.reolink.com and p2p1 through p2p11) where this uid is, and the \
+			 same question goes to each of them because the lookup does not stop at the first \
+			 answer. Which of those names land on this LAN is decided by the network's DNS, not by \
+			 this project: check that list before describing this deployment as offline. `local` \
+			 asks none of them, but without an IP-literal `address` it broadcasts only, which a \
+			 sleeping battery camera cannot hear"
+		);
+	}
+}
+
+/// Say, once, that the startup scan is armed with nothing to adopt a camera with.
+///
+/// This is the half of the mode the operator cannot see by reading the file: the scan
+/// will run, it may well hear something, and it will then refuse to act on what it
+/// heard, because a camera this file does not name is a camera whose password nobody
+/// knows. Without this line the outcome looks exactly like an empty network. With it,
+/// the missing key is named before the first broadcast goes out — and the scan still
+/// repeats the warning per camera it had to leave alone, because "something answered
+/// and we did not use it" is the fact that has to survive into the log of that run.
+///
+/// A warning, not a refusal: the bridge starts and serves every declared camera
+/// whether or not a scan can adopt anything, and a file that refused to load because
+/// of a table whose only job is to add cameras would be a worse file than the one it
+/// replaced.
+pub fn warn_startup_discovery_without_credentials(config: &Config) {
+	let Some(sd) = config.startup_discovery_active() else {
+		return;
+	};
+	let Some(missing) = sd.missing_credentials() else {
+		return;
+	};
+	tracing::warn!(
+		missing = missing,
+		wait_secs = sd.wait_secs,
+		"[startup_discovery] is on but {missing} is not configured: a camera that answers the \
+		 discovery broadcast cannot be adopted, because its credentials cannot be guessed. Write \
+		 [startup_discovery] username and password to adopt the cameras that answer, or leave the \
+		 table out if every camera is declared in [[cameras]]"
+	);
+}
+
 pub fn warn_loopback_webhook_advertise(config: &Config) {
 	let advertise = config
 		.webhook
@@ -352,6 +454,132 @@ pub fn parse_webhook_advertise(raw: &str) -> Result<WebhookAdvertise, String> {
 		crate::bc_opts::AddressHost::Name(name) => name,
 	};
 	Ok(WebhookAdvertise { host, port })
+}
+
+// ── StartupDiscoveryConfig ─────────────────────────────────────────────
+
+/// Longest window `[startup_discovery]` will wait for an answer.
+///
+/// The number exists to bound the wait, not to offer it. The scan sits on the
+/// startup path, before the RTSP listener and the camera tasks exist, so every
+/// second of the window is a second in which no camera is reachable by anybody.
+/// A window longer than this is a misconfiguration wearing the shape of a
+/// preference: a camera that is going to answer a broadcast answers within the
+/// first second or two, and one that is asleep will not answer at all.
+pub const MAX_STARTUP_DISCOVERY_WAIT_SECS: u64 = 60;
+
+/// `[startup_discovery]`: adopt the cameras that answer the LAN discovery
+/// broadcast, without their UIDs having been written in this file.
+///
+/// Every other path in this bridge starts from a UID the operator wrote down. A
+/// UID is what a wake request is addressed to, what the register registry keys on,
+/// and what a cloud token is minted for, so "declare the camera" has always meant
+/// "copy the number off the label". This block is the one place that instead asks
+/// the LAN: at startup it broadcasts the protocol's any-camera discovery request
+/// (`C2D_S`, see `crates/core/src/bcudp/xml.rs`), listens for `wait_secs`, and
+/// takes whatever answers that names a camera as a camera — with the address it
+/// answered from, the credentials named below, and `discovery = "local"`, because
+/// the only thing the broadcast proves is that the camera is on this LAN.
+///
+/// What it deliberately does not do:
+///
+/// * It does not invent an address. The address adopted is the source address of
+///   the answer, which is the one address this run has evidence for.
+/// * It does not guess credentials. With no pair configured below, a camera that
+///   answers is named in a warning and left alone — see [`StartupDiscoveryConfig::missing_credentials`].
+/// * It does not duplicate a declaration. An answer whose UID matches a camera
+///   this file already declares, in either of the two forms the firmware uses, is
+///   not added a second time, and the declared camera keeps every field the
+///   operator wrote for it.
+///
+/// What is **not** established, and the reason this is opt-in and a timeout is a
+/// warning rather than a failure: no capture in this repository contains a camera
+/// answering a UID-less request with a packet that names itself. `C2D_S` is
+/// modelled here — documented as "Discovery of any client", broadcast to port 2015
+/// — and has never been sent by this code; `grep C2D_S` reaches tests only. The
+/// UIDs this bridge has actually learned off the wire arrived camera-initiated on
+/// the register port, which is a different path (see `docs/wake-local-addressing.md`
+/// and `docs/cloud-interception.md`). A window that finds nothing is therefore an
+/// expected outcome, and the log says so in those words instead of failing.
+///
+/// Opt-in for a second reason too: a LAN broadcast is a wake-up call. A sleeping
+/// battery camera that hears it spends battery answering, and a bridge that
+/// broadcasts on every start without being asked is the last thing the operator of
+/// a battery doorbell wants on their network.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StartupDiscoveryConfig {
+	/// Off unless this is written `true`. Absent, or `false`, and the startup path
+	/// is byte-for-byte what it was before this block existed: no socket is
+	/// opened, nothing is broadcast, and the camera list is exactly `[[cameras]]`.
+	#[serde(default)]
+	pub enable: bool,
+
+	/// How long to listen for answers, in seconds. Bounded above by
+	/// [`MAX_STARTUP_DISCOVERY_WAIT_SECS`] and refused outside `1..=` that,
+	/// because a window of `0` would mean "ask and never listen" and a window of
+	/// an hour would mean "the bridge does not start".
+	#[serde(default = "default_startup_discovery_wait_secs")]
+	pub wait_secs: u64,
+
+	/// Username adopted cameras are given. Adoption needs a pair: see
+	/// [`StartupDiscoveryConfig::credentials`].
+	#[serde(default)]
+	pub username: Option<String>,
+
+	/// Password adopted cameras are given. Adopted cameras are ordinary cameras
+	/// from here on, so they need a password like any other: it is what the
+	/// login handshake sends. Never logged — the startup log lines name a UID
+	/// tail and an address, never a secret.
+	#[serde(default)]
+	pub password: Option<String>,
+}
+
+impl Default for StartupDiscoveryConfig {
+	fn default() -> Self {
+		Self {
+			enable: false,
+			wait_secs: default_startup_discovery_wait_secs(),
+			username: None,
+			password: None,
+		}
+	}
+}
+
+impl StartupDiscoveryConfig {
+	/// The credentials an answer would be adopted with, or `None` when the
+	/// operator has not written a complete pair.
+	///
+	/// There is no fallback here, and that is the point. A discovered camera is a
+	/// camera this file does not name, so there is no per-camera password to borrow
+	/// and no "obvious" account to try: the only pair this bridge may claim for it
+	/// is the one the operator wrote for exactly this purpose. Falling back to the
+	/// first declared camera's credentials would be a guess dressed as a default —
+	/// and it would be a guess that logs into one camera under the identity of
+	/// another.
+	pub fn credentials(&self) -> Option<(&str, &str)> {
+		let username = self.username.as_deref().filter(|u| !u.trim().is_empty())?;
+		let password = self.password.as_deref().filter(|p| !p.is_empty())?;
+		Some((username, password))
+	}
+
+	/// Which half of the credential pair is missing, phrased for a warning that
+	/// has to say what to write. `None` means a pair is there to adopt with.
+	///
+	/// The two tests are the same two filters [`StartupDiscoveryConfig::credentials`]
+	/// applies, written the same way: what counts as a filled half has to be one
+	/// definition, or the warning can name a missing half that the adoption then
+	/// accepts, or the reverse.
+	pub fn missing_credentials(&self) -> Option<&'static str> {
+		let username = self.username.as_deref().filter(|u| !u.trim().is_empty());
+		let password = self.password.as_deref().filter(|p| !p.is_empty());
+		match (username, password) {
+			(Some(_), Some(_)) => None,
+			(None, None) => Some("username and password"),
+			(None, Some(_)) => Some("username"),
+			(Some(_), None) => Some("password"),
+		}
+	}
 }
 
 // ── UserConfig ─────────────────────────────────────────────────────────
@@ -497,6 +725,75 @@ pub struct CameraConfig {
 
 	#[serde(default, alias = "idle", alias = "idle_disc")]
 	pub idle_disconnect: bool,
+	/// How often the session probe pokes the camera to prove the session is
+	/// still alive. **5 s by default; `0` removes the probe entirely.**
+	///
+	/// The probe is not a nicety. It is the only thing in this bridge that
+	/// notices a session whose camera has left the network: the socket reader
+	/// returns on EOF without reporting anything, no command on that socket
+	/// carries a timeout, and `SO_KEEPALIVE` is never set anywhere in the tree.
+	/// Without a probe, a camera that drops off Wi-Fi without sending a FIN
+	/// keeps its session open for ever: the connected-session call never
+	/// returns, so the outer reconnect loop and its backoff are never reached,
+	/// MQTT keeps publishing `connected`, presence keeps publishing reachable,
+	/// `bc_camera()` hands out a dead camera, and `control/wakeup` answers
+	/// success without touching the device.
+	///
+	/// Detection is not one tick: the probe loop tolerates five consecutive
+	/// failures before it gives up (`KEEPALIVE_MAX_FAILURES` in
+	/// `src/camera.rs`, a private constant so named in prose rather than linked),
+	/// so a session is declared dead after roughly `probe_session_secs` x 5
+	/// seconds.
+	///
+	/// `0` is refused together with `idle_disconnect = false`, because the two
+	/// together leave nothing at all to end a session. With
+	/// `idle_disconnect = true` the bound that remains is the grace period
+	/// (`idle_disconnect_timeout_secs`, 45 s by default, see
+	/// [`resolve_idle_disconnect_timeout`]), so the session still closes, only
+	/// later, and only on the idle path: a camera that vanishes *while
+	/// something is watching* is not covered by that bound either.
+	#[serde(default = "default_probe_session_secs")]
+	pub probe_session_secs: u64,
+
+	/// After a contact attempt gives up, wait this many seconds and try
+	/// **once** more, then stop and wait for a reason to talk to the camera.
+	/// `0` (the default) keeps today's behaviour: no further attempt.
+	///
+	/// **This only does anything in the parked regime**, that is with
+	/// `idle_disconnect = true`. Without it the connect loop already retries
+	/// for ever on its own backoff, and this key changes nothing there: a
+	/// startup warning says so rather than letting the key look broken.
+	///
+	/// The deferred attempt is deliberately narrower than the normal one. It is
+	/// built by [`crate::bc_opts::build_retry_bc_opts`], which pins the
+	/// protocol to TCP and drops the uid, so it cannot enter the UID discovery
+	/// chain: no LAN broadcast, no remote lookup, no map, no relay, no wake
+	/// burst. It dials only addresses this bridge can prove, which means a
+	/// camera reachable only through the relay is not retried at all and the log
+	/// says that in one line. The reason for the narrowness is the battery: a
+	/// local broadcast is a possible wake-up, and a periodic timer that rings
+	/// the camera's radio is exactly the cost this bridge exists to avoid.
+	/// Anything a person asked for keeps its full reach; only the automatic
+	/// path is restricted.
+	#[serde(default = "default_retry_after_secs")]
+	pub retry_after_secs: u64,
+
+	/// When this camera announces its own wake-up, ask it once, at that moment,
+	/// instead of waiting for the recording that follows to end. Off means the
+	/// announcement is still logged, and nothing else happens.
+	#[serde(default = "default_read_on_wake")]
+	pub read_on_wake: bool,
+
+	/// How long the bridge waits for that session to appear, in seconds, holding
+	/// the wake lock meanwhile. A camera that answers is released as soon as the
+	/// session is up, so raising this only lengthens the wait of one that does not.
+	#[serde(default = "default_read_hold_secs")]
+	pub read_hold_secs: u64,
+
+	/// Minimum spacing between two reads that got a session, in seconds. A read
+	/// that got nothing is not charged to this window, because it cost nothing.
+	#[serde(default = "default_read_interval_secs")]
+	pub read_interval_secs: u64,
 
 	/// Seconds to wait after the last wake lock drops before the camera
 	/// is told to sleep. `None` uses the 45 s default. A `[cameras.pause]
@@ -544,6 +841,63 @@ pub struct CameraConfig {
 	/// alarms to the `[webhook]` listener. Requires `[webhook] enable`.
 	#[serde(default)]
 	pub webhook: bool,
+
+	/// Declare that this camera can do two-way audio even though its
+	/// `abilityInfo` does not list `two_way_audio`, so the talk path
+	/// (`talk`, `audio-bridge`) is allowed for **this camera only**.
+	///
+	/// This is a firmware under-declaration, verified by `talk-ability`: the
+	/// doorbell answers `<TalkAbility>` (msg 10) with `version 1.1`, `FDX`
+	/// duplex and an `adpcm` 16000 Hz / 16 bit / 1024-sample-per-block
+	/// configuration, while its 56-entry `abilityInfo` lists no talk ability
+	/// at all. Default `false` keeps the ability gate exactly as strict as it
+	/// has always been for every other camera — and setting it on a camera
+	/// that genuinely lacks the microphone only makes the camera refuse the
+	/// talk config, it does not make bairelay any less strict elsewhere.
+	#[serde(default)]
+	pub two_way_audio: bool,
+
+	// ── Media pacer tuning ─────────────────────────────────────────────
+	// Every decoded frame goes through a per-source pacer before it reaches
+	// subscribers: it holds the frame, then re-emits it at the codec's own
+	// rate (see `stream_source::media_pacer_task`). Each pacer has two
+	// numbers. The *latency* is what the very first frame of a source waits
+	// — the pre-buffer, and therefore the floor on how long ago the picture
+	// a viewer sees is. The *lead cap* is how far the emit cursor may run
+	// ahead of the wall clock while the camera bursts, which is the other
+	// way latency grows. Both are deliberate delay: they buy the smooth
+	// cadence that stops mpv from re-buffering every two seconds, and they
+	// cost the seconds a live doorbell picture is late by. A go2rtc / WebRTC
+	// consumer re-buffers on its own and wants much less of both, so the
+	// defaults below — measured for mpv-over-RTSP — are per-camera keys.
+	// Set them from the measured wait, not from taste: run with
+	// `RUST_LOG=debug,bairelay=debug` and read `ms=` out of the
+	// `pacer emitted frame` lines.
+	/// Milliseconds the first frame a source queues waits before it is
+	/// emitted. Default 1500, the value the video pacer has always shipped
+	/// with; a live-viewing setup usually wants a few hundred.
+	#[serde(default = "default_video_pacer_latency_ms")]
+	pub video_pacer_latency_ms: u32,
+
+	/// How far ahead of the wall clock the video emit cursor may run when
+	/// the camera bursts a whole GOP at once. Default 3000. A value below
+	/// [`CameraConfig::video_pacer_latency_ms`] contradicts itself — the
+	/// first frame could never be emitted on time — so it is raised to the
+	/// latency at startup, with a warning.
+	#[serde(default = "default_video_pacer_max_lead_ms")]
+	pub video_pacer_max_lead_ms: u32,
+
+	/// Milliseconds the first audio frame of a source waits. Default 500,
+	/// the shipped value, which covers the 100–500 ms burst jitter of Argus
+	/// AAC with margin. Lower it and a late packet reaches the listener as
+	/// an audible clip instead of as waiting.
+	#[serde(default = "default_audio_pacer_latency_ms")]
+	pub audio_pacer_latency_ms: u32,
+
+	/// Audio counterpart of [`CameraConfig::video_pacer_max_lead_ms`].
+	/// Default 2000, raised to the latency if it is set below it.
+	#[serde(default = "default_audio_pacer_max_lead_ms")]
+	pub audio_pacer_max_lead_ms: u32,
 
 	// ── Neolink migration compat (deprecated; warn + ignore) ──────────
 	// Each Option<_> exists only so old configs parse cleanly under
@@ -600,6 +954,11 @@ impl Default for CameraConfig {
 			discovery: DiscoveryMethod::default(),
 			max_encryption: MaxEncryption::default(),
 			idle_disconnect: false,
+			probe_session_secs: default_probe_session_secs(),
+			retry_after_secs: default_retry_after_secs(),
+			read_on_wake: default_read_on_wake(),
+			read_hold_secs: default_read_hold_secs(),
+			read_interval_secs: default_read_interval_secs(),
 			idle_disconnect_timeout_secs: None,
 			motion_wake_hold_secs: default_motion_wake_hold_secs(),
 			enabled: true,
@@ -608,6 +967,11 @@ impl Default for CameraConfig {
 			permitted_users: Vec::new(),
 			debug: None,
 			webhook: false,
+			two_way_audio: false,
+			video_pacer_latency_ms: default_video_pacer_latency_ms(),
+			video_pacer_max_lead_ms: default_video_pacer_max_lead_ms(),
+			audio_pacer_latency_ms: default_audio_pacer_latency_ms(),
+			audio_pacer_max_lead_ms: default_audio_pacer_max_lead_ms(),
 			print_format: None,
 			update_time: None,
 			buffer_duration: None,
@@ -617,6 +981,91 @@ impl Default for CameraConfig {
 			push_notifications: None,
 			strict: None,
 		}
+	}
+}
+
+// ── Media pacer tuning ─────────────────────────────────────────────────
+
+/// Default [`CameraConfig::video_pacer_latency_ms`]: the startup latency the
+/// video pacer has always shipped with, measured for mpv-over-RTSP, which
+/// flips into `(Buffering)` every couple of seconds if the pacer pre-buffers
+/// less. It stays the default so that no existing configuration changes
+/// behaviour by this key existing.
+pub const DEFAULT_VIDEO_PACER_LATENCY_MS: u32 = 1500;
+
+/// Default [`CameraConfig::video_pacer_max_lead_ms`]: the latency plus 1.5 s
+/// of headroom for a camera-side GOP burst, which is what the shipped pacer
+/// allowed.
+pub const DEFAULT_VIDEO_PACER_MAX_LEAD_MS: u32 = 3000;
+
+/// Default [`CameraConfig::audio_pacer_latency_ms`]: the ~8-packet AU buffer
+/// the audio pacer has always started with, sized for the observed 100–500 ms
+/// AAC arrival jitter on Argus hardware.
+pub const DEFAULT_AUDIO_PACER_LATENCY_MS: u32 = 500;
+
+/// Default [`CameraConfig::audio_pacer_max_lead_ms`]: the audio lead cap this
+/// bridge has always used.
+pub const DEFAULT_AUDIO_PACER_MAX_LEAD_MS: u32 = 2000;
+
+/// Kept as functions so `serde(default)` and [`CameraConfig::default`] cannot
+/// drift apart, and so the pacer's own fallback constants in
+/// [`crate::stream_source`] are derived from the same numbers.
+const fn default_video_pacer_latency_ms() -> u32 {
+	DEFAULT_VIDEO_PACER_LATENCY_MS
+}
+
+const fn default_video_pacer_max_lead_ms() -> u32 {
+	DEFAULT_VIDEO_PACER_MAX_LEAD_MS
+}
+
+const fn default_audio_pacer_latency_ms() -> u32 {
+	DEFAULT_AUDIO_PACER_LATENCY_MS
+}
+
+const fn default_audio_pacer_max_lead_ms() -> u32 {
+	DEFAULT_AUDIO_PACER_MAX_LEAD_MS
+}
+
+/// One pacer's wall-clock timing, in the form the pacer constructors take.
+/// Built from the per-camera millisecond keys by
+/// [`CameraConfig::video_pacer_timings`] / [`CameraConfig::audio_pacer_timings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacerTimings {
+	/// Delay applied to the first frame a source queues, so a buffer exists
+	/// before anything reaches subscribers.
+	pub initial_latency: std::time::Duration,
+	/// How far ahead of the wall clock the emit cursor may run under burst
+	/// pressure.
+	pub max_lead: std::time::Duration,
+}
+
+impl PacerTimings {
+	/// Millisecond config values to durations, applying the one rule the
+	/// pair has to obey: the lead cap is never below the latency. A cap
+	/// under the latency is self-contradictory — the first frame would be
+	/// scheduled past the point where the cap re-anchors the cursor — so
+	/// the larger of the two is used for both. This is the last line of
+	/// defence for configurations that never went through
+	/// [`clamp_pacer_lead_limits`]; it never logs and never fails.
+	pub fn from_ms(latency_ms: u32, max_lead_ms: u32) -> Self {
+		let latency = std::time::Duration::from_millis(latency_ms as u64);
+		let max_lead = std::time::Duration::from_millis(max_lead_ms.max(latency_ms) as u64);
+		Self {
+			initial_latency: latency,
+			max_lead,
+		}
+	}
+}
+
+impl CameraConfig {
+	/// Effective video-pacer timings for this camera.
+	pub fn video_pacer_timings(&self) -> PacerTimings {
+		PacerTimings::from_ms(self.video_pacer_latency_ms, self.video_pacer_max_lead_ms)
+	}
+
+	/// Effective audio-pacer timings for this camera.
+	pub fn audio_pacer_timings(&self) -> PacerTimings {
+		PacerTimings::from_ms(self.audio_pacer_latency_ms, self.audio_pacer_max_lead_ms)
 	}
 }
 
@@ -801,6 +1250,16 @@ const fn default_motion_wake_hold_secs() -> f64 {
 	30.0
 }
 
+/// Five seconds, which is ten of the retransmission gaps the discovery code
+/// already uses (`RESEND_WAIT` in `crates/core/src/bc_protocol/connection/discovery.rs`):
+/// enough to cover a broadcast that the switch drops the first time round, and
+/// short enough that a bridge with nothing on its LAN still starts promptly. A
+/// camera that will answer, answers on the first round trip — the wait is for
+/// packet loss, not for the camera to wake up.
+const fn default_startup_discovery_wait_secs() -> u64 {
+	5
+}
+
 // ── Parsing ────────────────────────────────────────────────────────────
 
 /// Top-level scalar config keys. Used by [`validate_top_level_key_placement`]
@@ -898,13 +1357,94 @@ fn walk_for_misplaced(path: &str, value: &toml::Value, out: &mut Vec<(String, St
 	}
 }
 
+/// Tables this configuration language used to have, in French, and what replaced
+/// them.
+///
+/// Serde's own message for an unknown table lists the fields it expected, which tells the
+/// operator where to look only if they already know that their settings moved. The file
+/// still carrying these tables is a real file, written on request, and the next reader is
+/// going to have it under their eyes: so the two names are recognised here and answered in
+/// plain terms, with the successor of every key and a pointer to the migration table.
+const RETIRED_TABLES: &[(&str, &str)] = &[
+	(
+		"annonces",
+		"it is now three settings on each camera, not one table for all of them: 		 `interroger` -> `read_on_wake`, `tenue_secs` -> `read_hold_secs`, `intervalle_secs` 		 -> `read_interval_secs`. Move them into the `[[cameras]]` block they belong to: two 		 cameras on one installation do not need the same rhythm. The migration table in 		 `docs/settings.md` lists the three.",
+	),
+	(
+		"carnet",
+		"it has no successor. What the camera announces is published as the doorbell press 		 event (`status/doorbell`, payload `press`, not retained) and written to the log with 		 `event`, `reason` and the durations; this bridge keeps no notebook file, and nothing 		 reads one. Delete the table. The migration table in `docs/settings.md` says why.",
+	),
+];
+
+/// Refuse a configuration that still carries a retired table, naming it and saying what
+/// replaced it. Runs before serde for the same reason the placement scanner does: the
+/// generic "unknown field" message would be the last useful thing this operator reads.
+fn validate_renamed_tables(value: &toml::Value) -> Result<(), String> {
+	let Some(root) = value.as_table() else {
+		return Ok(());
+	};
+	let found: Vec<String> = RETIRED_TABLES
+		.iter()
+		.filter(|(name, _)| root.contains_key(*name))
+		.map(|(name, advice)| {
+			format!("the [{name}] table no longer exists: {advice}")
+		})
+		.collect();
+	if found.is_empty() {
+		return Ok(());
+	}
+	Err(found.join("\n"))
+}
+
+/// Decide whether a file that declares no camera may still be accepted.
+///
+/// A missing `[[cameras]]` is a parse error, and has been all along: a bridge with
+/// nothing to do is more likely to be a file the operator thinks they wrote than a
+/// deliberate choice. `[startup_discovery]` is the one case where "no camera in the
+/// file" *is* the instruction — asking the LAN who is there is the operator's way of
+/// not writing identifiers — so the empty list is spelled out for serde here, and
+/// nowhere else. A file without that table, or with it switched off, is not touched
+/// by this function at all: its parse error, if it has one, is the one it always
+/// produced.
+///
+/// Switched-off-but-present gets its own sentence rather than serde's `missing field
+/// \`cameras\``, because that operator has just asked for a mode they did not get, and
+/// "cameras" is not the word they were looking for.
+fn implicit_camera_list(value: &mut toml::Value) -> Result<(), String> {
+	let root = match value.as_table_mut() {
+		Some(root) => root,
+		None => return Ok(()),
+	};
+	let Some(discovery) = root.get("startup_discovery") else {
+		return Ok(());
+	};
+	let armed = discovery.get("enable").and_then(toml::Value::as_bool);
+	if root.contains_key("cameras") {
+		return Ok(());
+	}
+	match armed {
+		Some(true) => {
+			root.insert("cameras".to_string(), toml::Value::Array(Vec::new()));
+			Ok(())
+		}
+		_ => Err(
+			"the [startup_discovery] table is present but `enable` is not true, so nothing goes \
+			 looking for cameras on the network: set enable = true to adopt the ones that answer, \
+			 or declare them with [[cameras]]"
+				.to_string(),
+		),
+	}
+}
+
 /// Parse a TOML string into a Config. Runs the placement scanner
 /// before serde deserialisation so misplaced top-level keys get a
 /// dedicated diagnostic instead of serde's "unknown field" error.
 pub fn parse_config(toml_str: &str) -> Result<Config, String> {
-	let value: toml::Value =
+	let mut value: toml::Value =
 		toml::from_str(toml_str).map_err(|e| format!("Failed to parse config: {e}"))?;
 	validate_top_level_key_placement(&value)?;
+	validate_renamed_tables(&value)?;
+	implicit_camera_list(&mut value)?;
 	let mut config: Config = value
 		.try_into()
 		.map_err(|e: toml::de::Error| format!("Failed to parse config: {e}"))?;
@@ -914,7 +1454,61 @@ pub fn parse_config(toml_str: &str) -> Result<Config, String> {
 		cam.cloud_account = config.cloud_account.clone();
 		cam.cloud_password = config.cloud_password.clone();
 	}
+	// A pacer lead cap below its own latency is a tuning mistake, not a config
+	// error: normalise it once here so every consumer sees one coherent pair.
+	clamp_pacer_lead_limits(&mut config);
 	Ok(config)
+}
+
+/// Raise every camera's pacer lead cap to its latency floor, warning once per
+/// adjusted pair. Never fails and never panics: an inconsistent
+/// `(latency, max_lead)` pair says what the operator meant (a tighter
+/// pipeline), and quietly keeping the impossible half of it would leave them
+/// chasing a latency that never changes.
+///
+/// [`parse_config`] calls this. The add-on path assembles its config through
+/// [`crate::hassio::merge`] instead, so that command calls it explicitly too,
+/// and [`PacerTimings::from_ms`] clamps again as a last line of defence for
+/// anything built in code.
+pub fn clamp_pacer_lead_limits(config: &mut Config) {
+	for cam in &mut config.cameras {
+		cam.video_pacer_max_lead_ms = clamp_lead_to_latency(
+			&cam.name,
+			"video",
+			cam.video_pacer_latency_ms,
+			cam.video_pacer_max_lead_ms,
+		);
+		cam.audio_pacer_max_lead_ms = clamp_lead_to_latency(
+			&cam.name,
+			"audio",
+			cam.audio_pacer_latency_ms,
+			cam.audio_pacer_max_lead_ms,
+		);
+	}
+}
+
+/// The floor itself, and the one warning that goes with it. Returns the value
+/// to use: the cap, unless it sat below the latency, in which case the
+/// latency.
+fn clamp_lead_to_latency(
+	camera: &str,
+	kind: &'static str,
+	latency_ms: u32,
+	max_lead_ms: u32,
+) -> u32 {
+	if max_lead_ms >= latency_ms {
+		return max_lead_ms;
+	}
+	tracing::warn!(
+		camera,
+		kind,
+		latency_ms,
+		max_lead_ms,
+		"config: pacer max_lead_ms is below the pacer latency_ms; using the latency as the cap. \
+		 The first frame is held for latency_ms, so a smaller cap would release it early and \
+		 cancel the buffering the latency is there to buy."
+	);
+	latency_ms
 }
 
 /// Filename of the host's MFA trust-token store, written by `cloud-authorise`
@@ -1140,6 +1734,60 @@ pub fn warn_wire_debug_enabled(config: &Config) {
 			);
 		}
 	}
+}
+
+/// The session probe's default cadence: 5 s, the value this bridge has always
+/// used. Kept as a function so `serde(default)` and [`CameraConfig::default`]
+/// cannot drift apart.
+const fn default_probe_session_secs() -> u64 {
+	5
+}
+
+/// Off by default: no deferred attempt, which is what this bridge has always
+/// done. `0` is a value with a meaning, not a missing value.
+const fn default_retry_after_secs() -> u64 {
+	0
+}
+
+/// On by default, for the reason the camera itself gives: the announcement arrives
+/// when the camera is already awake, because that is what it is announcing. What it
+/// buys is a session at that moment instead of at the end of whatever the camera
+/// woke for, so a wake that carries no press still leaves the battery level and the
+/// settings current. What it costs is one session per announced wake, including
+/// detections that carry nothing, which is why it can be switched off per camera.
+/// It is not the way to learn that a button was pressed sooner: the announcement of
+/// a press is published directly, without a session.
+const fn default_read_on_wake() -> bool {
+	true
+}
+
+/// How long the bridge waits for that session to appear, holding the wake lock
+/// meanwhile. A camera that answers is released as soon as the session is up, so
+/// the long end of this window is only paid by a camera that does not answer.
+/// The default covers a camera whose link takes a few seconds to come up.
+const fn default_read_hold_secs() -> u64 {
+	20
+}
+
+/// Minimum spacing between two reads that got a session. Motion detection wakes a
+/// battery camera on every moving object, so without a floor every moving object
+/// buys a session and the battery budget is gone. A read that got no session is
+/// not charged to it: it cost nothing.
+const fn default_read_interval_secs() -> u64 {
+	60
+}
+
+/// The refusal message for a camera with no probe and no idle disconnect.
+/// One sentence, because it is printed at startup and the operator has to be
+/// able to act on it without opening a manual.
+fn probe_without_idle_error(name: &str) -> String {
+	format!(
+		"camera {name}: probe_session_secs = 0 removes the only detector of a half-dead session \
+		 (the socket reader gives up on EOF without reporting it, no command on that socket has a \
+		 timeout, and SO_KEEPALIVE is set nowhere in this tree), and with idle_disconnect = false \
+		 nothing else ever ends the session: set probe_session_secs above 0, or idle_disconnect \
+		 to true and let the grace period close it"
+	)
 }
 
 /// Resolve the effective idle-disconnect grace period for a camera,
@@ -1474,6 +2122,38 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 		}
 	}
 
+	// `[startup_discovery]` validation, gated on `enable` like the blocks above.
+	if let Some(sd) = config.startup_discovery_active() {
+		// The window is the one part of this mode that costs the operator
+		// something they cannot see: seconds of startup in which no camera is
+		// reachable. Out-of-range values are refused rather than clamped, because a
+		// clamp would silently replace the number they wrote with a different
+		// promise about how long the bridge takes to come up.
+		if sd.wait_secs == 0 || sd.wait_secs > MAX_STARTUP_DISCOVERY_WAIT_SECS {
+			return Err(format!(
+				"[startup_discovery]: wait_secs must be between 1 and {MAX_STARTUP_DISCOVERY_WAIT_SECS} \
+				 (got {}); the scan runs before the listeners start, so the window is time no camera \
+				 is serving",
+				sd.wait_secs,
+			));
+		}
+		// Missing credentials are *not* refused here. The mode's whole job is to hear
+		// from cameras this file does not name, and refusing the file because the pair
+		// is absent would hide the one thing worth telling the operator: that a camera
+		// may well answer and be left unadopted. `warn_startup_discovery_without_credentials`
+		// says so at startup and in `check-config`; the scan itself repeats it per
+		// camera that answers, naming it.
+	}
+
+	// The session probe is the only life detector for an open session, so a
+	// camera that switches it off has to have the other closer switched on.
+	// Refused at startup rather than discovered the first night the doorbell
+	// wanders off Wi-Fi and the bridge reports `connected` until the sun burns out.
+	for cam in &config.cameras {
+		if cam.probe_session_secs == 0 && !cam.idle_disconnect {
+			return Err(probe_without_idle_error(&cam.name));
+		}
+	}
 	// `[webhook]` validation, plus the per-camera opt-in it gates.
 	let webhook_enabled = config.webhook.as_ref().is_some_and(|w| w.enable);
 	if let Some(wh) = config.webhook.as_ref().filter(|w| w.enable) {
@@ -1555,6 +2235,152 @@ pub fn validate_config(config: &Config) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+	/// The scope decides, and the test pins which side of the line each scope is on.
+	#[test]
+	fn only_none_and_local_keep_the_uid_at_home() {
+		assert!(!uid_travels_beyond_local(DiscoveryMethod::None));
+		assert!(!uid_travels_beyond_local(DiscoveryMethod::Local));
+		for far in [
+			DiscoveryMethod::Remote,
+			DiscoveryMethod::Map,
+			DiscoveryMethod::Relay,
+			DiscoveryMethod::Cellular,
+		] {
+			assert!(uid_travels_beyond_local(far), "{far:?} asks the relays");
+		}
+	}
+
+	/// The warning is one line per offending camera, naming the tail and the scope, and
+	/// says nothing about a camera that stays on the LAN.
+	#[test]
+	fn the_relay_scope_is_named_at_startup_and_local_is_silent() {
+		let mut cfg = Config::default();
+		let mut relayed = CameraConfig {
+			name: "Doorbell".into(),
+			uid: Some("9527000SYNTHTESTWXYZ".into()),
+			..CameraConfig::default()
+		};
+		relayed.discovery = DiscoveryMethod::Relay;
+		let mut local = relayed.clone();
+		local.name = "Garden".into();
+		local.discovery = DiscoveryMethod::Local;
+		cfg.cameras = vec![relayed, local];
+
+		let captured = crate::test_logs::capture_at(tracing::Level::WARN);
+		warn_uid_beyond_local(&cfg);
+		let text = captured.text();
+		assert_eq!(text.matches("WARN").count(), 1, "one line, for the offending camera: {text}");
+		assert!(text.contains("twelve relay"), "{text}");
+		assert!(text.contains("does not stop at the first"), "{text}");
+		assert!(text.contains("decided by the network's DNS"), "{text}");
+		assert!(text.contains("broadcasts only"), "the cost of `local` is said in the same breath: {text}");
+		assert!(!text.contains("9527000SYNTHTESTWXYZ"), "the full uid is not printed: {text}");
+		assert!(text.contains("STWXYZ"), "the tail is, so it can be matched to the file: {text}");
+		assert!(!text.contains("Garden"), "the LAN camera is not mentioned: {text}");
+	}
+
+	/// The operator's own file, reduced to what matters for this check: the two retired
+	/// tables with their real keys, and one camera. Addresses and credentials are
+	/// placeholders, because the point is the table names, not her installation.
+	const OPERATOR_FILE: &str = r#"
+[wake_server]
+enable = true
+
+[carnet]
+enable = true
+interface = ""
+camera = ["aa:bb:cc:dd:ee:ff", "192.0.2.199"]
+journal = "/config/bairelay/frames-journal.txt"
+taille_max_octets = 2000000
+durree_secs = 21600
+
+[annonces]
+interroger = true
+tenue_secs = 25
+intervalle_secs = 30
+
+[[cameras]]
+name = "Doorbell"
+address = "192.0.2.10"
+username = "admin"
+password = "placeholder"
+"#;
+
+	#[test]
+	fn a_file_carrying_the_retired_tables_is_refused_by_name_and_answered() {
+		let err = parse_config(OPERATOR_FILE).expect_err("both retired tables must be refused");
+		assert!(err.contains("[annonces]"), "{err}");
+		assert!(err.contains("[carnet]"), "{err}");
+		// The successors, each named: an operator has to be able to edit the file from
+		// this message alone.
+		for key in ["read_on_wake", "read_hold_secs", "read_interval_secs"] {
+			assert!(err.contains(key), "the message must name {key}: {err}");
+		}
+		for old in ["interroger", "tenue_secs", "intervalle_secs"] {
+			assert!(err.contains(old), "the message must say which key moved: {old}");
+		}
+		assert!(err.contains("no successor"), "carnet has none: {err}");
+		assert!(err.contains("docs/settings.md"), "and where to read it: {err}");
+	}
+
+	#[test]
+	fn one_retired_table_is_named_without_naming_the_other() {
+		let only = OPERATOR_FILE.replace(
+			r#"[carnet]
+enable = true
+interface = ""
+camera = ["aa:bb:cc:dd:ee:ff", "192.0.2.199"]
+journal = "/config/bairelay/frames-journal.txt"
+taille_max_octets = 2000000
+durree_secs = 21600
+"#,
+			"",
+		);
+		let err = parse_config(&only).expect_err("[annonces] alone is still refused");
+		assert!(err.contains("[annonces]"), "{err}");
+		assert!(!err.contains("[carnet]"), "nothing was said about a table absent: {err}");
+	}
+
+	#[test]
+	fn a_file_without_retired_tables_is_not_touched_by_this_check() {
+		let without = OPERATOR_FILE
+			.split("\n[annonces]")
+			.next()
+			.expect("the file has the annonces table")
+			.split("\n[carnet]")
+			.next()
+			.expect("the file has the carnet table")
+			.to_string()
+			+ r#"
+[[cameras]]
+name = "Doorbell"
+address = "192.0.2.10"
+username = "admin"
+password = "placeholder"
+"#;
+		match parse_config(&without) {
+			Ok(_) => {}
+			Err(e) => assert!(
+				!e.contains("no longer exists"),
+				"a file with no retired table must not get that message: {e}"
+			),
+		}
+	}
+
+	#[test]
+	fn a_camera_with_no_discovery_key_still_defaults_to_the_relay() {
+		// `DiscoveryMethod::None` is an additive variant: it exists to emit nothing,
+		// not to look less far. Nothing may move the default away from the relay,
+		// because that default is what every existing configuration gets to keep. If
+		// this test ever fails, a camera that used to reach the relay has silently
+		// stopped trying to.
+		let cfg = CameraConfig::default();
+		assert!(
+			matches!(cfg.discovery, DiscoveryMethod::Relay),
+			"the default discovery is the relay"
+		);
+	}
+
 	use super::*;
 
 	/// A config with `[webhook] enable` and `webhook_advertise`.
@@ -1805,7 +2631,7 @@ mod tests {
 	}
 
 	#[test]
-	fn non_cloud_camera_still_requires_password() {
+	fn a_non_cloud_camera_still_requires_a_password() {
 		let toml = r#"
 			bind = "0.0.0.0"
 
@@ -1917,5 +2743,411 @@ mod tests {
 			password = "x"
 		"#;
 		assert!(toml::from_str::<Config>(toml).is_err());
+	}
+
+	#[test]
+	fn probe_session_secs_defaults_to_the_cadence_this_bridge_already_used() {
+		// Two paths must agree or an operator gets one cadence from the code and
+		// another from the parser.
+		assert_eq!(CameraConfig::default().probe_session_secs, 5, "the struct default");
+		let cam: CameraConfig = toml::from_str(
+			"name = \"Cam\"\naddress = \"192.168.1.5\"\nusername = \"admin\"\npassword = \"p\"\n",
+		)
+		.unwrap();
+		assert_eq!(
+			cam.probe_session_secs,
+			CameraConfig::default().probe_session_secs,
+			"serde's default and the struct's default are two code paths; they must not drift"
+		);
+	}
+
+	#[test]
+	fn probe_session_secs_is_read_from_the_toml() {
+		let cfg: Config = toml::from_str(
+			r#"
+			[[cameras]]
+			name = "Cam"
+			address = "192.168.1.5"
+			username = "admin"
+			password = "p"
+			probe_session_secs = 0
+			idle_disconnect = true
+			"#,
+		)
+		.unwrap();
+		assert_eq!(cfg.cameras[0].probe_session_secs, 0);
+	}
+
+	#[test]
+	fn removing_the_probe_without_the_idle_disconnect_is_refused() {
+		// The two settings are the only ways this bridge ends a session. Both
+		// off means a camera that leaves the network without a FIN holds the
+		// session, the status topics and the wake path open for ever.
+		let mut cfg = Config::default();
+		cfg.cameras = vec![CameraConfig {
+			name: "Doorbell".into(),
+			address: Some("192.168.1.9".into()),
+			password: Some("p".into()),
+			probe_session_secs: 0,
+			idle_disconnect: false,
+			..CameraConfig::default()
+		}];
+		let err = validate_config(&cfg).expect_err("probe off plus idle_disconnect off");
+		assert!(err.contains("Doorbell"), "the message names the camera: {err}");
+		assert!(
+			err.contains("probe_session_secs") && err.contains("idle_disconnect"),
+			"the message names both settings the operator can change: {err}"
+		);
+		assert!(
+			err.contains("SO_KEEPALIVE") || err.contains("EOF"),
+			"the message says why, not just that: {err}"
+		);
+	}
+
+	#[test]
+	fn removing_the_probe_is_allowed_when_the_grace_period_closes_the_session() {
+		let mut cfg = Config::default();
+		cfg.cameras = vec![CameraConfig {
+			name: "Doorbell".into(),
+			address: Some("192.168.1.9".into()),
+			password: Some("p".into()),
+			probe_session_secs: 0,
+			idle_disconnect: true,
+			..CameraConfig::default()
+		}];
+		validate_config(&cfg).expect("the grace period is a real bound");
+	}
+
+	#[test]
+	fn a_probe_cadence_of_one_second_is_not_refused() {
+		// An operator probing harder than the default is not a contradiction;
+		// the per-probe timeout is clamped to the tick instead of being refused.
+		let mut cfg = Config::default();
+		cfg.cameras = vec![CameraConfig {
+			name: "Fast".into(),
+			address: Some("192.168.1.9".into()),
+			password: Some("p".into()),
+			probe_session_secs: 1,
+			idle_disconnect: false,
+			..CameraConfig::default()
+		}];
+		validate_config(&cfg).expect("a fast probe is legal");
+	}
+
+	#[test]
+	fn no_deferred_attempt_is_the_default() {
+		assert_eq!(CameraConfig::default().retry_after_secs, 0, "today's behaviour");
+		let cam: CameraConfig = toml::from_str(
+			"name = \"Cam\"\naddress = \"192.168.1.5\"\nusername = \"admin\"\npassword = \"p\"\n",
+		)
+		.unwrap();
+		assert_eq!(cam.retry_after_secs, 0, "the parser agrees with the struct");
+	}
+
+	#[test]
+	fn the_deferred_attempt_delay_is_read_from_the_toml() {
+		let cfg: Config = toml::from_str(
+			r#"
+			[[cameras]]
+			name = "Cam"
+			address = "192.168.1.5"
+			username = "admin"
+			password = "p"
+			retry_after_secs = 90
+			idle_disconnect = true
+			"#,
+		)
+		.unwrap();
+		assert_eq!(cfg.cameras[0].retry_after_secs, 90);
+	}
+
+	/// The whole point of the mode, at the parser: a file that names no camera and
+	/// asks for the scan is a file that means something, and it has to load.
+	#[test]
+	fn a_file_that_lets_the_network_name_the_cameras_loads() {
+		let cfg = parse_config(
+			r#"
+			[startup_discovery]
+			enable = true
+			username = "admin"
+			password = "shared-lan-password"
+			"#,
+		)
+		.expect("no [[cameras]] is the request, not a mistake");
+		assert!(
+			cfg.cameras.is_empty(),
+			"nothing to declare means nothing to build"
+		);
+		let scan = cfg.startup_discovery_active().expect("the table is armed");
+		assert_eq!(scan.wait_secs, 5, "and the wait is the documented default");
+		validate_config(&cfg).expect("a scan-only file is a valid file");
+	}
+
+	/// The same file without the switch is the same file the operator would have
+	/// written before this mode existed — and it fails the way it always failed, with a
+	/// sentence that names the table they did write instead of the one they did not.
+	#[test]
+	fn a_scan_table_that_is_not_armed_still_needs_cameras() {
+		let err = parse_config(
+			r#"
+			[startup_discovery]
+			wait_secs = 3
+			username = "admin"
+			password = "shared-lan-password"
+			"#,
+		)
+		.expect_err("a table nobody armed cannot fill the camera list");
+		assert!(err.contains("[startup_discovery]"), "{err}");
+		assert!(err.contains("enable = true"), "{err}");
+
+		// And a file with no table at all keeps the error it has always produced:
+		// serde's own, about the missing field. Nothing in this mode leaks into it.
+		let plain = parse_config("bind = \"127.0.0.1\"\n").expect_err("no cameras, no mode");
+		assert!(
+			plain.contains("cameras") && !plain.contains("[startup_discovery]"),
+			"{plain}"
+		);
+	}
+
+	/// The window is bounded, and a value outside the bound is refused rather than
+	/// quietly replaced with something else.
+	#[test]
+	fn the_wait_is_bounded_and_says_so() {
+		let file = |secs: u64| {
+			parse_config(&format!(
+				r#"
+				[startup_discovery]
+				enable = true
+				wait_secs = {secs}
+				username = "admin"
+				password = "p"
+				"#,
+			))
+		};
+		for bad in [0, MAX_STARTUP_DISCOVERY_WAIT_SECS + 1] {
+			let err = validate_config(&file(bad).expect("the table parses"))
+				.expect_err("a window outside the bound is a refusal, not a clamp");
+			assert!(err.contains("wait_secs"), "{err}");
+			assert!(
+				err.contains("1 and"),
+				"the range is given back to them: {err}"
+			);
+		}
+		validate_config(&file(MAX_STARTUP_DISCOVERY_WAIT_SECS).expect("parses"))
+			.expect("the top of the range is legal, not refused");
+	}
+
+	/// Credentials are the one thing a discovered camera cannot be guessed into
+	/// having, so the mode says what is missing — once, before the scan — and stays
+	/// quiet when the pair is there or when the mode is off.
+	#[test]
+	fn the_credential_warning_names_the_missing_half_and_only_that_one() {
+		let mut cfg = Config {
+			startup_discovery: Some(StartupDiscoveryConfig {
+				enable: true,
+				username: Some("admin".into()),
+				password: None,
+				..StartupDiscoveryConfig::default()
+			}),
+			..Config::default()
+		};
+
+		let captured = crate::test_logs::capture_at(tracing::Level::WARN);
+		warn_startup_discovery_without_credentials(&cfg);
+		let text = captured.text();
+		assert_eq!(text.matches("WARN").count(), 1, "{text}");
+		assert!(
+			text.contains("but password is not configured"),
+			"the missing half is named: {text}"
+		);
+		assert!(
+			!text.contains("but username and password"),
+			"not the half that is already there: {text}"
+		);
+
+		cfg.startup_discovery.as_mut().expect("armed").password = Some("p".into());
+		let captured = crate::test_logs::capture_at(tracing::Level::WARN);
+		warn_startup_discovery_without_credentials(&cfg);
+		assert!(
+			captured.text().is_empty(),
+			"a complete pair has nothing to warn about"
+		);
+
+		// The same table with the switch off is not a mode, and not a warning.
+		cfg.startup_discovery.as_mut().expect("still there").password = None;
+		cfg.startup_discovery.as_mut().expect("still there").enable = false;
+		let captured = crate::test_logs::capture_at(tracing::Level::WARN);
+		warn_startup_discovery_without_credentials(&cfg);
+		assert!(
+			captured.text().is_empty(),
+			"the off switch silences the table as completely as it silences the scan"
+		);
+	}
+
+	/// `startup_discovery_active` is the only door: `Some` means "the operator wants
+	/// the scan", and nothing else in the codebase gets to decide that from the field.
+	#[test]
+	fn only_an_armed_table_counts_as_a_mode() {
+		let mut cfg = Config::default();
+		assert!(cfg.startup_discovery_active().is_none(), "absent: off");
+		cfg.startup_discovery = Some(StartupDiscoveryConfig::default());
+		assert!(
+			cfg.startup_discovery_active().is_none(),
+			"present, default: off"
+		);
+		cfg.startup_discovery.as_mut().expect("present").enable = true;
+		assert!(cfg.startup_discovery_active().is_some(), "armed");
+	}
+
+	/// The credential pair is only a pair when both halves have something in them.
+	/// Whitespace is not a username: an operator who typed a space in the field meant
+	/// to fill it, and a camera that is logged into with `" "` is not a fallback worth
+	/// having.
+	#[test]
+	fn a_credential_pair_is_both_halves_or_neither() {
+		let pair = |username: Option<&str>, password: Option<&str>| StartupDiscoveryConfig {
+			enable: true,
+			username: username.map(str::to_string),
+			password: password.map(str::to_string),
+			..StartupDiscoveryConfig::default()
+		};
+		assert_eq!(
+			pair(Some("admin"), Some("p")).credentials(),
+			Some(("admin", "p"))
+		);
+		assert_eq!(pair(Some("  "), Some("p")).credentials(), None);
+		assert_eq!(pair(Some("admin"), Some("")).credentials(), None);
+		assert_eq!(pair(None, None).credentials(), None);
+		assert_eq!(
+			pair(None, None).missing_credentials(),
+			Some("username and password")
+		);
+		assert_eq!(
+			pair(Some("admin"), None).missing_credentials(),
+			Some("password")
+		);
+		assert_eq!(
+			pair(None, Some("p")).missing_credentials(),
+			Some("username")
+		);
+		assert_eq!(pair(Some("admin"), Some("p")).missing_credentials(), None);
+	}
+
+	// ── Media pacer keys ───────────────────────────────────────────────
+
+	/// One camera, with the given pacer lines spliced in verbatim (an empty
+	/// string means the keys are absent, i.e. defaulted).
+	fn pacer_toml(lines: &str) -> String {
+		format!(
+			"bind = \"0.0.0.0\"\nbind_port = 8554\n\n[[cameras]]\nname = \"doorbell\"\naddress = \"10.0.0.10:9000\"\nusername = \"admin\"\npassword = \"x\"\n{lines}"
+		)
+	}
+
+	#[test]
+	fn pacer_keys_default_to_historical_values() {
+		let cfg = parse_config(&pacer_toml("")).expect("parse");
+		let cam = &cfg.cameras[0];
+		assert_eq!(cam.video_pacer_latency_ms, DEFAULT_VIDEO_PACER_LATENCY_MS);
+		assert_eq!(cam.video_pacer_max_lead_ms, DEFAULT_VIDEO_PACER_MAX_LEAD_MS);
+		assert_eq!(cam.audio_pacer_latency_ms, DEFAULT_AUDIO_PACER_LATENCY_MS);
+		assert_eq!(cam.audio_pacer_max_lead_ms, DEFAULT_AUDIO_PACER_MAX_LEAD_MS);
+		// The shipped defaults are exactly what was measured as 1.5 s / 3 s
+		// video and 0.5 s / 2 s audio. Adding the keys may not move them.
+		assert_eq!(cam.video_pacer_latency_ms, 1500);
+		assert_eq!(cam.video_pacer_max_lead_ms, 3000);
+		assert_eq!(cam.audio_pacer_latency_ms, 500);
+		assert_eq!(cam.audio_pacer_max_lead_ms, 2000);
+		// The `Default` impl and the serde defaults must not drift apart.
+		let defs = CameraConfig::default();
+		assert_eq!(cam.video_pacer_latency_ms, defs.video_pacer_latency_ms);
+		assert_eq!(cam.video_pacer_max_lead_ms, defs.video_pacer_max_lead_ms);
+		assert_eq!(cam.audio_pacer_latency_ms, defs.audio_pacer_latency_ms);
+		assert_eq!(cam.audio_pacer_max_lead_ms, defs.audio_pacer_max_lead_ms);
+	}
+
+	#[test]
+	fn pacer_keys_parse_operator_values() {
+		let cfg = parse_config(&pacer_toml(
+			"video_pacer_latency_ms = 300\nvideo_pacer_max_lead_ms = 800\naudio_pacer_latency_ms = 200\naudio_pacer_max_lead_ms = 600\n",
+		))
+		.expect("parse");
+		let cam = &cfg.cameras[0];
+		assert_eq!(cam.video_pacer_latency_ms, 300);
+		assert_eq!(cam.video_pacer_max_lead_ms, 800);
+		assert_eq!(cam.audio_pacer_latency_ms, 200);
+		assert_eq!(cam.audio_pacer_max_lead_ms, 600);
+		assert_eq!(
+			cam.video_pacer_timings().initial_latency,
+			std::time::Duration::from_millis(300)
+		);
+		assert_eq!(
+			cam.audio_pacer_timings().max_lead,
+			std::time::Duration::from_millis(600)
+		);
+	}
+
+	#[test]
+	fn pacer_lead_cap_below_latency_is_raised_with_warning() {
+		let logs = crate::test_logs::capture_at(tracing::Level::WARN);
+		let cfg = parse_config(&pacer_toml(
+			"video_pacer_latency_ms = 1500\nvideo_pacer_max_lead_ms = 500\naudio_pacer_latency_ms = 500\naudio_pacer_max_lead_ms = 200\n",
+		))
+		.expect("parse");
+		let cam = &cfg.cameras[0];
+		// Both caps sat below their floor, and both were raised to it.
+		assert_eq!(cam.video_pacer_max_lead_ms, 1500);
+		assert_eq!(cam.audio_pacer_max_lead_ms, 500);
+		let out = logs.text();
+		assert_eq!(out.matches("WARN").count(), 2, "got: {out}");
+		assert!(out.contains("max_lead_ms"), "got: {out}");
+		assert!(out.contains("doorbell"), "got: {out}");
+		// Latencies are the operator's own numbers and stay untouched.
+		assert_eq!(cam.video_pacer_latency_ms, 1500);
+		assert_eq!(cam.audio_pacer_latency_ms, 500);
+	}
+
+	#[test]
+	fn pacer_lead_cap_equal_to_latency_is_left_alone() {
+		let logs = crate::test_logs::capture_at(tracing::Level::WARN);
+		let cfg = parse_config(&pacer_toml(
+			"video_pacer_latency_ms = 300\nvideo_pacer_max_lead_ms = 300\n",
+		))
+		.expect("parse");
+		assert_eq!(cfg.cameras[0].video_pacer_max_lead_ms, 300);
+		assert!(logs.text().is_empty(), "got: {}", logs.text());
+	}
+
+	#[test]
+	fn pacer_zero_latency_is_accepted_and_uncapped_by_default() {
+		// `0` latency means "emit the first frame immediately". The default
+		// lead cap still applies, so nothing clamps and nothing warns.
+		let logs = crate::test_logs::capture_at(tracing::Level::WARN);
+		let cfg = parse_config(&pacer_toml("video_pacer_latency_ms = 0\n")).expect("parse");
+		let cam = &cfg.cameras[0];
+		assert_eq!(cam.video_pacer_latency_ms, 0);
+		assert_eq!(cam.video_pacer_max_lead_ms, DEFAULT_VIDEO_PACER_MAX_LEAD_MS);
+		assert!(cam.video_pacer_timings().initial_latency.is_zero());
+		assert!(logs.text().is_empty(), "got: {}", logs.text());
+	}
+
+	/// The accessor clamps too, so a `CameraConfig` built in code (the add-on
+	/// merge path, a test) can never hand the pacer a self-contradictory pair,
+	/// even though `parse_config` never produced one.
+	#[test]
+	fn pacer_timings_accessor_clamps_without_parser() {
+		let cam = CameraConfig {
+			video_pacer_latency_ms: 900,
+			video_pacer_max_lead_ms: 100,
+			audio_pacer_latency_ms: 400,
+			audio_pacer_max_lead_ms: 400,
+			..CameraConfig::default()
+		};
+		let v = cam.video_pacer_timings();
+		assert_eq!(v.initial_latency, std::time::Duration::from_millis(900));
+		assert_eq!(v.max_lead, std::time::Duration::from_millis(900));
+		assert_eq!(
+			cam.audio_pacer_timings().max_lead,
+			std::time::Duration::from_millis(400)
+		);
 	}
 }

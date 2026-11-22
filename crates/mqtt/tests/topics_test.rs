@@ -248,8 +248,13 @@ fn query_pir_topic_format() {
 #[test]
 fn subscribe_topics_count() {
 	let subs = bairelay_mqtt::topics::subscribe_topics(PREFIX, "cam1");
-	// 12 control + 4 query = 16 topics
-	assert_eq!(subs.len(), 16);
+	// // 12 control + 1 settings wildcard + 4 query + 2 settings requests = 19.
+	// // The `control/+/+` wildcard is shared by every family: adding a setting must
+	// // never force a change to the subscription list.
+	assert_eq!(subs.len(), 19);
+	assert!(subs.contains(&"bairelay/cam1/control/+/+".to_string()));
+	assert!(subs.contains(&"bairelay/cam1/query/settings".to_string()));
+	assert!(subs.contains(&"bairelay/cam1/query/settings/+".to_string()));
 }
 
 #[test]
@@ -289,5 +294,10 @@ fn legacy_neolink_prefix_subscribe_list_matches_pre_2g_paths() {
 	assert!(subs.contains(&"neolink/cam1/control/floodlight".to_string()));
 	assert!(subs.contains(&"neolink/cam1/control/wakeup".to_string()));
 	assert!(subs.contains(&"neolink/cam1/query/battery".to_string()));
-	assert_eq!(subs.len(), 16);
+	// // Settings topics are added the same way under both prefixes: a migrated
+	// // installation receives the settings discovery
+	// // without reconfiguring anything.
+	assert!(subs.contains(&"neolink/cam1/control/+/+".to_string()));
+	assert!(subs.contains(&"neolink/cam1/query/settings".to_string()));
+	assert_eq!(subs.len(), 19);
 }

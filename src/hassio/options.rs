@@ -16,7 +16,7 @@ pub struct MqttServiceFlags {
 	pub ssl: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HassioOptions {
 	#[serde(default = "default_topic_prefix")]
 	pub topic_prefix: String,
@@ -24,9 +24,41 @@ pub struct HassioOptions {
 	pub log_level: String,
 	#[serde(default)]
 	pub cameras: Vec<HassioCamera>,
+	/// The "rhythms and policies" group of the add-on form: how often this
+	/// bridge talks about a camera, and what it is allowed to do about a camera
+	/// it cannot hear. Maps onto the real `[wake_server]` section, so the group
+	/// in the form and the section in the operator's file hold the same keys and
+	/// the merge rules stay short enough to read in one place.
+	#[serde(default)]
+	pub wake_server: Option<HassioCadence>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// One camera's rhythm, as the form asks for it.
+///
+/// Every field is `Option`: a blank form field means "not asked for", which is
+/// a different question from "asked for, and set to the built-in value". The
+/// blank case keeps whatever this bridge does today; see `build_base_config`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HassioCadence {
+	/// Start the local wake server. Off unless asked, like the section itself.
+	#[serde(default)]
+	pub enable: Option<bool>,
+	/// What this bridge advertises as its heartbeat cadence.
+	#[serde(default)]
+	pub heartbeat_ms: Option<u32>,
+	/// How long a camera stays in the registry without being heard from.
+	#[serde(default)]
+	pub stale_after_ms: Option<u64>,
+	/// What to advertise when it should not be the same number as the cadence
+	/// above. Left alone unless asked: the firmware sets its own pace.
+	#[serde(default)]
+	pub hb_advice_ms: Option<u32>,
+	/// Spell out why a wake request naming a declared camera was refused.
+	#[serde(default)]
+	pub explain_declared_uid: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct HassioCamera {
 	pub name: String,
 	#[serde(default)]
@@ -38,6 +70,20 @@ pub struct HassioCamera {
 	pub password: String,
 	#[serde(default = "default_idle_disconnect")]
 	pub idle_disconnect: bool,
+	/// Grace period before this camera is let go, once nothing needs it.
+	#[serde(default)]
+	pub idle_disconnect_timeout_secs: Option<f64>,
+	/// How often this bridge checks that a live session is still alive.
+	#[serde(default)]
+	pub probe_session_secs: Option<u64>,
+	/// How long one motion event keeps this camera reachable.
+	#[serde(default)]
+	pub motion_wake_hold_secs: Option<f64>,
+	/// How far this bridge may go to find the camera. The form only offers the
+	/// two scopes that stay inside the network; the operator's file can still
+	/// ask for more, and the startup warning says what that means.
+	#[serde(default)]
+	pub discovery: Option<String>,
 }
 
 fn default_username() -> String {
@@ -106,6 +152,9 @@ pub fn build_base_config(opts: &HassioOptions, mqtt: &MqttServiceFlags) -> Confi
 		});
 	}
 
+	// A blank form field is not a request to switch a rhythm off, so the blank
+	// case falls back to what this bridge does today rather than to zero.
+	let cam_defaults = CameraConfig::default();
 	cfg.cameras = opts
 		.cameras
 		.iter()
@@ -116,11 +165,48 @@ pub fn build_base_config(opts: &HassioOptions, mqtt: &MqttServiceFlags) -> Confi
 			username: c.username.clone(),
 			password: Some(c.password.clone()),
 			idle_disconnect: c.idle_disconnect,
+			idle_disconnect_timeout_secs: c.idle_disconnect_timeout_secs,
+			probe_session_secs: c.probe_session_secs.unwrap_or(cam_defaults.probe_session_secs),
+			motion_wake_hold_secs: c
+				.motion_wake_hold_secs
+				.unwrap_or(cam_defaults.motion_wake_hold_secs),
+			discovery: discovery_from_form(c.discovery.as_deref()).unwrap_or(cam_defaults.discovery),
 			..CameraConfig::default()
 		})
 		.collect();
 
+	if let Some(group) = &opts.wake_server {
+		let ws_defaults = bairelay_wake_server::WakeServerConfig::default();
+		cfg.wake_server = Some(bairelay_wake_server::WakeServerConfig {
+			enable: group.enable.unwrap_or(ws_defaults.enable),
+			heartbeat_ms: group.heartbeat_ms.unwrap_or(ws_defaults.heartbeat_ms),
+			stale_after_ms: group.stale_after_ms.unwrap_or(ws_defaults.stale_after_ms),
+			hb_advice_ms: group.hb_advice_ms,
+			explain_declared_uid: group
+				.explain_declared_uid
+				.unwrap_or(ws_defaults.explain_declared_uid),
+			..bairelay_wake_server::WakeServerConfig::default()
+		});
+	}
+
 	cfg
+}
+
+/// Translate the form's `discovery` choice into the config's enum.
+///
+/// Only the scopes that cannot leave the network are translatable, and that is
+/// a hard limit, not a default: the add-on form on this network must not offer
+/// a setting that reaches the Reolink cloud, even though the operator's file
+/// can ask for it deliberately. Anything else, including an empty field, yields
+/// `None` so the camera keeps today's behaviour instead of inheriting a scope
+/// nobody chose.
+pub(crate) fn discovery_from_form(choice: Option<&str>) -> Option<crate::config::DiscoveryMethod> {
+	use crate::config::DiscoveryMethod as D;
+	match choice.map(str::trim) {
+		Some("none") => Some(D::None),
+		Some("local") => Some(D::Local),
+		_ => None,
+	}
 }
 
 #[cfg(test)]
@@ -185,7 +271,9 @@ mod tests {
 				username: "admin".into(),
 				password: "secret".into(),
 				idle_disconnect: true,
+				..Default::default()
 			}],
+			..Default::default()
 		};
 		let mqtt = MqttServiceFlags {
 			host: Some("core-mosquitto".into()),
@@ -193,6 +281,7 @@ mod tests {
 			username: Some("addons".into()),
 			password: Some("pw".into()),
 			ssl: false,
+			..Default::default()
 		};
 		let cfg = build_base_config(&opts, &mqtt);
 		assert_eq!(cfg.cameras.len(), 1);
@@ -225,7 +314,9 @@ mod tests {
 				username: "admin".into(),
 				password: "p".into(),
 				idle_disconnect: true,
+				..Default::default()
 			}],
+			..Default::default()
 		};
 		let cfg = build_base_config(&opts, &MqttServiceFlags::default());
 		assert!(cfg.cameras[0].address.is_none());
@@ -248,7 +339,9 @@ mod tests {
 				username: "admin".into(),
 				password: "p".into(),
 				idle_disconnect: true,
+				..Default::default()
 			}],
+			..Default::default()
 		};
 		let cfg = build_base_config(&opts, &MqttServiceFlags::default());
 		assert!(cfg.cameras[0].address.is_none());
@@ -261,6 +354,7 @@ mod tests {
 			topic_prefix: "bairelay".into(),
 			log_level: "info".into(),
 			cameras: vec![],
+			..Default::default()
 		};
 		let cfg = build_base_config(&opts, &MqttServiceFlags::default());
 		assert!(cfg.cameras.is_empty());
@@ -272,6 +366,7 @@ mod tests {
 			topic_prefix: "bairelay".into(),
 			log_level: "info".into(),
 			cameras: vec![],
+			..Default::default()
 		};
 		let cfg = build_base_config(&opts, &MqttServiceFlags::default());
 		assert!(
@@ -291,6 +386,7 @@ mod tests {
 			topic_prefix: "bairelay".into(),
 			log_level: "info".into(),
 			cameras: vec![],
+			..Default::default()
 		};
 		let mqtt = MqttServiceFlags {
 			host: Some("broker.example".into()),
@@ -317,6 +413,7 @@ mod tests {
 			topic_prefix: "bairelay".into(),
 			log_level: "info".into(),
 			cameras: vec![],
+			..Default::default()
 		};
 		let user_only = MqttServiceFlags {
 			host: Some("b.example".into()),
@@ -357,6 +454,7 @@ mod tests {
 			topic_prefix: "bairelay".into(),
 			log_level: "info".into(),
 			cameras: vec![],
+			..Default::default()
 		};
 		let mqtt = MqttServiceFlags {
 			host: None,
@@ -375,6 +473,7 @@ mod tests {
 			topic_prefix: "bairelay".into(),
 			log_level: "info".into(),
 			cameras: vec![],
+			..Default::default()
 		};
 		let mqtt = MqttServiceFlags {
 			host: Some("b.example".into()),

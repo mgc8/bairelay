@@ -372,7 +372,7 @@ impl UdpFlowState {
 
 	/// Camera→App: fold an inbound [`UdpData`] into the recv reorder
 	/// buffer. Returns `true` when the packet was inserted and the
-	/// caller should refresh the outgoing ack via [`build_send_ack`];
+	/// caller should refresh the outgoing ack via [`Self::build_send_ack`];
 	/// `false` when the packet was rejected (mismatched connection_id,
 	/// duplicate / already-consumed, REORDER_CAP overflow, or the
 	/// `u32::MAX` corner that would underflow ack-range arithmetic).

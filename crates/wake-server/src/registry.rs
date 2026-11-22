@@ -137,6 +137,45 @@ pub struct CameraEntry {
 #[derive(Default)]
 pub struct CameraRegistry {
 	cameras: Mutex<HashMap<String, CameraEntry>>,
+	/// Per-camera beat accounting, see [`CameraRegistry::note_beat`]. Keyed by the
+	/// same UIDs as `cameras` and pruned by the same sweep, so it cannot outgrow the
+	/// registry it belongs to.
+	/// Keyed by the uid **as the beat carried it**. A camera that ever showed up under
+	/// both of its shapes - the 20-character form from the beat and the 16-character one
+	/// from a binary header - would get two half windows and two reports, each internally
+	/// correct and neither complete. Same property as the entry table above, and it belongs
+	/// with the one-directional prefix fallback rather than to a key-fusing fix.
+	beats: Mutex<HashMap<String, BeatWindow>>,
+}
+
+/// How much beat history one line summarises. Ten minutes is long enough that a
+/// reported mean is not dominated by a single wake, and short enough that an
+/// unstable period shows up within one reading of it.
+pub(crate) const BEAT_REPORT_WINDOW: Duration = Duration::from_secs(600);
+
+/// One camera's window of beats.
+#[derive(Debug, Clone, Copy)]
+struct BeatWindow {
+	start: Instant,
+	prev: Instant,
+	beats: u32,
+	/// Shortest and longest gap seen in this window. The operator's own words for
+	/// the beat period were "quite unstable"; a mean alone would have hidden
+	/// exactly that, so the spread is reported next to it.
+	min_ms: u64,
+	max_ms: u64,
+}
+
+/// A closed window, ready to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeatReport {
+	pub window_secs: u64,
+	/// Beats seen in this window. The **intervals** reported below are
+	/// `beats - 1`: a window is bounded by the arrivals it holds.
+	pub beats: u32,
+	pub min_ms: u64,
+	pub max_ms: u64,
+	pub mean_ms: u64,
 }
 
 impl CameraRegistry {
@@ -169,6 +208,69 @@ impl CameraRegistry {
 		Some(prev.is_none())
 	}
 
+	/// Record one beat for `uid` and, when its window closes, hand back the summary
+	/// to log. A window opens on the first beat recorded for that uid, not at process
+	/// start: a camera that only started beating four minutes ago has four minutes of
+	/// evidence, and claiming otherwise would attribute silence to tempo. Returns `None` when the uid is not a registered camera — the window
+	/// follows the registry, so a flood of beats for unknown UIDs cannot grow this
+	/// map, and a camera evicted as stale stops being counted the moment it stops
+	/// being a camera. The clock is an argument, so tests drive windows without
+	/// sleeping.
+	pub fn note_beat(&self, uid: &str, now: Instant) -> Option<BeatReport> {
+		if !self.cameras.lock().expect("CameraRegistry mutex poisoned").contains_key(uid) {
+			return None;
+		}
+		let mut map = self.beats.lock().expect("CameraRegistry beat map poisoned");
+		let Some(window) = map.get_mut(uid) else {
+			map.insert(
+				uid.to_string(),
+				BeatWindow {
+					start: now,
+					prev: now,
+					beats: 1,
+					min_ms: u64::MAX,
+					max_ms: 0,
+				},
+			);
+			return None;
+		};
+		let gap = now.saturating_duration_since(window.prev).as_millis() as u64;
+		window.prev = now;
+		window.beats += 1;
+		window.min_ms = window.min_ms.min(gap);
+		window.max_ms = window.max_ms.max(gap);
+		let elapsed = now.saturating_duration_since(window.start);
+		if elapsed < BEAT_REPORT_WINDOW {
+			return None;
+		}
+		let total = elapsed.as_millis() as u64;
+		let beats = window.beats;
+		let report = BeatReport {
+			window_secs: total / 1000,
+			beats,
+			min_ms: window.min_ms,
+			max_ms: window.max_ms,
+			// The mean of the **same gaps** `min_ms` and `max_ms` bound, so the three
+			// numbers in one report answer one question: what did the beat actually do
+			// between its first and last arrival. Dividing the window by the beat count
+			// instead would mix species - a window of three beats holds two intervals,
+			// and a reader comparing a mean against min and max would be comparing a
+			// cadence against gaps. A one-beat window holds no interval at all: it
+			// reports 0 here and its extremes are not to be read.
+			mean_ms: if beats >= 2 {
+				total / u64::from(beats - 1)
+			} else {
+				0
+			},
+		};
+		window.start = now;
+		window.prev = now;
+		window.beats = 1;
+		window.min_ms = u64::MAX;
+		window.max_ms = 0;
+		Some(report)
+	}
+
 	/// Drop entries past `stale_after` and return the evicted UIDs.
 	/// Callers log info on each eviction so operators see deregistration.
 	/// Lazy: the registry has no background sweeper, so call this from
@@ -184,6 +286,12 @@ impl CameraRegistry {
 		for uid in &stale {
 			map.remove(uid);
 		}
+		// Beat windows belong to cameras, not to addresses: whatever leaves the
+		// registry stops being counted, so this map cannot accumulate ghosts.
+		self.beats
+			.lock()
+			.expect("CameraRegistry beat map poisoned")
+			.retain(|uid, _| !stale.contains(uid));
 		stale
 	}
 
@@ -249,8 +357,120 @@ impl CameraRegistry {
 
 #[cfg(test)]
 mod tests {
+	/// A registry with one camera that beat at `t0`.
+	fn rig(t0: Instant) -> CameraRegistry {
+		let reg = CameraRegistry::new();
+		reg.upsert("9527000SYNTHTEST", "192.0.2.7:50124".parse().unwrap(), 7, t0);
+		reg
+	}
+
+	#[test]
+	fn the_cadence_window_closes_only_after_the_full_window() {
+		let t0 = Instant::now();
+		let reg = rig(t0);
+		let mut beat = t0;
+		for _ in 0..50 {
+			beat += Duration::from_secs(11);
+			assert!(reg.note_beat("9527000SYNTHTEST", beat).is_none(), "ten minutes have not passed");
+		}
+		// The window opened on the first beat above, at t0 + 11 s, so it closes a full
+		// window after that beat and not after t0.
+		let closed = reg.note_beat("9527000SYNTHTEST", t0 + BEAT_REPORT_WINDOW + Duration::from_secs(11));
+		assert!(closed.is_some(), "the window closes once it is at least ten minutes wide");
+	}
+
+	/// The reason the spread exists: a period the operator calls unstable is
+	/// invisible in a mean. A wake doubles one gap while the mean barely moves.
+	#[test]
+	fn the_window_reports_the_spread_and_not_only_the_mean() {
+		let t0 = Instant::now();
+		let reg = CameraRegistry::new();
+		// A beat for a uid that is not a camera is not counted at all, so the window
+		// below really does open on the second call.
+		reg.note_beat("U", t0);
+		reg.upsert("U", "192.0.2.8:50124".parse().unwrap(), 1, t0);
+		assert!(reg.note_beat("U", t0).is_none(), "the window opens on this beat");
+		assert!(reg.note_beat("U", t0 + Duration::from_secs(10)).is_none());
+		let report = reg
+			.note_beat("U", t0 + BEAT_REPORT_WINDOW + Duration::from_secs(1))
+			.expect("the window closes");
+		assert_eq!(report.beats, 3, "the beats counted in the window");
+		assert_eq!(report.min_ms, 10_000, "the tight gap is reported");
+		assert_eq!(report.max_ms, 591_000, "the wake-sized gap is reported, not averaged away");
+		assert_eq!(
+			report.mean_ms, 300_500,
+			"the mean of the two gaps the window holds (10 s and 591 s), not its span over beat count"
+		);
+		assert_eq!(report.window_secs, 601);
+		// Why four numbers and not two: 10 s against 591 s inside the same ten minutes
+		// is the instability the operator described, and a mean of 200 s on its own
+		// would have hidden it completely.
+	}
+
+	#[test]
+	fn a_window_never_outlives_its_camera() {
+		let t0 = Instant::now();
+		let reg = rig(t0);
+		reg.note_beat("9527000SYNTHTEST", t0 + Duration::from_secs(5));
+		// An unknown uid is not a camera: counting it would let a flood of beats
+		// with invented UIDs grow this map.
+		assert!(reg.note_beat("9527000GHOST000000", t0).is_none());
+		let evicted = reg.purge_stale(t0 + Duration::from_secs(90_000), Duration::from_secs(80));
+		assert_eq!(evicted, vec!["9527000SYNTHTEST".to_string()]);
+		assert!(
+			reg.note_beat("9527000SYNTHTEST", t0 + Duration::from_secs(90_001)).is_none(),
+			"an evicted camera stops being counted the moment it stops being a camera"
+		);
+	}
+
+	#[test]
+	fn the_window_starts_over_after_it_reports() {
+		let t0 = Instant::now();
+		let reg = rig(t0);
+		let open = t0 + Duration::from_secs(5);
+		reg.note_beat("9527000SYNTHTEST", open);
+		let first = reg.note_beat("9527000SYNTHTEST", open + BEAT_REPORT_WINDOW).expect("closes");
+		let second = reg
+			.note_beat("9527000SYNTHTEST", open + 2 * BEAT_REPORT_WINDOW)
+			.expect("closes again");
+		assert_eq!(first.beats, 2, "{:?}", first);
+		assert_eq!(second.beats, 2, "the counter restarts, it does not accumulate: {:?}", second);
+		assert_eq!(second.window_secs, 600);
+		assert_eq!(second.min_ms, 600_000, "a single gap in a window is both extremes");
+		assert_eq!(second.max_ms, 600_000);
+	}
+
 	use super::*;
 	use std::net::SocketAddr;
+
+	#[test]
+	fn a_two_beat_window_reports_the_single_gap_it_measured() {
+		// The smallest case that tells the two definitions of `mean_ms` apart: a window of
+		// two beats holds one interval, so the mean must equal both extremes. Dividing the
+		// span by the beat count would print half the gap against a max that is the whole
+		// gap, and the report line would carry both numbers side by side.
+		let t0 = Instant::now();
+		let reg = CameraRegistry::new();
+		reg.upsert("9527000SYNTHWINDOW", "192.0.2.9:50124".parse().unwrap(), 3, t0);
+		assert!(reg.note_beat("9527000SYNTHWINDOW", t0).is_none(), "the window opens here");
+		let report = reg
+			.note_beat(
+				"9527000SYNTHWINDOW",
+				t0 + BEAT_REPORT_WINDOW + Duration::from_secs(1),
+			)
+			.expect("a window this wide closes");
+		assert_eq!(report.beats, 2, "{:?}", report);
+		assert_eq!(
+			report.mean_ms, report.max_ms,
+			"one interval: the mean is that interval, not half of it"
+		);
+		assert_eq!(report.mean_ms, report.min_ms);
+		assert!(
+			report.mean_ms >= 600_000,
+			"the gap is reported whole: {:?}",
+			report
+		);
+	}
 
 	fn addr(s: &str) -> SocketAddr {
 		s.parse().unwrap()

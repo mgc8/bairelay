@@ -1,3 +1,4 @@
+pub mod audio_control;
 pub mod audio_presence;
 pub mod bc_opts;
 pub mod bcmedia_dump;
@@ -8,8 +9,20 @@ pub mod capabilities;
 pub mod cli;
 pub mod cli_convert;
 pub mod config;
+pub mod family_state;
 pub mod grace_period;
 pub mod hassio;
+/// The wake-polling engine: one guarded question per wake announcement, so a
+/// camera that woke by itself gets read instead of going back to sleep unseen.
+///
+/// Driven by [`crate::wake_announcements`], which drains the announcements the
+/// register port hears: a camera that woke by itself gets read instead of going
+/// back to sleep with its battery level unread.
+pub(crate) mod polling;
+pub(crate) mod published_text_guard;
+/// Drives the guarded read from the announcements a camera pushes by itself;
+/// see the module docs.
+pub mod wake_announcements;
 pub mod local_time;
 pub mod mqtt_dispatch;
 pub mod mqtt_loop;
@@ -18,8 +31,13 @@ pub mod orchestrator;
 pub mod preview_overlay;
 pub mod preview_state;
 pub mod push_listener;
+pub mod settings;
 pub mod run_support;
+pub mod burst;
 pub mod shutdown_signal;
+/// The one place a camera enters the running configuration without having been
+/// written in the file: ask the LAN, adopt what answers. See the module docs.
+pub mod startup_discovery;
 pub mod startup_wake;
 pub mod status_cache;
 pub mod stream_source;

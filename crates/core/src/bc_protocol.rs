@@ -5,7 +5,7 @@ use log::*;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	sync::atomic::{AtomicBool, AtomicU16, Ordering},
 };
 use tokio::sync::RwLock;
@@ -14,10 +14,12 @@ use Md5Trunc::*;
 
 mod abilityinfo;
 mod alarm;
+mod audio;
 mod battery;
 mod camera_driver;
 pub mod connection;
 mod credentials;
+mod ding_dong;
 mod email;
 mod errors;
 #[cfg(any(test, feature = "test-util"))]
@@ -37,6 +39,7 @@ mod pirstate;
 mod ptz;
 mod pushinfo;
 mod reboot;
+mod settings;
 mod resolution;
 mod services;
 mod set_helpers;
@@ -55,6 +58,11 @@ pub use alarm::{
 	classify_alarm, classify_alarm_events, AiObject, AiObjects, AlarmUpdate, VisitorEdge,
 };
 pub use camera_driver::CameraDriver;
+/// The two pieces of the local discovery broadcast that a caller needs when it has no
+/// UID to look up: where a broadcast goes, and a socket able to send one. Published so
+/// the binary's startup scan asks the LAN with this code rather than a copy of it — see
+/// `connection::discovery`.
+pub use connection::discovery::{broadcast_destinations, broadcast_socket};
 pub(crate) use connection::*;
 pub use credentials::*;
 pub use errors::Error;
@@ -66,9 +74,11 @@ pub use motion::{MotionData, MotionStatus};
 pub use pirstate::PirState;
 pub use ptz::Direction;
 pub use pushinfo::PhoneType;
+pub use settings::{RawRequest, ImageCfg, MotionCfg, OsdCfg, RawResponse};
 pub use resolution::*;
 use std::sync::Arc;
 pub use stream::{StreamData, StreamKind, VideoStream};
+pub use talk::TalkAbilityProbe;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
@@ -99,6 +109,16 @@ pub struct BcCamera {
 	// wire so the plaintext does not leave the host outside that case.
 	credentials: Credentials,
 	abilities: RwLock<HashMap<String, ReadKind>>,
+	/// Abilities the *operator* declared for this camera because its own
+	/// `abilityInfo` omits them. [`has_ability`](Self::has_ability) treats a
+	/// name listed here as read-write for this session, so an
+	/// under-reporting firmware can be worked around per camera from the
+	/// config. Deliberately a **separate** map: [`ability_advertised`] and the
+	/// `abilities` command keep reporting exactly what the box advertised, so
+	/// an override can never make the diagnostic lie about the camera.
+	///
+	/// [`ability_advertised`]: Self::ability_advertised
+	ability_assertions: RwLock<HashSet<String>>,
 	/// This camera is configured `discovery = "cloud"` — it authenticates with a
 	/// minted cloud token (sigV3), never a local password. The account/UID below
 	/// are propagated to *every* camera from the document root, so this flag —
@@ -568,6 +588,7 @@ impl BcCamera {
 			logged_in: AtomicBool::new(false),
 			credentials: Credentials::new(username, passwd),
 			abilities: Default::default(),
+			ability_assertions: Default::default(),
 			is_cloud: matches!(options.discovery, DiscoveryMethods::Cloud),
 			sigv3_handshake,
 			cloud_account: options.cloud_account.clone(),
@@ -611,8 +632,15 @@ impl BcCamera {
 	}
 
 	async fn has_ability<T: Into<String>>(&self, name: T) -> ReadKind {
+		let name = name.into();
+		// Operator override first: a camera that answers `<TalkAbility>` with
+		// a full configuration while omitting the ability from `abilityInfo`
+		// is reachable only this way. See the field docs.
+		if self.ability_assertions.read().await.contains(&name) {
+			return ReadKind::ReadWrite;
+		}
 		let abilities = self.abilities.read().await;
-		if let Some(kind) = abilities.get(&name.into()).copied() {
+		if let Some(kind) = abilities.get(&name).copied() {
 			kind
 		} else {
 			ReadKind::None
@@ -623,11 +651,31 @@ impl BcCamera {
 	/// `None` when it wasn't — account (cloud) cameras answer msg 151
 	/// with 421, leaving the map empty, which says nothing about the
 	/// camera. Reads the cached map — no camera round trip.
+	///
+	/// Ignores [`declare_ability`](Self::declare_ability) on purpose: this is
+	/// the camera's own report, and the `abilities` diagnostic must keep
+	/// showing it even where an override lets a command through.
 	pub async fn ability_advertised(&self, name: &str) -> Option<bool> {
-		if self.abilities.read().await.is_empty() {
+		let abilities = self.abilities.read().await;
+		if abilities.is_empty() {
 			return None;
 		}
-		Some(!matches!(self.has_ability(name).await, ReadKind::None))
+		Some(abilities.contains_key(name))
+	}
+
+	/// Declare that this camera really does have `name`, even though its
+	/// `abilityInfo` does not list it, so the `has_ability_ro` /
+	/// `has_ability_rw` gates let the command through for **this session
+	/// only**.
+	///
+	/// This is the single escape hatch for firmware that under-reports: it is
+	/// off unless a caller passes it explicitly (the binary wires it to the
+	/// per-camera `two_way_audio = true` config entry, whose default is
+	/// `false`), it never touches the advertised-ability report, and it never
+	/// relaxes the gate for any other camera. Call it after `login` —
+	/// `login` is what fills the ability map it sits beside.
+	pub async fn declare_ability(&self, name: impl Into<String>) {
+		self.ability_assertions.write().await.insert(name.into());
 	}
 
 	async fn has_ability_ro<T: Into<String>>(&self, name: T) -> Result<()> {
@@ -706,6 +754,7 @@ impl BcCamera {
 			logged_in: AtomicBool::new(true),
 			credentials,
 			abilities: Default::default(),
+			ability_assertions: Default::default(),
 			is_cloud: false,
 			sigv3_handshake: None,
 			cloud_account: None,
@@ -830,6 +879,58 @@ mod bccamera_helpers_tests {
 		cam.test_set_ability("feature", true).await;
 		cam.has_ability_ro("feature").await.expect("ro ok");
 		cam.has_ability_rw("feature").await.expect("rw ok");
+	}
+
+	#[tokio::test]
+	async fn declared_ability_opens_the_gate_without_claiming_advertisement() {
+		// The measured doorbell case: `<TalkAbility>` answers with a full
+		// configuration, `abilityInfo` lists nothing. The gate lets the write
+		// through once the operator declared it, while the advertised report
+		// still says "the camera told us nothing".
+		let mock = MockConnection::new().build().await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		assert!(matches!(
+			cam.has_ability("two_way_audio").await,
+			ReadKind::None
+		));
+		assert_eq!(cam.ability_advertised("two_way_audio").await, None);
+
+		cam.declare_ability("two_way_audio").await;
+		cam.has_ability_rw("two_way_audio")
+			.await
+			.expect("declared ability opens the rw gate");
+		assert_eq!(cam.ability_advertised("two_way_audio").await, None);
+	}
+
+	#[tokio::test]
+	async fn declared_ability_keeps_the_advertised_report_false() {
+		// With a populated `abilityInfo` cache the override must not turn a
+		// missing ability into an advertised one.
+		let mock = MockConnection::new().build().await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.test_set_ability("ledControl", true).await;
+		cam.declare_ability("two_way_audio").await;
+		assert_eq!(cam.ability_advertised("ledControl").await, Some(true));
+		assert_eq!(
+			cam.ability_advertised("two_way_audio").await,
+			Some(false),
+			"an override must not make the abilities diagnostic lie"
+		);
+		cam.has_ability_rw("two_way_audio")
+			.await
+			.expect("gate still open");
+	}
+
+	#[tokio::test]
+	async fn declared_ability_does_not_leak_to_other_abilities() {
+		let mock = MockConnection::new().build().await;
+		let cam = BcCamera::from_mock_connection(mock).await;
+		cam.declare_ability("two_way_audio").await;
+		let err = cam
+			.has_ability_rw("someOtherFeature")
+			.await
+			.expect_err("the override is per-ability");
+		assert!(matches!(err, Error::MissingAbility { .. }));
 	}
 
 	#[tokio::test]
@@ -1467,7 +1568,7 @@ mod pick_sockets_tests {
 	}
 
 	#[test]
-	fn tcp_non_standard_port_falls_back_to_9000() {
+	fn tcp_not_standard_port_falls_back_to_9000() {
 		let addrs = [v4("10.0.0.5")];
 		let out = pick_tcp_sockets(&addrs, Some(9500));
 		assert_eq!(
@@ -1514,7 +1615,7 @@ mod pick_sockets_tests {
 	}
 
 	#[test]
-	fn udp_non_standard_port_tries_override_then_both_fallbacks() {
+	fn udp_not_standard_port_tries_override_then_both_fallbacks() {
 		let addrs = [v4("10.0.0.5")];
 		let out = pick_udp_sockets(&addrs, Some(2020));
 		assert_eq!(

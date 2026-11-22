@@ -745,6 +745,8 @@ mod tests {
 	fn short_is_char_safe_at_boundary() {
 		// Multibyte chars past the cap: the truncation point splits a codepoint
 		// byte-wise — `short` must cut on a char boundary, not panic.
+		// This module keeps non-ASCII values on purpose: they stand in for what an operator
+		// would type or a camera would answer, so they are data being tested, not prose to translate.
 		let v = Value::String("é".repeat(SHORT_MAX_CHARS + 100));
 		let out = short(&v);
 		assert!(out.ends_with('…'));

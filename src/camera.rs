@@ -76,6 +76,123 @@ fn aggregate_preview_state(
 	}
 }
 
+/// The probe cadence this camera asked for, `None` when the operator set
+/// `probe_session_secs = 0`. Kept as a pure function so the meaning of `0` is
+/// asserted in one place instead of being re-derived at the tick site.
+pub(crate) fn probe_cadence(config: &crate::config::CameraConfig) -> Option<Duration> {
+	(config.probe_session_secs > 0).then(|| Duration::from_secs(config.probe_session_secs))
+}
+
+/// How long one probe may take, given the tick it lives in. The normal limit
+/// is [`CameraHandle::KEEPALIVE_PROBE_TIMEOUT`], but a probe must
+/// never outlive its own tick: with a 1 s cadence a 3 s timeout would mean a
+/// probe still in flight when the next tick is due, which reads as a slow
+/// camera to the failure counter and would take a healthy session down.
+pub(crate) fn probe_timeout(cadence: Duration) -> Duration {
+	cadence.min(CameraHandle::KEEPALIVE_PROBE_TIMEOUT)
+}
+
+/// The one deferred attempt a parked camera is allowed after a failed contact.
+///
+/// Not a ladder: once spent it stays spent until an attempt succeeds. That is
+/// what stops `retry_after_secs` from becoming a perpetual timer that rings a
+/// battery camera's radio, which is the one cost this bridge exists to avoid.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeferredRetry {
+	armed: bool,
+}
+
+impl DeferredRetry {
+	pub(crate) fn new() -> Self {
+		Self { armed: true }
+	}
+
+	/// When the parked loop should wake itself up. `None` whenever nothing
+	/// should: the key is off, the camera is not parked (`idle_disconnect =
+	/// false` means the loop's own backoff is already the retry, and this key
+	/// would be a second timer on top of it), or the single attempt was spent.
+	pub(crate) fn deadline(&self, config: &CameraConfig) -> Option<Duration> {
+		if !self.armed || !config.idle_disconnect || config.retry_after_secs == 0 {
+			return None;
+		}
+		Some(Duration::from_secs(config.retry_after_secs))
+	}
+
+	/// The attempt is on its way: there is no second one after this.
+	pub(crate) fn spend(&mut self) {
+		self.armed = false;
+	}
+
+	/// An attempt landed, so the next failure earns its one deferred try again.
+	pub(crate) fn rearm(&mut self) {
+		self.armed = true;
+	}
+
+	/// One sentence for the log when nothing will retry this camera on its own,
+	/// and `None` when something will. The sentence has to be readable by an
+	/// operator looking at a greyed-out dashboard at night, so it names the key
+	/// instead of describing the symptom.
+	pub(crate) fn refusal_reason(&self, config: &CameraConfig) -> Option<String> {
+		if !config.idle_disconnect {
+			return None;
+		}
+		if config.retry_after_secs == 0 {
+			return Some(
+				"retry_after_secs = 0, so the next attempt waits for a reason to talk to this \
+					  camera (a stream, a command, a webhook, a motion push)"
+					.to_string(),
+			);
+		}
+		if !self.armed {
+			return Some(
+				"the single deferred attempt allowed by retry_after_secs has been used and failed; \
+					  the next attempt waits for a reason to talk to this camera"
+					.to_string(),
+			);
+		}
+		None
+	}
+}
+
+/// The startup warning for a key that cannot do anything on this camera.
+///
+/// `retry_after_secs` only applies while the loop parks, which needs
+/// `idle_disconnect = true`. Without that the loop already retries on its own
+/// backoff for ever, so the key would sit there doing nothing while looking
+/// like it does something. One line at startup, not one line per attempt.
+fn deferred_inert_warning(config: &CameraConfig) -> Option<&'static str> {
+	if config.retry_after_secs > 0 && !config.idle_disconnect {
+		return Some(
+			"retry_after_secs has no effect while idle_disconnect = false: the connect loop keeps \
+				  its own backoff and retries on its own, so nothing here is waiting for that timer"
+		);
+	}
+	None
+}
+
+/// Sleep when the deferred attempt is armed, and never otherwise. Same shape as
+/// `probe_tick`: a timer that is not armed must not wake the loop at all, so
+/// "off" is the absence of a future rather than a very long one.
+async fn retry_timer(delay: Option<Duration>) {
+	match delay {
+		Some(secs) => tokio::time::sleep(secs).await,
+		None => std::future::pending::<()>().await,
+	}
+}
+
+/// One tick of the probe ticker. With the probe switched off the ticker does
+/// not exist, and this never resolves: the session loop keeps waiting on its
+/// cancel arms, which is the behaviour an operator asking for "no probe" means.
+async fn probe_tick(ticker: &mut Option<tokio::time::Interval>) {
+	match ticker {
+		// `tick()` resolves to the instant it fired; the loop does not care which.
+		Some(interval) => {
+			interval.tick().await;
+		}
+		None => std::future::pending::<()>().await,
+	}
+}
+
 /// Pick the PreviewState after `keepalive_loop` returns — the session
 /// is over, either because the camera is about to park (idle +
 /// idle_disconnect) or because the loop is about to reconnect.
@@ -228,6 +345,13 @@ pub struct CameraHandle {
 	/// `spawn_session_tasks` consults it so a reconnect doesn't restart
 	/// the poller and re-run the same futile probes on every wake.
 	battery_unsupported: Arc<AtomicBool>,
+	/// Last reachability verdict published for this camera, shared for its whole
+	/// lifetime. Reachability does not follow the session: it goes to `reachable`
+	/// when an attempt to reach the camera succeeds and to `unreachable` when an
+	/// attempt gives up. Carried in an `Arc`, it deduplicates the publications
+	/// between the three places that publish it, which keeps fifty identical
+	/// messages an hour off a home broker.
+	presence_publiee: Arc<bairelay_mqtt::PublishedPresence>,
 	/// Serialises `control/ir` / `control/led`. Both are read-modify-
 	/// write of one `<LedState>` on the camera, so overlapping commands
 	/// would otherwise undo each other's field.
@@ -262,6 +386,11 @@ pub struct CameraHandle {
 	/// is strictly less than this, so zero disables it for tests that
 	/// want short-grace timing.
 	prune_grace: Duration,
+	/// Guard for the wake burst: one burst at a time, and not two inside the
+	/// [`crate::burst::GUARD_WINDOW`] window. Three sources announce the same
+	/// wake (the session alarm, the webhook, the pseudo-cloud push); this object
+	/// decides which one pays for the read. See [`crate::burst`].
+	burst: Arc<crate::burst::BurstGuard>,
 }
 
 impl CameraHandle {
@@ -332,6 +461,7 @@ impl CameraHandle {
 			preview_state_rx,
 			status_cache: Arc::new(StatusCache::default()),
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
+			presence_publiee: Arc::new(bairelay_mqtt::PublishedPresence::default()),
 			led_write_lock: tokio::sync::Mutex::new(()),
 			push_seq: AtomicU64::new(0),
 			camera_ip: std::sync::RwLock::new(None),
@@ -339,6 +469,7 @@ impl CameraHandle {
 			webhook_target: None,
 			webhook_memo: camera_tasks::ArmMemo::default(),
 			prune_grace: Duration::ZERO,
+			burst: Arc::new(crate::burst::BurstGuard::new(crate::burst::GUARD_WINDOW)),
 		}
 	}
 
@@ -475,6 +606,12 @@ impl CameraHandle {
 		let Some(publisher) = self.discovery_publisher.as_ref() else {
 			return Ok(());
 		};
+		// First call for this camera in this process: bring back the families the
+		// bridge already proved modifiable (see [`crate::family_state`]) so this
+		// very first discovery publishes them as sliders instead of read-only
+		// sensors. Disk read only — no camera command, which is the whole point
+		// on a battery doorbell.
+		crate::family_state::prime(publisher, &self.config.name);
 		let Some(caps) = self.capabilities() else {
 			return Ok(());
 		};
@@ -500,6 +637,80 @@ impl CameraHandle {
 	#[doc(hidden)]
 	pub fn set_capabilities_for_test(&self, caps: CameraCapabilities) {
 		*self.capabilities.write_recover() = Some(caps);
+	}
+
+	/// Records settings-read outcomes and re-publishes discovery **exactly once**,
+	/// if at least one family changed state. Returns `false` when nothing moved,
+	/// which is also the answer when no publisher is attached.
+	///
+	/// `(family, verdict)` pairs, with the four verdicts of
+	/// [`crate::settings::Verdict`]: writable, locked by local evidence (`<MdAlarm>`
+	/// or `<OsdChannelName>` absent), **transient** - a passing read error, which
+	/// counts as writable because the reason is published beside it - or
+	/// **undetermined**, and an undetermined family does not move. That is the
+	/// point the first day of field work knocked down: four families had just
+	/// been read or written successfully, one full burst earned them a `400`, and
+	/// the bridge read them as forbidden settings. Answering badly once is not a
+	/// prohibition.
+	/// A single bad answer says nothing about what the camera can do.
+	///
+	/// The verdicts that move are remembered on disk
+	/// ([`crate::family_state`]): a family proven writable stays writable across
+	/// a restart of the add-on, without the camera having to prove it
+	/// family proven writable stays writable across an add-on restart, without the
+	///
+	/// Called after a write with read-back, after `query/settings` (one
+	/// entry per family re-read) and after a preview. Never on a timer: the
+	/// family re-read) and after a preview. Never on a timer: the doorbell's
+	/// own.
+	// `pub(crate)`: the verdict travels in a signature, and [`crate::settings::Verdict`]
+	// stays inside the binary - a `pub` method showing it would expose a private
+	// interface (the `private_interfaces` lint).
+	pub(crate) async fn mark_families_read(
+		&self,
+		read: &[(bairelay_mqtt::settings::Family, crate::settings::Verdict)],
+	) -> bool {
+		let Some(publisher) = self.discovery_publisher.as_ref() else {
+			return false;
+		};
+		let mut a_change = false;
+		for &(family, verdict) in read {
+			let Some(writable) = verdict.writable() else {
+				continue;
+			};
+			a_change |= publisher.mark_family_read(&self.config.name, family, writable);
+		}
+		if !a_change {
+			return false;
+		}
+		if let Err(e) = self.publish_discovery().await {
+			tracing::debug!(
+				camera = %self.config.name,
+				error = %e,
+				"re-publishing discovery after a settings read failed; the next re-read will try again"
+			);
+		}
+		// Persist the verdicts that just moved. This is the only place the bridge
+		// learns a family became (or stopped being) modifiable, and the next boot
+		// should not have to re-prove it over the radio.
+		crate::family_state::record(publisher, &self.config.name);
+		true
+	}
+
+	/// The common case: one family was just re-read **successfully** (a write, or
+	/// `query/settings/<family>`). See [`Self::mark_families_read`] for what the two
+	/// verdicts mean.
+	pub(crate) async fn mark_family_read(
+		&self,
+		family: bairelay_mqtt::settings::Family,
+		writable: bool,
+	) -> bool {
+		let verdict = if writable {
+			crate::settings::Verdict::Writable
+		} else {
+			crate::settings::Verdict::NotWritable
+		};
+		self.mark_families_read(&[(family, verdict)]).await
 	}
 
 	/// Shared per-camera status cache. Each status-publishing task
@@ -664,6 +875,35 @@ impl CameraHandle {
 		&self.wake_lock
 	}
 
+	/// The wake-burst guard ([`crate::burst`]). `pub(crate)`: the guard is a type
+	/// internal to the binary, and a `pub` method exposing it would expose a
+	/// private interface (the `private_interfaces` lint).
+	pub(crate) fn burst(&self) -> &Arc<crate::burst::BurstGuard> {
+		&self.burst
+	}
+
+	/// This camera's MQTT client, `None` when the bridge runs without a broker.
+	/// The burst needs it to publish its own state now, settings included: the
+	/// state publisher borrows the client, so it has to be named here.
+	/// here as well.
+	pub(crate) fn mqtt_client(&self) -> Option<&bairelay_mqtt::SharedMqttClient> {
+		self.mqtt_client.as_ref()
+	}
+
+	/// Does any stream of this camera have subscribers?
+	///
+	/// This is the burst's "never during a stream" guard: a camera already
+	/// pushing video is not the moment to ask it for ten XML blocks. Sources with
+	/// no subscribers (created and then left by an RTSP reader that left) do not
+	/// count: they no longer keep the radio running.
+	/// A source nobody watches is not a camera worth waking.
+	pub(crate) fn stream_in_flight(&self) -> bool {
+		self.stream_sources
+			.read_recover()
+			.values()
+			.any(|source| source.subscribers() > 0)
+	}
+
 	pub fn is_cancelled(&self) -> bool {
 		self.cancel.is_cancelled()
 	}
@@ -693,6 +933,18 @@ impl CameraHandle {
 	/// boundary without touching the binary's call-sites.
 	pub fn bc_camera(&self) -> Option<Arc<dyn CameraDriver>> {
 		self.bc_camera.read_recover().clone()
+	}
+
+	/// The connected camera, under its concrete type [`BcCamera`].
+	///
+	/// Settings (volume, image, OSD, NTP, masks, chime) do not go through
+	/// [`CameraDriver`]: they are read/write pairs specific to the Baichuan
+	/// protocol, and the trait is not meant to carry thirty methods. This slot is
+	/// filled and emptied together with [`Self::bc_camera`] (see
+	/// `run_connected_session`), so a `Some` here means "a session is open" and a
+	/// setting may be attempted.
+	pub fn bc_camera_concrete(&self) -> Option<Arc<BcCamera>> {
+		self.bc_camera_concrete.read_recover().clone()
 	}
 
 	/// Signal the camera to disconnect (used by the watchdog for idle cameras).
@@ -826,6 +1078,10 @@ impl CameraHandle {
 			self.bcmedia_dump.clone(),
 			self.audio_presence(),
 			gap_threshold,
+			// Per-camera pacer timings (`*_pacer_latency_ms` /
+			// `*_pacer_max_lead_ms`), so an operator can trade deliberate
+			// buffering for latency on one camera without touching the others.
+			crate::stream_source::PacerSettings::from_camera_config(&self.config),
 		);
 
 		// Insert the new source under the sync lock.
@@ -887,7 +1143,7 @@ impl CameraHandle {
 	}
 
 	/// Returns `true` if any currently-registered [`StreamSource`] for
-	/// this camera reports [`GapState::Bridging`]. Used by the
+	/// this camera reports [`crate::stream_source::GapState::Bridging`]. Used by the
 	/// per-camera preview-state aggregator to decide
 	/// whether to downgrade `PreviewState::Live` → `Connecting` for the
 	/// MQTT overlay while upstream frames are stalled.
@@ -931,8 +1187,30 @@ impl CameraHandle {
 
 	/// Attempt to connect and login to the camera. Returns the camera
 	/// and the device type its login `DeviceInfo` reports.
-	async fn try_connect(&self) -> anyhow::Result<(Arc<BcCamera>, Option<String>)> {
-		let opts = crate::bc_opts::build_bc_opts_resolved(&self.config).await?;
+	/// Open a session and log in.
+	///
+	/// `proven` selects which options the attempt is built from: `None` is the
+	/// normal path, which honours the operator's `address`, `uid` and
+	/// `discovery` keys. `Some(addresses)` is the deferred attempt the timer
+	/// takes on the operator's behalf, and it is built by
+	/// [`crate::bc_opts::build_retry_bc_opts`]: TCP only, uid dropped, discovery
+	/// forbidden, so it cannot enter the discovery chain and cannot reach a
+	/// Reolink server. An empty list is refused rather than quietly upgraded into
+	/// a search.
+	async fn try_connect(
+		&self,
+		proven: Option<&[std::net::IpAddr]>,
+	) -> anyhow::Result<(Arc<BcCamera>, Option<String>)> {
+		let opts = match proven {
+			Some(addrs) => crate::bc_opts::build_retry_bc_opts(&self.config, addrs).ok_or_else(|| {
+				anyhow::anyhow!(
+					"{}: the deferred attempt found no address this bridge can prove, and will not \
+						  go looking for the camera",
+					self.config.name
+				)
+			})?,
+			None => crate::bc_opts::build_bc_opts_resolved(&self.config).await?,
+		};
 		let max_enc = crate::bc_opts::max_encryption(&self.config);
 		let camera = BcCamera::new(&opts).await?;
 		let device_info = camera.login_with_maxenc(max_enc).await?;
@@ -940,14 +1218,58 @@ impl CameraHandle {
 		Ok((Arc::new(camera), device_info.device_type))
 	}
 
-	/// Send periodic keepalive probes to detect connection loss.
-	/// Uses [`CameraDriver::keepalive_probe`] (a lenient wrapper over
+	/// Publish this camera's presence verdict, retained, once per transition only.
+	///
+	/// Three events drive it, and all three already happen anyway: the bridge
+	/// starting (an optimistic verdict), a session opening (a real contact), and a
+	/// connection attempt giving up. Never one more network call towards the
+	/// camera — waking a sleeping doorbell to ask it whether it is there is exactly
+	/// the battery this option is meant to save. See `docs/availability.md`.
+	async fn publish_presence(&self, reachable: bool) {
+		let Some(ref mqtt) = self.mqtt_client else {
+			return;
+		};
+		let publisher = bairelay_mqtt::StatusPublisher::with_presence(
+			mqtt,
+			&self.topic_prefix,
+			&self.config.name,
+			Arc::clone(&self.presence_publiee),
+		);
+		if let Err(e) = publisher.publish_presence(reachable).await {
+			tracing::warn!(
+				camera = %self.config.name,
+				reachable,
+				error = %e,
+				"Failed to publish presence status"
+			);
+		}
+	}
+
+	/// Send periodic session probes to detect connection loss; see
+	/// [`Self::KEEPALIVE_INTERVAL`] for what that detects and why nothing else
+	/// does. Uses [`CameraDriver::keepalive_probe`] (a lenient wrapper over
 	/// `get_linktype()` matching neolink's choice) and tolerates up to
 	/// [`Self::KEEPALIVE_MAX_FAILURES`] consecutive failures before
-	/// disconnecting. Cadence and per-probe timeout are both
-	/// [`Self::KEEPALIVE_INTERVAL`].
+	/// disconnecting, so a session is declared dead after roughly
+	/// `probe_session_secs` x 5 seconds.
+	///
+	/// With `probe_session_secs = 0` there is no tick at all: the loop still
+	/// waits for the cancel, session-cancel and watchdog arms, so teardown
+	/// behaves exactly as before, but nothing on this side ever notices a camera
+	/// that vanished mid-session. That is the trade the operator signed; the
+	/// session then closes on the grace period (`idle_disconnect = true`) or on
+	/// an explicit disconnect, and never on its own.
 	async fn keepalive_loop(&self, camera: &dyn CameraDriver, session_cancel: &CancellationToken) {
-		let mut interval = tokio::time::interval(Self::KEEPALIVE_INTERVAL);
+		let cadence = probe_cadence(&self.config);
+		let mut ticker = cadence.map(tokio::time::interval);
+		if cadence.is_none() {
+			tracing::info!(
+				camera = %self.config.name,
+				"session probe disabled: a session that dies silently will not be noticed by \
+					  this bridge; it closes on the grace period or an explicit disconnect only"
+			);
+		}
+		let probe_limit = probe_timeout(cadence.unwrap_or(Self::KEEPALIVE_INTERVAL));
 		let mut consecutive_failures: u32 = 0;
 
 		'outer: loop {
@@ -961,7 +1283,7 @@ impl CameraHandle {
 					tracing::info!(camera = %self.config.name, "Watchdog requested disconnect");
 					break;
 				}
-				_ = interval.tick() => {
+				_ = probe_tick(&mut ticker) => {
 					// Race the probe against cancel / disconnect signals so a
 					// shutdown that arrives mid-probe preempts immediately
 					// instead of stalling for the full
@@ -969,7 +1291,7 @@ impl CameraHandle {
 					// shutdown latency was bounded by the per-probe timeout
 					// (previously equal to the interval, so up to 5 s).
 					let raw = tokio::select! {
-						v = tokio::time::timeout(Self::KEEPALIVE_PROBE_TIMEOUT, camera.keepalive_probe()) => v,
+						v = tokio::time::timeout(probe_limit, camera.keepalive_probe()) => v,
 						_ = self.cancel.cancelled() => break 'outer,
 						_ = session_cancel.cancelled() => {
 							tracing::info!(
@@ -1025,6 +1347,22 @@ impl CameraHandle {
 	/// responsive via the cancel arm regardless. A still-failing attempt
 	/// then falls to the outer `ReconnectBackoff`.
 	const CONNECT_TIMEOUT: Duration = Duration::from_secs(100);
+	/// Interval between session probes. 5 s matches neolink and is the default
+	/// the operator gets; `probe_session_secs` in `[[cameras]]` retimes it and
+	/// `0` switches the probe off.
+	///
+	/// **This probe is the only detector of a live session.** The socket reader
+	/// stops on EOF without reporting anything to anyone
+	/// (`bc_protocol::connection::bcconn`), no command on that socket carries a
+	/// timeout, and `SO_KEEPALIVE` is set nowhere in this tree. So a camera that
+	/// leaves the network without sending a FIN keeps its session open for ever:
+	/// the connected-session call never returns, the outer reconnect loop and its
+	/// backoff are never reached, MQTT keeps publishing `connected`, presence
+	/// keeps publishing `reachable`, `bc_camera()` hands out a camera that is
+	/// gone, and `control/wakeup` answers success without touching the device.
+	/// Turning the probe off is therefore a decision about *what closes the
+	/// session*, not about traffic: `validate_config` refuses it when
+	/// `idle_disconnect = false` leaves nothing else to close it.
 	pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 	/// Per-probe timeout: strictly below [`Self::KEEPALIVE_INTERVAL`]
 	/// so a slow probe doesn't consume the entire tick budget, AND
@@ -1074,6 +1412,13 @@ impl CameraHandle {
 				tracing::warn!(camera = %self.config.name, error = %e, "Failed to publish connected status");
 			}
 		}
+
+		// Contact succeeded: an open session is an attempt to reach the camera that
+		// came to something. Every command and every query runs inside a session, so
+		// this point covers all of them, with no extra read. A session closing says
+		// nothing about reachability: a sleeping doorbell
+		// stays reachable on demand.
+		self.publish_presence(true).await;
 
 		*self.bc_camera.write_recover() = Some(Arc::clone(&driver));
 		*self.bc_camera_concrete.write_recover() = concrete.clone();
@@ -1224,6 +1569,12 @@ impl CameraHandle {
 					self.status_cache(),
 					caps,
 					self.held_press_window(),
+					// A wake heard on the session alarm (press,
+					// motion) opens the burst's read window: that is the only
+					// battery we can read without paying for a wake. The handle is
+					// the camera itself; the one-burst-per-wake guard lives in
+					// `crate::burst`.
+					Some(Arc::clone(self)),
 				));
 			}
 			// `battery_unsupported` latches when the poller concludes the
@@ -1342,7 +1693,7 @@ impl CameraHandle {
 	/// source, log out via the concrete `BcCamera` handle if present,
 	/// clear the camera's driver/concrete slots, and publish the
 	/// disconnected MQTT status. Symmetric with
-	/// [`spawn_session_tasks`]; the caller is expected to have
+	/// [`Self::spawn_session_tasks`]; the caller is expected to have
 	/// already cancelled `session_cancel` before invoking this.
 	async fn teardown_session_tasks(
 		self: &Arc<Self>,
@@ -1424,6 +1775,11 @@ impl CameraHandle {
 			let _ = publisher.publish_motion_unknown().await;
 		}
 
+		// Optimistic reachability verdict at startup: nothing yet says the camera is
+		// unreachable, and greying out a whole dashboard before the first contact
+		// would be a lie that the first failure corrects by itself.
+		self.publish_presence(true).await;
+
 		// Spawn the preview publisher at camera lifetime (NOT session
 		// scope): it must keep publishing status/preview with the
 		// current overlay caption across disconnect/sleep windows, so
@@ -1450,6 +1806,12 @@ impl CameraHandle {
 		};
 
 		let mut backoff = ReconnectBackoff::new(Duration::from_secs(2), Duration::from_secs(60));
+		let mut deferred = DeferredRetry::new();
+		// Addresses the deferred attempt is allowed to dial, and nothing else.
+		let mut proven: Option<Vec<std::net::IpAddr>> = None;
+		if let Some(warning) = deferred_inert_warning(&self.config) {
+			tracing::warn!(camera = %self.config.name, "{warning}");
+		}
 
 		loop {
 			if self.cancel.is_cancelled() {
@@ -1463,10 +1825,43 @@ impl CameraHandle {
 			if self.config.idle_disconnect && self.wake_lock.is_idle() {
 				self.set_preview_state(PreviewState::Sleeping);
 				tracing::info!(camera = %self.config.name, "Idle disconnect enabled, waiting for wake lock...");
+				let retry_in = deferred.deadline(&self.config);
 				tokio::select! {
 					_ = self.cancel.cancelled() => break,
 					_ = self.wake_lock.wait_for_acquire() => {
 						tracing::info!(camera = %self.config.name, "Wake lock acquired, connecting...");
+					}
+					_ = retry_timer(retry_in) => {
+						// The timer spends the one allowed attempt before it dials
+						// anything, so a deferred attempt that itself hangs or
+						// fails cannot lead to a second one.
+						deferred.spend();
+						let addrs = match crate::bc_opts::build_bc_opts_resolved(&self.config).await {
+							Ok(opts) => opts.addrs,
+							Err(_) => Vec::new(),
+						};
+						// The registry's heard UDP address joins this list with the
+						// announcement step; the configuration address alone cannot
+						// follow a camera that changed IP after a reset, which is how
+						// this bridge loses a doorbell for good.
+						match crate::bc_opts::build_retry_bc_opts(&self.config, &addrs) {
+							Some(_) => {
+								tracing::info!(
+									camera = %self.config.name,
+									addrs = addrs.len(),
+									"deferred attempt: one TCP-only try at an address this bridge can \
+										  prove, no discovery and no wake traffic"
+								);
+								proven = Some(addrs);
+							}
+							None => tracing::info!(
+								camera = %self.config.name,
+								"deferred attempt skipped: no address this bridge can prove; \
+									 the automatic path will not search for the camera. A stream, a
+									 command or a webhook takes the normal path, with the discovery
+									 the operator configured."
+							),
+						}
 					}
 				}
 			}
@@ -1477,9 +1872,15 @@ impl CameraHandle {
 
 			// Wrap connection attempt in a timeout + cancellation guard
 			// so that Ctrl+C works even if bairelay_neolink_core is stuck
+			// A deferred attempt is spent here and only here: `take` is what makes
+			// it one attempt rather than a standing mode for the rest of the loop.
+			let addrs = proven.take();
 			let connect_result = tokio::select! {
 				_ = self.cancel.cancelled() => break,
-				result = tokio::time::timeout(Self::CONNECT_TIMEOUT, self.try_connect()) => {
+				result = tokio::time::timeout(
+					Self::CONNECT_TIMEOUT,
+					self.try_connect(addrs.as_deref()),
+				) => {
 					match result {
 						Ok(r) => r,
 						Err(_) => {
@@ -1494,6 +1895,7 @@ impl CameraHandle {
 					let driver: Arc<dyn CameraDriver> =
 						Arc::clone(&camera) as Arc<dyn CameraDriver>;
 					backoff.reset();
+					deferred.rearm();
 					self.run_connected_session(
 						driver,
 						Some(Arc::clone(&camera)),
@@ -1502,12 +1904,26 @@ impl CameraHandle {
 					.await;
 				}
 				Err(e) => {
+					// Giving up: this branch is the furthest upstream point that
+					// gathers every contact failure - timeout, failed discovery, a
+					// refused socket or rejected credentials. It runs once the
+					// attempt's normal flow is over, with discovery's internal rounds
+					// having had their budget. Reachability passes here, and nowhere
+					// else.
+					self.publish_presence(false).await;
 					if is_login_failure(&e) {
 						tracing::error!(camera = %self.config.name, error = %format!("{:#}", e), "Authentication failed — check credentials. Stopping retries.");
 						self.set_state(CameraState::Disconnected);
 						break;
 					}
 					tracing::warn!(camera = %self.config.name, error = %e, "Connection failed");
+					// Presence says what happened. This says what happens next,
+					// because "nothing happens next" is otherwise indistinguishable
+					// from a bridge that is broken, and an operator who cannot tell
+					// the two reconfigures things that were fine.
+					if let Some(reason) = deferred.refusal_reason(&self.config) {
+						tracing::info!(camera = %self.config.name, "no automatic retry: {reason}");
+					}
 					self.set_state(CameraState::Disconnected);
 				}
 			}
@@ -1768,6 +2184,18 @@ impl CameraHandle {
 		self.set_state(CameraState::Connected);
 	}
 
+	/// Test helper: install a concrete [`BcCamera`] (wired to a scripted
+	/// `MockConnection`) into **both** slots, the way `run_connected_session`
+	/// does. Settings tests need this, because the dispatch of
+	/// settings calls [`Self::bc_camera_concrete`], which fake
+	/// `CameraDriver`s cannot fill.
+	#[cfg(test)]
+	pub(crate) fn set_bc_camera_for_test(&self, cam: Arc<BcCamera>) {
+		*self.bc_camera.write_recover() = Some(Arc::clone(&cam) as Arc<dyn CameraDriver>);
+		*self.bc_camera_concrete.write_recover() = Some(cam);
+		self.set_state(CameraState::Connected);
+	}
+
 	/// Test-only entry into the post-connect session lifecycle.
 	/// Runs [`Self::run_connected_session`] with `concrete = None`,
 	/// skipping the stream-source spawn / logout paths that require a
@@ -1971,7 +2399,7 @@ mod tests {
 	}
 
 	#[test]
-	fn aggregate_stays_connecting_when_bridging_still_active() {
+	fn aggregate_stays_connecting_when_bridging_still_enables() {
 		assert_eq!(
 			aggregate_preview_state(
 				PreviewState::Connecting,
@@ -3328,7 +3756,7 @@ mod tests {
 	/// `bell` type marks the doorbell present when `<Support>` carries
 	/// no `doorbellVersion`; without it the same item reads absent.
 	#[tokio::test(flavor = "current_thread", start_paused = true)]
-	async fn run_connected_session_threads_device_type_to_doorbell_presence() {
+	async fn run_connected_session_threads_device_kind_to_doorbell_presence() {
 		use crate::capabilities::Presence;
 		use crate::config::test_helpers::minimal_camera_config;
 		use bairelay_neolink_core::bc::xml::{Support, SupportItem};
@@ -3791,5 +4219,126 @@ mod prune_grace_tests {
 		// 61 s after t1: past the fresh grace → pruned.
 		handle.prune_idle_stream_sources_at(t1 + Duration::from_secs(61), GRACE);
 		assert!(!handle.has_stream_source_for_test(StreamKind::Main));
+	}
+
+	#[test]
+	fn a_zero_cadence_means_no_probe_at_all() {
+		let mut cam = minimal_camera_config("Cam");
+		cam.probe_session_secs = 5;
+		assert_eq!(probe_cadence(&cam), Some(Duration::from_secs(5)));
+		cam.probe_session_secs = 0;
+		assert_eq!(probe_cadence(&cam), None, "0 is off, not every second");
+	}
+
+	#[test]
+	fn a_probe_never_outlives_the_tick_it_lives_in() {
+		assert_eq!(
+			probe_timeout(Duration::from_secs(5)),
+			CameraHandle::KEEPALIVE_PROBE_TIMEOUT,
+			"the default cadence keeps today's 3 s timeout"
+		);
+		assert_eq!(
+			probe_timeout(Duration::from_secs(1)),
+			Duration::from_secs(1),
+			"a 1 s cadence cannot afford a 3 s probe"
+		);
+	}
+
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn a_disabled_probe_never_fires_and_a_live_one_fires_on_the_tick() {
+		// The whole point of `probe_session_secs = 0` is that nothing on this
+		// side wakes up. Under the paused clock, an hour of waiting must produce
+		// no tick, while a ticker built for 5 s must produce one immediately and
+		// the next one after exactly 5 s.
+		let mut off: Option<tokio::time::Interval> = None;
+		let quiet = tokio::time::timeout(Duration::from_secs(3600), probe_tick(&mut off)).await;
+		assert!(quiet.is_err(), "with the probe off, the tick must never arrive");
+
+		let mut on = Some(tokio::time::interval(Duration::from_secs(5)));
+		probe_tick(&mut on).await;
+		let t1 = tokio::time::Instant::now();
+		tokio::time::advance(Duration::from_secs(5)).await;
+		probe_tick(&mut on).await;
+		let t2 = tokio::time::Instant::now();
+		assert_eq!(t2.duration_since(t1), Duration::from_secs(5));
+	}
+
+	#[test]
+	fn the_deferred_attempt_is_off_until_a_parked_camera_asks_for_it() {
+		let mut cam = minimal_camera_config("Cam");
+		let deferred = DeferredRetry::new();
+		assert_eq!(deferred.deadline(&cam), None, "0 means no deferred attempt");
+
+		cam.retry_after_secs = 30;
+		cam.idle_disconnect = false;
+		assert_eq!(
+			deferred.deadline(&cam),
+			None,
+			"with idle_disconnect = false the loop's own backoff is already the retry"
+		);
+
+		cam.idle_disconnect = true;
+		assert_eq!(deferred.deadline(&cam), Some(Duration::from_secs(30)));
+	}
+
+	#[test]
+	fn the_one_attempt_stays_spent_until_an_attempt_lands() {
+		let mut cam = minimal_camera_config("Cam");
+		cam.retry_after_secs = 30;
+		cam.idle_disconnect = true;
+		let mut deferred = DeferredRetry::new();
+		assert!(deferred.deadline(&cam).is_some());
+		deferred.spend();
+		assert_eq!(deferred.deadline(&cam), None, "one attempt, not a ladder");
+		assert_eq!(deferred.deadline(&cam), None, "and spending it twice changes nothing");
+		deferred.rearm();
+		assert_eq!(deferred.deadline(&cam), Some(Duration::from_secs(30)));
+	}
+
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn an_unarmed_timer_never_wakes_the_parked_loop() {
+		// The parked loop waits on cancel, wake lock, and this timer. A timer
+		// that fires when it should not is a periodic radio call, so the "off"
+		// case has to be proven, not assumed.
+		let quiet =
+			tokio::time::timeout(Duration::from_secs(3600), retry_timer(None)).await;
+		assert!(quiet.is_err(), "no deadline means no wake-up");
+
+		let fired = tokio::time::timeout(
+			Duration::from_secs(60),
+			retry_timer(Some(Duration::from_secs(30))),
+		);
+		tokio::time::advance(Duration::from_secs(30)).await;
+		assert!(fired.await.is_ok(), "the deadline wakes the loop");
+	}
+
+	#[test]
+	fn the_log_names_the_key_that_decides_whether_anything_retries() {
+		let mut cam = minimal_camera_config("Cam");
+		cam.idle_disconnect = true;
+		let mut deferred = DeferredRetry::new();
+
+		let reason = deferred.refusal_reason(&cam).expect("off means nothing retries");
+		assert!(reason.contains("retry_after_secs"), "{reason}");
+
+		cam.retry_after_secs = 30;
+		assert_eq!(
+			deferred.refusal_reason(&cam),
+			None,
+			"a deferred attempt is still coming, so there is nothing to explain"
+		);
+		deferred.spend();
+		let reason = deferred.refusal_reason(&cam).expect("spent means nothing retries");
+		assert!(reason.contains("single"), "{reason}");
+
+		// The other regime is not a refusal, it is a key that does nothing, and
+		// it is said once at startup instead of after every failed attempt.
+		cam.idle_disconnect = false;
+		assert_eq!(deferred.refusal_reason(&cam), None);
+		let warning = deferred_inert_warning(&cam).expect("retry_after_secs is inert here");
+		assert!(warning.contains("retry_after_secs"), "{warning}");
+		assert!(warning.contains("idle_disconnect"), "{warning}");
+		cam.retry_after_secs = 0;
+		assert!(deferred_inert_warning(&cam).is_none(), "nothing configured, nothing to warn about");
 	}
 }

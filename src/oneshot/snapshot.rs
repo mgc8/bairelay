@@ -108,7 +108,7 @@ pub(crate) fn finish_stream_capture(
 /// Pull packets off `stream` until we see the first I-frame or the
 /// overall deadline elapses. Extracted so tests can drive a scripted
 /// [`VideoStream`] without a live camera — production uses
-/// [`StreamData`]; tests use a `MockVideoStream`.
+/// [`bairelay_neolink_core::bc_protocol::StreamData`]; tests use a `MockVideoStream`.
 ///
 /// On error / timeout the caller is still responsible for sending
 /// `stop_video` — this helper only owns the pull loop.

@@ -48,6 +48,10 @@ use bairelay_neolink_core::bc_protocol::{BcCamera, StreamKind as CoreStreamKind}
 use bairelay_neolink_core::bcmedia::model::{BcMedia, BcMediaIframe, BcMediaPframe};
 
 use crate::bcmedia_dump::{BcMediaDumpConfig, FrameDumper};
+use crate::config::{
+	CameraConfig, PacerTimings, DEFAULT_AUDIO_PACER_LATENCY_MS, DEFAULT_AUDIO_PACER_MAX_LEAD_MS,
+	DEFAULT_VIDEO_PACER_LATENCY_MS, DEFAULT_VIDEO_PACER_MAX_LEAD_MS,
+};
 
 /// Capacity of the per-source broadcast channel.
 ///
@@ -151,7 +155,7 @@ pub enum GapState {
 /// A live `(camera, stream_kind)` media source. See module docs.
 pub struct StreamSource {
 	tx: broadcast::Sender<Frame>,
-	/// Shared last-frame buffer owned by the [`CameraHandle`]. All sources
+	/// Shared last-frame buffer owned by the [`crate::camera::CameraHandle`]. All sources
 	/// for the same camera write into this single buffer so the MQTT
 	/// preview publisher and RTSP placeholder code see one consistent view
 	/// and the buffer outlives any individual source lifetime.
@@ -385,8 +389,11 @@ impl StreamSource {
 	/// `camera` is the connected `BcCamera` to pull video from,
 	/// `camera_name` is the logical name (used in the SDP `s=` line),
 	/// `kind` is the bairelay-side stream kind (mapped to the underlying
-	/// `bairelay_neolink_core::StreamKind` internally), and `last_frame` is the
-	/// camera-scoped buffer shared across all sources for this camera.
+	/// `bairelay_neolink_core::StreamKind` internally), `last_frame` is the
+	/// camera-scoped buffer shared across all sources for this camera, and
+	/// `pacer` carries the camera's pacer timings (see [`PacerSettings`];
+	/// [`PacerSettings::DEFAULT`] restores the historical buffering).
+	#[allow(clippy::too_many_arguments)]
 	pub fn start(
 		camera: Arc<BcCamera>,
 		camera_name: String,
@@ -395,6 +402,7 @@ impl StreamSource {
 		bcmedia_dump: Option<Arc<BcMediaDumpConfig>>,
 		audio_presence: Arc<RwLock<crate::audio_presence::AudioPresence>>,
 		gap_threshold: Duration,
+		pacer: PacerSettings,
 	) -> Arc<Self> {
 		let parts =
 			StreamSourceParts::new(&camera_name, kind, Arc::clone(&last_frame), gap_threshold);
@@ -412,10 +420,12 @@ impl StreamSource {
 			audio_pace_rx,
 			audio_broadcast,
 			audio_cancel,
+			pacer.audio,
 		));
 
 		// Per-source video pacer. Holds a 1.5 s startup buffer
-		// (`VIDEO_PACER_INITIAL_LATENCY`) so the queue stays stocked
+		// (`VIDEO_PACER_INITIAL_LATENCY`, overridable per camera through
+		// `video_pacer_latency_ms`) so the queue stays stocked
 		// across the camera's burst-idle pattern (Argus 4 K HEVC
 		// delivers each GOP in ~900 ms then idles ~1.1 s before the
 		// next burst). Without the buffer, the receiver's playback
@@ -431,6 +441,7 @@ impl StreamSource {
 			video_pace_rx,
 			video_broadcast,
 			video_cancel,
+			pacer.video,
 		));
 
 		let reader_args = ReaderTaskArgs {
@@ -938,6 +949,23 @@ fn map_stream_kind(kind: RtspStreamKind) -> CoreStreamKind {
 pub struct PacedFrame {
 	pub frame: Frame,
 	pub duration: Duration,
+	/// When the frame entered the pacer queue. Carried to the exit so the
+	/// pacer can log how long each frame actually waited (see
+	/// [`media_pacer_task`]'s debug line) — the deliberate buffer plus the
+	/// queue depth is exactly what an operator has to measure before
+	/// turning the latency knobs down.
+	pub queued_at: tokio::time::Instant,
+}
+
+impl PacedFrame {
+	/// Queue a frame stamped with the current (monotonic) time.
+	pub fn new(frame: Frame, duration: Duration) -> Self {
+		Self {
+			frame,
+			duration,
+			queued_at: tokio::time::Instant::now(),
+		}
+	}
 }
 
 /// Hard cap on how far the pacer's emit cursor is allowed to drift into
@@ -947,10 +975,17 @@ pub struct PacedFrame {
 /// to 1.5 s under burst pressure before the future-cap trips; video
 /// sits at 3 s so the 1.5 s initial-latency cushion has the same
 /// 1.5 s of headroom.
-const AUDIO_PACER_MAX_LEAD: Duration = Duration::from_millis(2000);
+///
+/// These are the *defaults* only: the per-camera
+/// `audio_pacer_max_lead_ms` / `video_pacer_max_lead_ms` config keys
+/// override them (see [`PacerSettings`]), which is why the pacer tasks
+/// take the timings as arguments instead of reading these directly.
+const AUDIO_PACER_MAX_LEAD: Duration =
+	Duration::from_millis(DEFAULT_AUDIO_PACER_MAX_LEAD_MS as u64);
 /// See [`AUDIO_PACER_MAX_LEAD`]; raised for video so the deliberate
 /// 1.5 s startup buffer doesn't hit the cap and snap forward.
-const VIDEO_PACER_MAX_LEAD: Duration = Duration::from_millis(3000);
+const VIDEO_PACER_MAX_LEAD: Duration =
+	Duration::from_millis(DEFAULT_VIDEO_PACER_MAX_LEAD_MS as u64);
 /// Latency injected into the audio pacer at the *first* frame so the
 /// queue accumulates ~8 packets of buffer before the first emission.
 /// In steady state the pacer drains the queue at exactly one packet
@@ -962,7 +997,10 @@ const VIDEO_PACER_MAX_LEAD: Duration = Duration::from_millis(3000);
 /// time an audio packet was delivered late, producing the audible
 /// 0.1 s glitches operators heard. 500 ms covers the worst observed
 /// jitter on real Argus hardware with margin to spare.
-const AUDIO_PACER_INITIAL_LATENCY: Duration = Duration::from_millis(500);
+///
+/// Default for the per-camera `audio_pacer_latency_ms` config key.
+const AUDIO_PACER_INITIAL_LATENCY: Duration =
+	Duration::from_millis(DEFAULT_AUDIO_PACER_LATENCY_MS as u64);
 /// Latency injected into the video pacer at the *first* frame so the
 /// queue holds ~1.5 s of frames in steady state. Reolink Argus delivers
 /// each GOP as a burst followed by ~1.1 s of silence; without an
@@ -971,7 +1009,57 @@ const AUDIO_PACER_INITIAL_LATENCY: Duration = Duration::from_millis(500);
 /// pre-buffered the pacer always has frames to emit even when the
 /// upstream goes briefly silent, so receiver-side cadence stays
 /// continuous.
-const VIDEO_PACER_INITIAL_LATENCY: Duration = Duration::from_millis(1500);
+///
+/// Default for the per-camera `video_pacer_latency_ms` config key — the
+/// knob to lower first for a low-latency consumer (go2rtc / WebRTC),
+/// since this delay is paid once per stream, on top of the queue depth
+/// the lead cap allows.
+const VIDEO_PACER_INITIAL_LATENCY: Duration =
+	Duration::from_millis(DEFAULT_VIDEO_PACER_LATENCY_MS as u64);
+
+/// Both pacer timings for one stream source, as configured per camera.
+///
+/// [`StreamSource::start`] takes this so the reader task's two pacer
+/// tasks get the operator's values instead of the compile-time defaults.
+/// Use [`PacerSettings::default`] (equivalently
+/// [`PacerSettings::from_camera_config`] on an all-default camera) to keep
+/// the historical behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacerSettings {
+	/// Video pacer `(initial latency, max lead)`.
+	pub video: PacerTimings,
+	/// Audio pacer `(initial latency, max lead)`.
+	pub audio: PacerTimings,
+}
+
+impl PacerSettings {
+	/// The historical compile-time defaults, unchanged by this type.
+	pub const DEFAULT: Self = Self {
+		video: PacerTimings {
+			initial_latency: VIDEO_PACER_INITIAL_LATENCY,
+			max_lead: VIDEO_PACER_MAX_LEAD,
+		},
+		audio: PacerTimings {
+			initial_latency: AUDIO_PACER_INITIAL_LATENCY,
+			max_lead: AUDIO_PACER_MAX_LEAD,
+		},
+	};
+
+	/// Read the operator's per-camera pacer knobs (already clamped so each
+	/// lead cap covers its latency floor).
+	pub fn from_camera_config(config: &CameraConfig) -> Self {
+		Self {
+			video: config.video_pacer_timings(),
+			audio: config.audio_pacer_timings(),
+		}
+	}
+}
+
+impl Default for PacerSettings {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
 
 /// Per-source audio pacing task.
 ///
@@ -994,6 +1082,7 @@ async fn audio_pacer_task(
 	rx: mpsc::Receiver<PacedFrame>,
 	broadcast: broadcast::Sender<Frame>,
 	cancel: CancellationToken,
+	timings: PacerTimings,
 ) {
 	// `snap_on_past = true` for audio. Argus emits AAC in GOP-aligned
 	// bursts (~30 AUs in 50 ms wallclock, then ~1.9 s of silence
@@ -1008,24 +1097,18 @@ async fn audio_pacer_task(
 	// (one that uses arrival wallclock to drive playback rate) sees a
 	// small jump per silence; mpv / ffmpeg / HA's wrap all use RTP
 	// timestamps for playback rate so they're unaffected.
-	media_pacer_task(
-		rx,
-		broadcast,
-		cancel,
-		AUDIO_PACER_MAX_LEAD,
-		AUDIO_PACER_INITIAL_LATENCY,
-		true,
-	)
-	.await
+	media_pacer_task(rx, broadcast, cancel, timings, true, "audio").await
 }
 
 /// Per-source video pacer — same shape as `audio_pacer_task` but with
 /// a larger lead cap and a deliberate startup latency. See the
-/// `VIDEO_PACER_*` constants for details.
+/// `VIDEO_PACER_*` constants for the defaults; the values actually used
+/// come from the camera's `video_pacer_*_ms` config keys.
 async fn video_pacer_task(
 	rx: mpsc::Receiver<PacedFrame>,
 	broadcast: broadcast::Sender<Frame>,
 	cancel: CancellationToken,
+	timings: PacerTimings,
 ) {
 	// `snap_on_past = false` for video — the 1.5 s initial-latency
 	// pre-buffer combined with the camera's natural 0.9 s GOP burst
@@ -1034,23 +1117,16 @@ async fn video_pacer_task(
 	// ever DID land in the past keeps the long-term wallclock-PTS
 	// slope at clock_rate, which matters more for video (per-frame
 	// PTS continuity drives downstream re-muxers' DTS reasoning).
-	media_pacer_task(
-		rx,
-		broadcast,
-		cancel,
-		VIDEO_PACER_MAX_LEAD,
-		VIDEO_PACER_INITIAL_LATENCY,
-		false,
-	)
-	.await
+	media_pacer_task(rx, broadcast, cancel, timings, false, "video").await
 }
 
 /// Generic per-source pacer driving emission to a `broadcast` channel
-/// at the rate dictated by each item's `duration`. `max_lead` caps how
-/// far the emit cursor may drift into the future under burst pressure;
-/// `initial_latency` delays the very first emission so the queue
-/// builds up a buffer that the absolute-anchor scheduling can drain
-/// against during upstream silence.
+/// at the rate dictated by each item's `duration`. `timings` carries the
+/// per-camera lead cap (how far the emit cursor may drift into the future
+/// under burst pressure) and the initial latency (delays the very first
+/// emission so the queue builds up a buffer that the absolute-anchor
+/// scheduling can drain against during upstream silence). `kind` labels
+/// the per-frame debug trace (`"audio"` / `"video"`).
 ///
 /// `snap_on_past` controls past-cursor handling. With `false`, when the
 /// cursor falls into the past (queue ran dry while camera was idle),
@@ -1066,10 +1142,14 @@ async fn media_pacer_task(
 	mut rx: mpsc::Receiver<PacedFrame>,
 	broadcast: broadcast::Sender<Frame>,
 	cancel: CancellationToken,
-	max_lead: Duration,
-	initial_latency: Duration,
+	timings: PacerTimings,
 	snap_on_past: bool,
+	kind: &'static str,
 ) {
+	let PacerTimings {
+		initial_latency,
+		max_lead,
+	} = timings;
 	let mut next_emit_at: Option<tokio::time::Instant> = None;
 	loop {
 		let item = tokio::select! {
@@ -1104,6 +1184,25 @@ async fn media_pacer_task(
 			}
 		}
 
+		// Measurement trace, emitted just before the frame goes out on the
+		// wire: `ms` is the wall time between the frame entering the pacer
+		// queue and this send (deliberate latency + queue residency), `pts`
+		// is the frame's own clock so lines can be matched to a consumer's
+		// log, `queued` is how many frames are still waiting behind it.
+		// Debug level only — and gated, so a non-debug run pays neither the
+		// PTS probe nor `Receiver::len`. Timestamps are never logged: the
+		// local time formatter drops milliseconds, so only computed
+		// durations are meaningful here.
+		if tracing::enabled!(tracing::Level::DEBUG) {
+			tracing::debug!(
+				kind = kind,
+				pts = frame_pts(&item.frame),
+				ms = item.queued_at.elapsed().as_millis() as u64,
+				queued = rx.len(),
+				"pacer emitted frame"
+			);
+		}
+
 		// `broadcast::send` returns `Err` only when there are no
 		// subscribers — that is normal pre-PLAY state and not a pacer
 		// problem; ignore.
@@ -1118,6 +1217,16 @@ async fn media_pacer_task(
 		// audio PTS" jump every SR_INTERVAL. Absolute scheduling keeps
 		// the long-term slope at exactly `clock_rate`.
 		next_emit_at = Some(target.checked_add(item.duration).unwrap_or(target));
+	}
+}
+
+/// The frame's PTS in its own media clock, for pacer diagnostics: 90 kHz
+/// for video, the codec's sample rate for audio. Only ever logged together
+/// with a computed duration, never as a standalone timestamp.
+fn frame_pts(frame: &Frame) -> u32 {
+	match frame {
+		Frame::Video { pts_90khz, .. } => *pts_90khz,
+		Frame::Audio { pts, .. } => *pts,
 	}
 }
 
@@ -2163,7 +2272,7 @@ fn dispatch_paced_video(
 	duration: Duration,
 ) {
 	if let Some(pace_tx) = video_pace_tx {
-		match pace_tx.try_send(PacedFrame { frame, duration }) {
+		match pace_tx.try_send(PacedFrame::new(frame, duration)) {
 			Ok(()) => {}
 			Err(mpsc::error::TrySendError::Full(item)) => {
 				record_pacer_overflow("video", item.duration);
@@ -2441,7 +2550,7 @@ fn dispatch_paced_audio(
 	duration: Duration,
 ) {
 	if let Some(pace_tx) = audio_pace_tx {
-		match pace_tx.try_send(PacedFrame { frame, duration }) {
+		match pace_tx.try_send(PacedFrame::new(frame, duration)) {
 			Ok(()) => {}
 			Err(mpsc::error::TrySendError::Full(item)) => {
 				// Queue is at capacity — pacer cannot keep up. Drop the
@@ -2622,13 +2731,18 @@ mod tests {
 		let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<Frame>(64);
 		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(16);
 		let cancel = CancellationToken::new();
-		let pacer = tokio::spawn(audio_pacer_task(pace_rx, broadcast_tx, cancel.clone()));
+		let pacer = tokio::spawn(audio_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			PacerSettings::DEFAULT.audio,
+		));
 
 		// Push 4 frames bursty — all within the same ms in paused time.
 		for i in 0..4u32 {
 			pace_tx
-				.send(PacedFrame {
-					frame: Frame::Audio {
+				.send(PacedFrame::new(
+					Frame::Audio {
 						payload: AudioPayload::Aac {
 							au_data: bytes::Bytes::new(),
 							sample_rate: 16_000,
@@ -2636,8 +2750,8 @@ mod tests {
 						},
 						pts: i.wrapping_mul(1024),
 					},
-					duration: Duration::from_millis(64),
-				})
+					Duration::from_millis(64),
+				))
 				.await
 				.expect("send to pacer");
 		}
@@ -2678,13 +2792,248 @@ mod tests {
 		let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Frame>(4);
 		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(4);
 		let cancel = CancellationToken::new();
-		let pacer = tokio::spawn(audio_pacer_task(pace_rx, broadcast_tx, cancel.clone()));
+		let pacer = tokio::spawn(audio_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			PacerSettings::DEFAULT.audio,
+		));
 		cancel.cancel();
 		drop(pace_tx);
 		tokio::time::timeout(Duration::from_secs(1), pacer)
 			.await
 			.expect("pacer must exit on cancel")
 			.expect("pacer task panicked");
+	}
+
+	/// The pacer must apply the *configured* startup latency, not the
+	/// compile-time default: with a 300 ms video latency the first frame
+	/// leaves ~300 ms after it entered the queue, and subsequent frames
+	/// still go out on their PTS-implied intervals. Virtual clock, so no
+	/// real sleeping.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn video_pacer_honours_configured_initial_latency() {
+		let timings = PacerTimings {
+			initial_latency: Duration::from_millis(300),
+			max_lead: Duration::from_millis(800),
+		};
+		let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<Frame>(16);
+		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(16);
+		let cancel = CancellationToken::new();
+		let pacer = tokio::spawn(video_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			timings,
+		));
+
+		pace_tx
+			.send(PacedFrame::new(dummy_video_frame(), Duration::ZERO))
+			.await
+			.expect("send to pacer");
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(
+			broadcast_rx.try_recv().is_err(),
+			"first frame must wait out the configured latency"
+		);
+
+		// 299 ms is not enough; crossing 300 ms releases it.
+		tokio::time::advance(Duration::from_millis(299)).await;
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(broadcast_rx.try_recv().is_err());
+		tokio::time::advance(Duration::from_millis(1)).await;
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(
+			matches!(broadcast_rx.try_recv(), Ok(Frame::Video { .. })),
+			"first frame must be emitted at the configured latency"
+		);
+
+		// The latency is a one-shot startup buffer, not a per-frame delay:
+		// the emit cursor already sits at `now`, so the next frame goes out
+		// straight away.
+		pace_tx
+			.send(PacedFrame::new(
+				dummy_video_frame(),
+				Duration::from_millis(33),
+			))
+			.await
+			.expect("send to pacer");
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(
+			matches!(broadcast_rx.try_recv(), Ok(Frame::Video { .. })),
+			"second frame must not pay the startup latency again"
+		);
+
+		// From there on slots advance by the frames' own intervals: the
+		// 33 ms just emitted schedules the next one 33 ms out.
+		pace_tx
+			.send(PacedFrame::new(dummy_video_frame(), Duration::ZERO))
+			.await
+			.expect("send to pacer");
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(
+			broadcast_rx.try_recv().is_err(),
+			"a frame must wait the previous frame's interval"
+		);
+		tokio::time::advance(Duration::from_millis(33)).await;
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(matches!(broadcast_rx.try_recv(), Ok(Frame::Video { .. })));
+
+		cancel.cancel();
+		drop(pace_tx);
+		let _ = tokio::time::timeout(Duration::from_millis(100), pacer).await;
+	}
+
+	/// Audio side of the same contract: `audio_pacer_latency_ms` reaches
+	/// the pacer task, and the audio lead cap does not snap the cursor
+	/// forward on the first frame (600 ms cap ≥ 300 ms latency).
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn audio_pacer_honours_configured_initial_latency() {
+		let timings = PacerTimings {
+			initial_latency: Duration::from_millis(300),
+			max_lead: Duration::from_millis(600),
+		};
+		let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<Frame>(16);
+		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(16);
+		let cancel = CancellationToken::new();
+		let pacer = tokio::spawn(audio_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			timings,
+		));
+
+		pace_tx
+			.send(PacedFrame::new(
+				dummy_audio_frame(),
+				Duration::from_millis(20),
+			))
+			.await
+			.expect("send to pacer");
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(broadcast_rx.try_recv().is_err());
+		tokio::time::advance(Duration::from_millis(300)).await;
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(
+			matches!(broadcast_rx.try_recv(), Ok(Frame::Audio { .. })),
+			"first audio frame must be emitted at the configured latency"
+		);
+
+		cancel.cancel();
+		drop(pace_tx);
+		let _ = tokio::time::timeout(Duration::from_millis(100), pacer).await;
+	}
+
+	/// The measurement trace must exist (that is how the operator measures
+	/// internal latency before lowering the knobs) and must carry a
+	/// computed duration rather than a raw timestamp: `ms`, `pts`, `queued`.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn pacer_logs_wait_duration_at_debug() {
+		let logs = crate::test_logs::capture_at(tracing::Level::DEBUG);
+		let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Frame>(16);
+		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(16);
+		let cancel = CancellationToken::new();
+		let pacer = tokio::spawn(video_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			PacerSettings::DEFAULT.video,
+		));
+
+		pace_tx
+			.send(PacedFrame::new(dummy_video_frame(), Duration::ZERO))
+			.await
+			.expect("send to pacer");
+		// Let the pacer sample the (paused) clock and arm its sleep before
+		// moving time forward, otherwise its first frame anchor is the
+		// already-advanced time and nothing is emitted yet.
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		tokio::time::advance(VIDEO_PACER_INITIAL_LATENCY).await;
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+
+		let out = logs.text();
+		assert!(
+			out.contains("pacer emitted frame"),
+			"expected the pacer debug line, got: {out}"
+		);
+		assert!(out.contains("kind=\"video\""), "got: {out}");
+		// Wait time equals the deliberate latency in this scenario.
+		assert!(out.contains("ms=1500"), "got: {out}");
+		assert!(out.contains("queued=0"), "got: {out}");
+
+		cancel.cancel();
+		drop(pace_tx);
+		let _ = tokio::time::timeout(Duration::from_millis(100), pacer).await;
+	}
+
+	/// Nothing at info level: the per-frame trace is debug-only, so an
+	/// operator running at the default level sees no pacer spam.
+	#[tokio::test(flavor = "current_thread", start_paused = true)]
+	async fn pacer_trace_is_silent_below_debug_level() {
+		let logs = crate::test_logs::capture_at(tracing::Level::INFO);
+		let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Frame>(16);
+		let (pace_tx, pace_rx) = mpsc::channel::<PacedFrame>(16);
+		let cancel = CancellationToken::new();
+		let pacer = tokio::spawn(video_pacer_task(
+			pace_rx,
+			broadcast_tx,
+			cancel.clone(),
+			PacerSettings::DEFAULT.video,
+		));
+		pace_tx
+			.send(PacedFrame::new(dummy_video_frame(), Duration::ZERO))
+			.await
+			.expect("send to pacer");
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		tokio::time::advance(VIDEO_PACER_INITIAL_LATENCY).await;
+		tokio::task::yield_now().await;
+		tokio::task::yield_now().await;
+		assert!(!logs.text().contains("pacer emitted frame"));
+
+		cancel.cancel();
+		drop(pace_tx);
+		let _ = tokio::time::timeout(Duration::from_millis(100), pacer).await;
+	}
+
+	/// `PacerSettings::from_camera_config` is the threading path from the
+	/// operator's TOML keys to the pacer constructors.
+	#[test]
+	fn pacer_settings_read_per_camera_keys() {
+		let config = CameraConfig {
+			video_pacer_latency_ms: 300,
+			video_pacer_max_lead_ms: 800,
+			audio_pacer_latency_ms: 200,
+			audio_pacer_max_lead_ms: 600,
+			..CameraConfig::default()
+		};
+		let settings = PacerSettings::from_camera_config(&config);
+		assert_eq!(settings.video.initial_latency, Duration::from_millis(300));
+		assert_eq!(settings.video.max_lead, Duration::from_millis(800));
+		assert_eq!(settings.audio.initial_latency, Duration::from_millis(200));
+		assert_eq!(settings.audio.max_lead, Duration::from_millis(600));
+	}
+
+	/// Defaults unchanged: an all-default camera still paces at the
+	/// historical 1500/3000 + 500/200 ms.
+	#[test]
+	fn pacer_settings_default_matches_historical_constants() {
+		let settings = PacerSettings::from_camera_config(&CameraConfig::default());
+		assert_eq!(settings, PacerSettings::DEFAULT);
+		assert_eq!(settings.video.initial_latency, VIDEO_PACER_INITIAL_LATENCY);
+		assert_eq!(settings.video.max_lead, VIDEO_PACER_MAX_LEAD);
+		assert_eq!(settings.audio.initial_latency, AUDIO_PACER_INITIAL_LATENCY);
+		assert_eq!(settings.audio.max_lead, AUDIO_PACER_MAX_LEAD);
 	}
 
 	/// the `gap_threshold` supplied at construction
@@ -5364,10 +5713,7 @@ mod tests {
 		let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Frame>(1);
 		// Saturate the queue.
 		pace_tx
-			.try_send(PacedFrame {
-				frame: dummy_video_frame(),
-				duration: Duration::ZERO,
-			})
+			.try_send(PacedFrame::new(dummy_video_frame(), Duration::ZERO))
 			.unwrap();
 		// Now the next dispatch must hit the Full branch and not panic.
 		dispatch_paced_video(
@@ -5406,10 +5752,7 @@ mod tests {
 		let (pace_tx, _pace_rx) = mpsc::channel::<PacedFrame>(1);
 		let (broadcast_tx, _broadcast_rx) = broadcast::channel::<Frame>(1);
 		pace_tx
-			.try_send(PacedFrame {
-				frame: dummy_audio_frame(),
-				duration: Duration::ZERO,
-			})
+			.try_send(PacedFrame::new(dummy_audio_frame(), Duration::ZERO))
 			.unwrap();
 		dispatch_paced_audio(
 			Some(&pace_tx),

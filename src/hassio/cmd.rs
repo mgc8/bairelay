@@ -43,6 +43,12 @@ pub fn run(
 		}
 	}
 
+	// Same normalisation `parse_config` does for the file-only path: a pacer
+	// lead cap below its own latency is a tuning mistake, so the effective
+	// config the operator sees and the pacer runs on carries the corrected
+	// pair, with the warning in this command's output.
+	crate::config::clamp_pacer_lead_limits(&mut cfg);
+
 	validate_config(&cfg).map_err(|e| anyhow::anyhow!("merged config invalid: {e}"))?;
 
 	let rendered = minimize_render(&cfg)?;

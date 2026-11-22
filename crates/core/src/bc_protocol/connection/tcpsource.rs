@@ -84,7 +84,22 @@ async fn connect_to(addr: SocketAddr) -> Result<TcpStream> {
 	};
 
 	match tokio::time::timeout(TCP_CONNECT_TIMEOUT, socket.connect(addr)).await {
-		Ok(Ok(stream)) => Ok(stream),
+		Ok(Ok(stream)) => {
+			// The Baichuan control channel is strictly request/response: a
+			// small write (login, get_param, talk config, PTZ) followed by a
+			// wait for the camera's reply. Nagle's algorithm holds a small
+			// segment until the previous one is ACKed, which adds up to a
+			// round trip per request on a lossy Wi-Fi link — exactly the
+			// stall operators see as slow wake-ups and laggy talk setup.
+			// Media flows on a separate socket, so disabling Nagle here only
+			// removes latency, it does not change how bursts are shaped.
+			// A failure is not actionable and never fatal: the connection
+			// works, just with Nagle on.
+			if let Err(e) = stream.set_nodelay(true) {
+				log::debug!("TCP_NODELAY on {addr} failed: {e}; continuing with Nagle");
+			}
+			Ok(stream)
+		}
 		Ok(Err(e)) => Err(e.into()),
 		Err(_) => Err(std::io::Error::new(
 			std::io::ErrorKind::TimedOut,

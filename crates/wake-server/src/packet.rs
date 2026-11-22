@@ -41,19 +41,29 @@ pub fn decode_discovery(buf: &[u8]) -> Result<(u32, UdpXml), WakeServerError> {
 	}
 }
 
-/// Reject UDP payloads whose UID field exceeds `MAX_UID_LEN`. Returns
-/// `Err(WakeServerError::UnexpectedPacketKind)` (with a "uid-too-long"
-/// label) so the caller's existing log path fires uniformly with
-/// other bad-packet rejections.
-fn validate_uid_bounds(payload: &UdpXml) -> Result<(), WakeServerError> {
-	let uid: Option<&str> = match payload {
+/// The UID a payload carries, for the packet types that name a camera.
+///
+/// The wake server reads this to bound the field before storing it. The binary's
+/// startup discovery scan reads the same field off whatever a camera sends it, so
+/// the two cannot disagree about which packets name a camera — a list each caller
+/// kept for itself would be a list one of them forgot to update.
+pub fn payload_uid(payload: &UdpXml) -> Option<&str> {
+	match payload {
 		UdpXml::C2mQ(q) => Some(q.uid.as_str()),
 		UdpXml::D2mQ(q) => Some(q.uid.as_str()),
 		UdpXml::C2rC(c) => Some(c.uid.as_str()),
 		UdpXml::D2rHb(hb) => Some(hb.uid.as_str()),
 		UdpXml::D2rR(r) => Some(r.uid.as_str()),
 		_ => None,
-	};
+	}
+}
+
+/// Reject UDP payloads whose UID field exceeds `MAX_UID_LEN`. Returns
+/// `Err(WakeServerError::UnexpectedPacketKind)` (with a "uid-too-long"
+/// label) so the caller's existing log path fires uniformly with
+/// other bad-packet rejections.
+fn validate_uid_bounds(payload: &UdpXml) -> Result<(), WakeServerError> {
+	let uid = payload_uid(payload);
 	if let Some(u) = uid {
 		if u.len() > MAX_UID_LEN {
 			return Err(WakeServerError::UnexpectedPacketKind {

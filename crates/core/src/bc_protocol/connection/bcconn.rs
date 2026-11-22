@@ -30,7 +30,7 @@ pub(crate) type BcConnSink = Box<dyn Sink<Bc, Error = Error> + Send + Sync + Unp
 pub(crate) type BcConnSource = Box<dyn Stream<Item = Result<Bc>> + Send + Sync + Unpin>;
 
 /// A shareable connection to a camera.  Handles serialization of messages.  To send/receive, call
-/// .[subscribe()] with a message number.  You can use the BcSubscription to send or receive only
+/// [`BcConnection::subscribe()`] with a message number.  You can use the BcSubscription to send or receive only
 /// messages with that number; each incoming message is routed to its appropriate subscriber.
 ///
 /// There can be only one subscriber per kind of message at a time.
@@ -134,7 +134,7 @@ impl BcConnection {
 		Ok(())
 	}
 
-	/// Stop a message handler created using [`handle_msg`]
+	/// Stop a message handler created using [`BcConnection::handle_msg`]
 	#[allow(dead_code)] // Currently unused but added for future use
 	pub async fn unhandle_msg(&self, msg_id: u32) -> Result<()> {
 		self.poll_commander

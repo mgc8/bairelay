@@ -106,7 +106,7 @@ pub async fn warm_last_frame_buffers(
 /// Every awaited step is raced against `cancel` so Ctrl+C during startup
 /// returns immediately rather than waiting for per-step timeouts.
 async fn warm_one(
-	handle: &CameraHandle,
+	handle: &Arc<CameraHandle>,
 	name: &str,
 	cancel: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -179,10 +179,35 @@ async fn warm_one(
 	//    `stop_all_stream_sources` runs.
 	drop(source);
 
+	// 6) Ask, once, what has never been asked. A family the bridge has never read
+	//    stays read-only in Home Assistant until somebody reads it, and on a battery
+	//    doorbell in maximum power saving "somebody" can be nobody for days. The
+	//    session is already open here - this cycle paid for it to warm the last-frame
+	//    buffer - so the question is paid in commands, not in a wake: no second
+	//    session is opened, and the guard in `burst` still refuses to run two at once.
+	//    After `drop(source)` so the reads do not compete with our own video pull, and
+	//    the wake lock held by the caller keeps the camera with us while the burst
+	//    works. When the memory already proves everything, nothing is asked: an
+	//    ordinary restart costs zero commands.
+	let unproven = crate::burst::families_never_read(name);
+	if unproven.is_empty() {
+		tracing::debug!(
+			camera = %name,
+			"startup settings read: nothing to ask, the memory already proves this camera"
+		);
+	} else {
+		tracing::info!(
+			camera = %name,
+			families = unproven.len(),
+			"startup settings read: asking the families the memory has never proved, in the session this cycle already paid for"
+		);
+		crate::burst::trigger(Arc::clone(handle), crate::burst::Wake::Startup);
+	}
+
 	Ok(())
 }
 
-/// Request a JPEG snapshot via [`CameraDriver::get_snapshot`] (retrying the wake-time 400 and bounded per attempt by [`SNAPSHOT_TIMEOUT`]) and push successful bytes into
+/// Request a JPEG snapshot via [`bairelay_neolink_core::bc_protocol::CameraDriver::get_snapshot`] (retrying the wake-time 400 and bounded per attempt by [`SNAPSHOT_TIMEOUT`]) and push successful bytes into
 /// `last_frame`. Errors / timeouts log at warn and leave the buffer
 /// untouched. Lifted out of [`warm_one`] so behaviour tests can drive
 /// it against a `FakeCamera` without the stream / audio dependencies.
@@ -517,6 +542,56 @@ mod tests {
 
 		let presence = *handle.audio_presence().read().unwrap();
 		assert_eq!(presence, crate::audio_presence::AudioPresence::Absent);
+	}
+
+	/// The startup cycle owes the camera one burst when families have never been
+	/// proved: without it, every write entity stays read-only until the camera wakes
+	/// by itself. The burst is observable without an MQTT broker - taking the guard is
+	/// synchronous and survives the burst then giving up for want of a broker - so the
+	/// ask is asserted by asking a second time and being refused.
+	#[tokio::test]
+	async fn warm_cycle_asks_the_families_the_memory_never_proved() {
+		use crate::camera::CameraHandle;
+		use crate::config::test_helpers::minimal_camera_config;
+		use crate::stream_source::StreamSource;
+		use bairelay_neolink_core::bc_protocol::FakeCameraBuilder;
+		use bairelay_rtsp::buffer::VideoBurst;
+		use bairelay_rtsp::codec::VideoCodec;
+		use bairelay_rtsp::url::StreamKind;
+		use std::collections::HashMap;
+		use std::time::Instant as StdInstant;
+
+		let fake = FakeCameraBuilder::new().with_snapshot(|| Ok(vec![0xFF, 0xD8])).build();
+		let (source, last_frame) =
+			StreamSource::start_inert_for_test_with_gap_and_last_frame(Duration::from_secs(1));
+		last_frame.replace_video(VideoBurst {
+			codec: VideoCodec::H264,
+			parameter_sets: vec![vec![0x67]],
+			iframe_nals: vec![vec![0x65]],
+			pframe_nals: vec![],
+			captured_at: StdInstant::now(),
+			captured_pts_90khz: 0,
+		});
+
+		let cancel = CancellationToken::new();
+		let handle = Arc::new(CameraHandle::new(
+			minimal_camera_config("cam-startup-read"),
+			cancel.clone(),
+			None,
+		));
+		handle.insert_stream_source_for_test(StreamKind::Main, Arc::clone(&source));
+		handle.set_driver_for_test(fake);
+
+		let mut map = HashMap::new();
+		map.insert("cam-startup-read".to_string(), Arc::clone(&handle));
+		let cameras = Arc::new(map);
+		warm_last_frame_buffers(&cameras, cancel).await;
+
+		let seconde = crate::burst::trigger(Arc::clone(&handle), crate::burst::Wake::Press);
+		assert!(
+			seconde.is_none(),
+			"the warm cycle should have taken this camera's burst for the startup read"
+		);
 	}
 
 	/// `observe_audio_presence` short-circuits when the SDP already

@@ -42,14 +42,43 @@ pub const MSG_ID_REBOOT: u32 = 23;
 pub const MSG_ID_MOTION_REQUEST: u32 = 31;
 /// Motion detection messages
 pub const MSG_ID_MOTION: u32 = 33;
+/// Write the `<VideoInput>` / `<InputAdvanceCfg>` image block. The SET wants
+/// the block the GET (26) just printed, both carriers together.
+pub const MSG_ID_SET_IMAGE: u32 = 25;
+/// Read the image block: one reply carries **both** `<VideoInput>` and
+/// `<InputAdvanceCfg>`.
+pub const MSG_ID_GET_IMAGE: u32 = 26;
 /// Set service ports
 pub const MSG_ID_SET_SERVICE_PORTS: u32 = 36;
 /// Get service ports
 pub const MSG_ID_GET_SERVICE_PORTS: u32 = 37;
+/// Read the `<Ntp>` clock-synchronisation block.
+pub const MSG_ID_GET_NTP: u32 = 38;
+/// Write the `<Ntp>` block back (read-modify-write of the 38 reply).
+pub const MSG_ID_SET_NTP: u32 = 39;
 /// Get Email setting
 pub const MSG_ID_GET_EMAIL: u32 = 42;
 /// Set email settings
 pub const MSG_ID_SET_EMAIL: u32 = 43;
+/// Read the on-screen-display blocks: one reply carries **both**
+/// `<OsdDatetime>` and `<OsdChannelName>`. Never read OSD through 26 —
+/// the reference client's pre-0.6 bug, which wrote tags the 25 setter
+/// does not have.
+pub const MSG_ID_GET_OSD: u32 = 44;
+/// Write the OSD blocks back (both carriers, patched in place).
+pub const MSG_ID_SET_OSD: u32 = 45;
+/// Read the motion-detection configuration. The reply carries `<MdAlarm>`
+/// on the firmwares recorded on the operator's doorbell, and `<MD>`
+/// on the ones that print the setter's own shape; both are modelled.
+pub const MSG_ID_GET_MOTION_DETECT: u32 = 46;
+/// Write the motion-detection configuration. Documented request body is
+/// `<MD version="1.1">`; see `BcCamera::set_motion_cfg` for why a camera
+/// that only printed `<MdAlarm>` is not written.
+pub const MSG_ID_SET_MOTION_DETECT: u32 = 47;
+/// Read the privacy-mask (shelter) block `<Shelter>`.
+pub const MSG_ID_GET_PRIVACY_MASK: u32 = 52;
+/// Write the `<Shelter>` block back.
+pub const MSG_ID_SET_PRIVACY_MASK: u32 = 53;
 /// Get users and general system info
 pub const MSG_ID_GET_ABILITY_SUPPORT: u32 = 58;
 /// Update, create and remove users
@@ -58,6 +87,11 @@ pub const MSG_ID_UPDATE_USER_LIST: u32 = 59;
 pub const MSG_ID_VERSION: u32 = 80;
 /// Ping messages have this ID
 pub const MSG_ID_PING: u32 = 93;
+/// Write the `<AutoReboot>` schedule. Note the asymmetry: the setter is the
+/// **lower** id (100) and the getter 101.
+pub const MSG_ID_SET_AUTO_REBOOT: u32 = 100;
+/// Read the `<AutoReboot>` schedule.
+pub const MSG_ID_GET_AUTO_REBOOT: u32 = 101;
 /// General system info messages have this ID
 pub const MSG_ID_GET_GENERAL: u32 = 104;
 /// Setting general system info (clock mostly) messages have this ID
@@ -74,6 +108,13 @@ pub const MSG_ID_SET_DST: u32 = 107;
 pub const MSG_ID_SNAP: u32 = 109;
 /// Used to grab the UID
 pub const MSG_ID_UID: u32 = 114;
+/// Read `<WifiSignal>`: the single `<signal>` field's unit is undocumented
+/// (dBm or %; the reference client never converts it), so it is relayed as
+/// the camera's own text.
+pub const MSG_ID_GET_WIFI_SIGNAL: u32 = 115;
+/// Read `<Wifi>`: the joined network. The firmware may return the `<key>`,
+/// so nothing from this block is ever published to MQTT.
+pub const MSG_ID_GET_WIFI: u32 = 116;
 /// Used to pass the token and client ID for push notifications
 pub const MSG_ID_PUSH_INFO: u32 = 124;
 /// Send a test email configuration
@@ -110,6 +151,12 @@ pub const MSG_ID_BATTERY_INFO_LIST: u32 = 252;
 pub const MSG_ID_BATTERY_INFO: u32 = 253;
 /// Used for to play sounds like the siren
 pub const MSG_ID_PLAY_AUDIO: u32 = 263;
+/// Read the `<audioCfg>` loudspeaker / intercom block (volumes, visitor
+/// loudspeaker). The only place `talkAndReplyVolume` exists.
+pub const MSG_ID_GET_AUDIO_CFG: u32 = 264;
+/// Write the `<audioCfg>` block back. The firmware wants the whole block it
+/// just printed with one tag changed, not a partial block.
+pub const MSG_ID_SET_AUDIO_CFG: u32 = 265;
 /// Manual Floodlight Control
 pub const MSG_ID_FLOODLIGHT_MANUAL: u32 = 288;
 /// Set Floodlight tasks xml
@@ -120,8 +167,65 @@ pub const MSG_ID_FLOODLIGHT_STATUS_LIST: u32 = 291;
 pub const MSG_ID_GET_ZOOM_FOCUS: u32 = 294;
 /// Used for camera Zoom write
 pub const MSG_ID_SET_ZOOM_FOCUS: u32 = 295;
+/// Read one AI-detection type's `<AiDetectCfg>`. The request names the type,
+/// so there is no single all-types read.
+///
+/// **Documented in the upstream sources**: the two
+/// upstream sources contradict each other on the setter (343 vs 345), but the
+/// **executable code** of the reference library uses only **343** - so 343 is
+/// what is coded here, and 345 stays a note. `bairelay` does not write this
+/// block yet: the encoding of fractions (`5.000000e-01`, two-digit exponent)
+/// and the exact body of request 342 have no local capture, and a truncation
+/// silently accepted would write thresholds.
+pub const MSG_ID_GET_AI_DETECT: u32 = 342;
+/// Write an AI-detection type's `<AiDetectCfg>` (see
+/// [`MSG_ID_GET_AI_DETECT`]: 343 is the setter the reference client executes).
+pub const MSG_ID_SET_AI_DETECT: u32 = 343;
+/// Observed in app traffic; semantics **not** established (see
+/// [`MSG_ID_GET_AI_DETECT`] for why 343 is the one we side with). Never sent.
+pub const MSG_ID_AI_DETECT_UNKNOWN: u32 = 345;
 /// Get the floodlight task xml
 pub const MSG_ID_FLOODLIGHT_TASKS_READ: u32 = 438;
+/// Read the microphone AI denoiser block `<aiDenoise>` (enable + level).
+/// This is the closest thing the protocol has to a microphone setting: the
+/// reference client's own UI calls it "On-device denoiser applied to the
+/// camera mic", and no mic gain / mic mute command exists anywhere.
+pub const MSG_ID_GET_AI_DENOISE: u32 = 439;
+/// Write the `<aiDenoise>` block back (read-modify-write of the 439 reply).
+pub const MSG_ID_SET_AI_DENOISE: u32 = 440;
+/// Hardwired (mains) chime control: `<dingdongCtrl>` with
+/// `machineStateGet` (read) / `machineStateSet` (write). The wired chime
+/// never appears in the wireless list (484) — this is its only face.
+pub const MSG_ID_DING_DONG_CTRL: u32 = 483;
+/// List the chimes paired to the doorbell: empty body, the reply carries
+/// repeated `<dingdongDeviceInfo>` blocks. The camera also pushes this
+/// list unsolicited when pairing changes; the push is not modelled here.
+/// A 400 / timeout on this id is how a model without a wireless chime
+/// answers (inferred, not documented as an error table).
+pub const MSG_ID_GET_DING_DONG_LIST: u32 = 484;
+/// Chime device options on `<dingdongDeviceOpt>`: `getParam` reads
+/// `name` / `volLevel` / `ledState`, `setParam` writes them, and
+/// `ringWithMusic` makes the chime ring once — the only live proof a
+/// paired chime answers through the doorbell session.
+pub const MSG_ID_DING_DONG_OPT: u32 = 485;
+/// Per-event chime configuration: empty body, the reply carries repeated
+/// `<deviceCfg>` blocks, each with `<id>` / `<ringId>` and one
+/// `<alarminCfg>` per ringable event type.
+pub const MSG_ID_GET_DING_DONG_CFG: u32 = 486;
+/// Write one `<deviceCfg>` block back inside a `<dingdongCfg>` wrapper.
+/// Like other SETs, this firmware may swallow a truncated block silently.
+pub const MSG_ID_SET_DING_DONG_CFG: u32 = 487;
+/// Read `<sleepState>`: whether the battery camera is asleep, plus its PTZ
+/// park position. Read-only — there is no documented setter, and waking or
+/// sleeping the device is done by the wake path, not by a settings write.
+pub const MSG_ID_GET_SLEEP_STATE: u32 = 574;
+/// Chime silent mode read: `<dingdongSilentMode><id>` in, `<time>` back.
+pub const MSG_ID_GET_DING_DONG_SILENT: u32 = 609;
+/// Chime silent mode write: `<id>` + `<time>` + `<type>63</type>` (the
+/// type value is hard-coded upstream; its meaning is undocumented).
+/// Re-writing the block RE-ARMS the mute countdown, which is why
+/// `set_ding_dong_cfg` only sends it when the text actually changed.
+pub const MSG_ID_SET_DING_DONG_SILENT: u32 = 610;
 /// Get the HTTP webhook configuration (`HaCfg`)
 pub const MSG_ID_GET_HA_CFG: u32 = 806;
 /// Set the HTTP webhook configuration (`HaCfg`)

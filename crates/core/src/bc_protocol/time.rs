@@ -527,7 +527,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn get_time_non_200_returns_err() {
+	async fn get_time_not_200_returns_err() {
 		let mock = MockConnection::new()
 			.expect_msg(MSG_ID_GET_GENERAL)
 			.reply_with(|req| reply_err_code(req, 500))
@@ -691,6 +691,7 @@ mod tests {
 							time_format: Some(1),
 							language: Some("English".to_string()),
 							device_name: Some("Front gate".to_string()),
+							..Default::default()
 						}),
 						..Default::default()
 					},
@@ -759,7 +760,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn set_time_non_200_returns_err() {
+	async fn set_time_not_200_returns_err() {
 		let mock = MockConnection::new()
 			.expect_msg(MSG_ID_GET_DST)
 			.reply_with(reply_dst_disabled)

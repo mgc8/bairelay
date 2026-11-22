@@ -717,6 +717,14 @@ fn xml_talk_ability_roundtrip_preserves_all_fields() {
 	let ta = parsed.talk_ability.as_ref().unwrap();
 	assert_eq!(ta.duplex_list.len(), 1);
 	assert_eq!(ta.audio_config_list.len(), 1);
+	// One element inside a repeated tag is still a one-item collection.
+	assert_eq!(ta.duplex_list[0].duplex, vec!["FDX".to_string()]);
+	assert_eq!(
+		ta.audio_stream_mode_list[0].audio_stream_mode,
+		vec!["followVideoStream".to_string()]
+	);
+	assert_eq!(ta.audio_config_list[0].audio_config.len(), 1);
+	assert_eq!(ta.audio_config_list[0].audio_config[0].sample_rate, 16000);
 }
 
 #[test]
@@ -731,6 +739,84 @@ fn xml_talk_ability_empty_lists() {
 	let parsed = BcXml::try_parse(xml.as_bytes()).unwrap();
 	let ta = parsed.talk_ability.as_ref().unwrap();
 	assert!(ta.duplex_list.is_empty());
+}
+
+/// Measured reply from hardware, verbatim: msg id 10, 553 bytes, captured
+/// with `debug = true` / `-vvv`. One `<audioStreamModeList>` carries **two**
+/// `<audioStreamMode>` children — the exact payload the protocol layer used
+/// to throw away with ``Custom("duplicate field `audioStreamMode`")`` while
+/// the wrapper modelled that tag as a single element, which is how a camera
+/// that does have a talk path looked like one that does not.
+#[test]
+fn xml_talk_ability_measured_two_audio_stream_modes() {
+	let xml = indoc!(
+		r#"
+		<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<TalkAbility version="1.1"><duplexList><duplex>FDX</duplex></duplexList><audioStreamModeList><audioStreamMode>followVideoStream</audioStreamMode><audioStreamMode>mixAudioStream</audioStreamMode></audioStreamModeList><audioConfigList><audioConfig><priority>0</priority><audioType>adpcm</audioType><sampleRate>16000</sampleRate><samplePrecision>16</samplePrecision><lengthPerEncoder>1024</lengthPerEncoder><soundTrack>mono</soundTrack></audioConfig></audioConfigList></TalkAbility>
+		</body>"#
+	);
+	let parsed = assert_xml_roundtrip_via_bcxml(xml);
+	let ta = parsed.talk_ability.as_ref().unwrap();
+	assert_eq!(ta.version, "1.1");
+	assert_eq!(ta.duplex_list[0].duplex, vec!["FDX".to_string()]);
+	assert_eq!(
+		ta.audio_stream_mode_list[0].audio_stream_mode,
+		vec!["followVideoStream".to_string(), "mixAudioStream".to_string()]
+	);
+	let configs = &ta.audio_config_list[0].audio_config;
+	assert_eq!(configs.len(), 1);
+	assert_eq!(configs[0].priority, Some(0));
+	assert_eq!(configs[0].audio_type, "adpcm");
+	assert_eq!(configs[0].sample_rate, 16000);
+	assert_eq!(configs[0].sample_precision, 16);
+	assert_eq!(configs[0].length_per_encoder, 1024);
+	assert_eq!(configs[0].sound_track, "mono");
+}
+
+/// Same reasoning for the two other wrappers: nothing in the protocol says
+/// a firmware may not advertise several duplex modes or several codecs in
+/// one list, and each would have failed the whole reply the same way.
+#[test]
+fn xml_talk_ability_multiple_duplex_and_audio_configs() {
+	let xml = indoc!(
+		r#"
+		<?xml version="1.0" encoding="UTF-8" ?>
+		<body>
+		<TalkAbility version="1.1">
+		<duplexList>
+		<duplex>FDX</duplex>
+		<duplex>FBX</duplex>
+		</duplexList>
+		<audioConfigList>
+		<audioConfig>
+		<audioType>adpcm</audioType>
+		<sampleRate>16000</sampleRate>
+		<samplePrecision>16</samplePrecision>
+		<lengthPerEncoder>1024</lengthPerEncoder>
+		<soundTrack>mono</soundTrack>
+		</audioConfig>
+		<audioConfig>
+		<audioType>adpcm</audioType>
+		<sampleRate>8000</sampleRate>
+		<samplePrecision>16</samplePrecision>
+		<lengthPerEncoder>512</lengthPerEncoder>
+		<soundTrack>mono</soundTrack>
+		</audioConfig>
+		</audioConfigList>
+		</TalkAbility>
+		</body>"#
+	);
+	let parsed = assert_xml_roundtrip_via_bcxml(xml);
+	let ta = parsed.talk_ability.as_ref().unwrap();
+	assert_eq!(ta.duplex_list[0].duplex, vec!["FDX".to_string(), "FBX".to_string()]);
+	let configs = &ta.audio_config_list[0].audio_config;
+	assert_eq!(configs.len(), 2);
+	assert_eq!(configs[0].length_per_encoder, 1024);
+	assert_eq!(configs[1].sample_rate, 8000);
+	assert_eq!(configs[1].length_per_encoder, 512);
+	// `<priority>` is optional and absent here: still `None`, not 0.
+	assert_eq!(configs[0].priority, None);
 }
 
 #[test]

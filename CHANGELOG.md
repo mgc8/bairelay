@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased] — two-way-audio-and-settings branch
+
+### Added
+- Two-way audio: `talk` and `audio-bridge` one-shots (go2rtc backchannel
+  plumbing), silence keepalive, talk-capability probe (docs/two-way-audio.md)
+- Settings family over MQTT discovery switches for camera and wired chime, with
+  refusal-safe published text (docs/settings.md, docs/availability.md)
+- Wake-server: permissive `0x31` announcement decoding, doorbell press and
+  burst events as HA events (docs/wake-local-addressing.md)
+- Per-camera media pacer keys (`video_pacer_latency_ms` / `*_max_lead_ms`
+  and audio counterparts)
+- Opt-in startup UID discovery (disabled by default) and family-state memory
+  with wake-burst budgeting
+
+### Verified on\n- Reolink Video Doorbell (battery) D340B class, fw `v3.0.0.4636_25060550`, cloud-disabled,\n  paired with a mains Reolink Chime, under Home Assistant\n\n### Changed
+- Command names and identifiers in English throughout (`audio-bridge`
+  canonical); published text sanitised at the MQTT boundary
+
 ## [1.1.2] — 2026-06-08
 
 Maintenance release:
@@ -122,3 +140,4 @@ Bairelay is a pure-Rust replacement for [Neolink](https://github.com/QuantumEnta
 - Two-way audio (`talk`).
 
 See `README.md` for full rationale and acknowledgements.
+

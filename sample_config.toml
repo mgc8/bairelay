@@ -59,8 +59,16 @@ bind = "0.0.0.0"
 # enable = false             # opt-in
 # middleman_port = 9999      # UDP, C2M_Q listener
 # register_port = 58200      # UDP, D2R_HB / C2R_C / D2R_DISC listener
-# heartbeat_ms = 20000       # echoed to cameras in R2D_HB_R
-# stale_after_ms = 80000     # registry entries older than this read as None
+# heartbeat_ms = 20000       # cadence we assume: stale_after_ms must cover it,
+#                          # and it is what R2D_HB_R carries when hb_advice_ms is unset
+# hb_advice_ms = 20000     # cadence advertised in R2D_HB_R. Advice only: the
+#                          # firmware sets its own pace (about 10 s observed), so
+#                          # this changes what we say, never what we hear
+# stale_after_ms = 80000   # registry entries older than this read as None
+# explain_declared_uid = false # log the real reason when a refused wake request
+#                          # names a camera this bridge declares: the answer to the
+#                          # client stays rsp = -1, nothing is invented, only the
+#                          # sentence changes
 
 
 # Motion-push listener.
@@ -83,6 +91,27 @@ bind = "0.0.0.0"
 # motion_wake_hold_secs = 30           # wake-lock window per webhook event
 
 
+# Startup discovery: let the network say which cameras exist.
+# Off unless enable = true. When it is on, bairelay broadcasts the protocol's
+# any-camera discovery request (UDP broadcast to port 2015) once at startup,
+# listens for wait_secs, and adds every camera that answers and names itself:
+# address = the address it answered from, discovery = "local", credentials = the
+# pair below. Nothing else is invented — no port is guessed, no address is
+# tried, no password is borrowed from another camera.
+# A camera that is already in [[cameras]] is never added a second time: the
+# declaration wins, with every field written in it. With no username and
+# password here, a camera that answers is named in a warning and left alone.
+# What it costs: the broadcast is a wake-up call that a battery camera pays for
+# in battery. And no capture in this project has ever shown a camera answering a
+# request that does not name it, so a window that hears nothing is a warning and
+# not a failure — the bridge carries on with the cameras declared below.
+# [startup_discovery]
+# enable = false                       # opt-in; off means nothing is broadcast
+# wait_secs = 5                        # 1..=60; startup waits this long, no longer
+# username = "admin"                   # both halves are needed to adopt a camera
+# password = "camera-password"
+
+
 # ── Cameras ──
 # Name must match [A-Za-z0-9_-]+. Address OR uid is required.
 
@@ -94,6 +123,12 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 # uid = "ABCDEF1234567890"
 # channel_id = 0
 # stream = "all"              # none | all | main | sub | extern
+#                             # Which streams this camera may serve, whatever the
+#                             # URL suffix asks for: main/sub/extern answer that
+#                             # one only, all (the default) answers every one, none
+#                             # answers none. A /extern request on a camera set to
+#                             # "sub" is served the substream; on one set to "main"
+#                             # it fails. A refused request never wakes the camera.
 # discovery = "relay"         # local | remote | map | relay | cellular | cloud
 # max_encryption = "aes"      # none | aes | bcencrypt
 # idle_disconnect = false     # true for battery cams
@@ -103,6 +138,23 @@ address = "192.168.1.187:9000"   # ip or hostname, optional :port
 # permitted_users = ["me"]
 # debug = false               # trace-dump decrypted protocol payloads; logs credential hashes
 # webhook = false             # report wake reasons via [webhook]; needs [webhook] enable
+# two_way_audio = false       # talk path on cameras whose abilityInfo omits the ability; see docs/two-way-audio.md
+
+# Media pacer buffering. Every decoded frame waits in a per-source pacer that
+# re-emits it at the codec's own rate. *_pacer_latency_ms is the wait paid by
+# the FIRST frame — the pre-buffer, and the floor on how late the picture a
+# viewer sees is; *_pacer_max_lead_ms is how far the emit cursor may run ahead
+# while the camera bursts. The defaults suit mpv-over-RTSP, which re-buffers
+# every couple of seconds without them; a go2rtc / WebRTC consumer re-buffers
+# on its own and wants much less — try 300 / 800 / 200 / 600 for a doorbell you
+# watch live. A cap set below its own latency is raised to the latency at
+# startup, with a warning. To see what the pacer is actually costing, run with
+# RUST_LOG=debug,bairelay=debug and read the wait out of the per-frame line
+# "pacer emitted frame ... ms=<wait> queued=<depth>".
+# video_pacer_latency_ms = 1500
+# video_pacer_max_lead_ms = 3000
+# audio_pacer_latency_ms = 500
+# audio_pacer_max_lead_ms = 2000
 
 # [cameras.mqtt]
 # enable_motion     = true    # also carries AI objects + doorbell presses

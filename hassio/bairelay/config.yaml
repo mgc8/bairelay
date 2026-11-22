@@ -22,6 +22,7 @@ options:
   topic_prefix: bairelay
   log_level: info
   cameras: []
+  wake_server: {}
 schema:
   topic_prefix: str
   log_level: list(info|debug|trace)
@@ -32,4 +33,18 @@ schema:
       username: str?
       password: password
       idle_disconnect: bool?
+      # Rhythms this camera may be asked about. Every key is optional: a field
+      # left blank keeps what the bridge does today.
+      idle_disconnect_timeout_secs: float?
+      probe_session_secs: int?
+      motion_wake_hold_secs: float?
+      # Capped on purpose. The bridge can be told by file to search a camera
+      # through the Reolink cloud; the form on this network does not offer it.
+      discovery: list(none|local)?
+  wake_server:
+    enable: bool?
+    heartbeat_ms: int?
+    stale_after_ms: int?
+    hb_advice_ms: int?
+    explain_declared_uid: bool?
 image: ghcr.io/mgc8/bairelay-hassio-{arch}

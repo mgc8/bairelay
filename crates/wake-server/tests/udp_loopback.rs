@@ -37,8 +37,9 @@ async fn middleman_replies_to_c2m_q_with_register_addr() {
 		bind: LOOPBACK,
 		middleman_port: middleman_addr.port(),
 		register_port: register_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
@@ -94,8 +95,9 @@ async fn heartbeat_records_and_replies() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -143,8 +145,9 @@ async fn heartbeat_without_needrsp_records_silently() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -187,8 +190,9 @@ async fn c2r_c_for_known_uid_emits_burst_and_replies() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -305,8 +309,9 @@ async fn c2r_c_for_unknown_uid_replies_with_rsp_neg1() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -366,8 +371,9 @@ async fn d2r_disc_is_acked_with_matching_sid() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -404,8 +410,9 @@ async fn stale_uid_reads_as_unknown() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 1000,
+		hb_advice_ms: 1000,
 		stale_after_ms: 2000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -508,8 +515,9 @@ async fn loopback_self_call_succeeds() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -557,8 +565,9 @@ async fn bad_packets_do_not_crash_listener() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -612,8 +621,9 @@ async fn run_binds_configured_ports_and_cancels_cleanly() {
 		bind: LOOPBACK,
 		middleman_port: mid_port,
 		register_port: reg_port,
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let cancel = CancellationToken::new();
 	let handle = tokio::spawn(bairelay_wake_server::run(
@@ -648,8 +658,9 @@ async fn run_returns_bind_error_on_register_port_collision() {
 		bind: LOOPBACK,
 		middleman_port: mid_port,
 		register_port: reg_port,
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let cancel = CancellationToken::new();
 	let res = bairelay_wake_server::run(cfg, bairelay_wake_server::make_registry(), cancel).await;
@@ -675,8 +686,9 @@ async fn cancel_during_wake_burst_aborts_remaining_packets() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -752,8 +764,9 @@ async fn run_returns_bind_error_on_port_collision() {
 		bind: LOOPBACK,
 		middleman_port: occupied_port,
 		register_port: reg_port,
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let cancel = CancellationToken::new();
 	let res = bairelay_wake_server::run(cfg, bairelay_wake_server::make_registry(), cancel).await;
@@ -777,8 +790,9 @@ async fn register_logs_d2r_c_r_without_replying() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -819,8 +833,9 @@ async fn register_logs_c2r_cfm_without_replying() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -863,8 +878,9 @@ async fn register_drops_unhandled_xml_variant() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -897,8 +913,9 @@ async fn middleman_drops_non_c2m_q_xml() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -937,8 +954,9 @@ async fn c2r_c_for_unknown_uid_does_not_leak_other_uids_address() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1031,8 +1049,9 @@ async fn bad_crc_packet_does_not_crash_listener() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1096,8 +1115,9 @@ async fn oversized_uid_in_d2m_q_is_rejected() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1163,8 +1183,9 @@ async fn d2r_r_with_no_anchor_is_dropped() {
 		bind: LOOPBACK,
 		middleman_port: mid_addr.port(),
 		register_port: reg_addr.port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let server_handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,
@@ -1206,8 +1227,9 @@ async fn cancel_returns_promptly() {
 		bind: LOOPBACK,
 		middleman_port: middleman.local_addr().unwrap().port(),
 		register_port: register.local_addr().unwrap().port(),
-		heartbeat_ms: 20000,
+		hb_advice_ms: 20000,
 		stale_after_ms: 80000,
+		declared: Default::default(),
 	};
 	let handle = tokio::spawn(bairelay_wake_server::run_with_sockets(
 		cfg,

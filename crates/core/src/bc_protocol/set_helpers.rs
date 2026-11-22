@@ -37,7 +37,7 @@ pub(super) const SET_QUIRK_TIMEOUT: Duration = Duration::from_millis(500);
 /// `msg_id` and `code` for the caller to log.
 ///
 /// Errors from the underlying subscription (channel closed, connection
-/// dropped) propagate as [`Error::SubscriberError`] / [`Error::Other`]
+/// dropped) propagate as [`Error::DroppedSubscriber`] / [`Error::Other`]
 /// via the `?` operator on `sub.recv()`.
 pub(super) async fn await_set_reply_with_quirk(
 	sub: &mut BcSubscription<'_>,
